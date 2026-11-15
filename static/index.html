@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gemini Vibe Companion</title>
+  <link rel="stylesheet" href="/static/css/tokens.css" />
+  <link rel="stylesheet" href="/static/css/layout.css" />
+  <link rel="stylesheet" href="/static/css/components.css" />
+</head>
+<body>
+  <div id="app-shell" class="app-shell">
+    <!-- Left Sidebar: Projects, Sessions, Model & Token Meter -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand-title">Gemini Companion</div>
+        <div class="row-gap">
+          <button id="btn-api-key" class="btn btn-ghost btn-xs" title="Configure Gemini API Key">Key</button>
+          <button id="btn-new-project" class="btn btn-secondary btn-xs" title="Add or configure project profile">+ Project</button>
+        </div>
+      </div>
+
+      <div class="sidebar-block">
+        <label class="field-label" for="project-select">Active Project</label>
+        <div class="row-gap">
+          <select id="project-select" class="select-input"></select>
+          <button id="btn-edit-project" class="btn btn-ghost btn-sm" title="Project Settings">Edit</button>
+        </div>
+        <div id="project-meta" class="meta-line">No project selected</div>
+      </div>
+
+      <div class="sidebar-block grow-block">
+        <div class="block-header">
+          <span class="field-label">Sessions</span>
+          <button id="btn-new-session" class="btn btn-primary btn-xs">+ New</button>
+        </div>
+        <div id="session-list" class="session-list"></div>
+      </div>
+
+      <div class="sidebar-block">
+        <label class="field-label" for="model-select">Model</label>
+        <select id="model-select" class="select-input"></select>
+
+        <div class="row-gap mt-2">
+          <div class="col-half">
+            <label class="field-label" for="thinking-select">Thinking</label>
+            <select id="thinking-select" class="select-input"></select>
+          </div>
+          <div class="col-half">
+            <label class="field-label" for="auto-read-input">Auto-Read &le; tok</label>
+            <input id="auto-read-input" type="number" min="0" step="250" value="0" class="text-input tabular" />
+          </div>
+        </div>
+
+        <div class="token-meter mt-3">
+          <div class="meter-row">
+            <span>Context Used</span>
+            <span id="token-total-label" class="mono tabular">0 / 1,048,576</span>
+          </div>
+          <div class="meter-track">
+            <div id="token-meter-fill" class="meter-fill" style="width: 0%;"></div>
+          </div>
+          <div id="token-breakdown" class="meta-line mono tabular">In 0 · Out 0 · Think 0</div>
+        </div>
+      </div>
+    </aside>
+
+    <div id="resizer-left" class="resizer" title="Drag to resize sidebar"></div>
+
+    <!-- Center Main Stage: Top Bar, Chat Stream, Tool Gates, Huge Composer -->
+    <main class="main-stage">
+      <header class="topbar">
+        <div class="topbar-left">
+          <input id="session-title-input" class="session-title-input" type="text" value="Select or create a session" disabled />
+          <span id="directives-meta" class="meta-line"></span>
+        </div>
+        <div class="topbar-right">
+          <select id="cdp-tab-select" class="select-input select-compact" title="Chrome :9222 Target Tab">
+            <option value="">Chrome :9222 (Not connected)</option>
+          </select>
+          <button id="btn-cdp-refresh" class="btn btn-ghost btn-sm" title="Refresh Chrome :9222 tabs">Refresh Tabs</button>
+        </div>
+      </header>
+
+      <section id="chat-stream" class="chat-stream">
+        <div class="empty-state">
+          <h3>Workspace Ready</h3>
+          <p>Select a project profile and start a session to inspect files, review gated diffs, capture Chrome :9222 state, and commit cleanly.</p>
+        </div>
+      </section>
+
+      <section id="pending-gates" class="pending-gates hidden"></section>
+
+      <footer class="composer">
+        <div id="attachment-strip" class="attachment-strip hidden"></div>
+        <textarea
+          id="prompt-input"
+          class="prompt-textarea"
+          rows="5"
+          placeholder="Write your prompt, or Ctrl+V a UI screenshot directly here..."
+        ></textarea>
+        <div class="composer-bar">
+          <div class="composer-actions">
+            <button id="btn-cdp-shot" class="btn btn-secondary btn-sm">CDP Screenshot</button>
+            <button id="btn-cdp-console" class="btn btn-secondary btn-sm">CDP Console</button>
+            <button id="btn-run-post-tests" class="btn btn-secondary btn-sm">Run Tests</button>
+          </div>
+          <div class="composer-right">
+            <span id="composer-token-est" class="meta-line mono tabular">Prompt ~0 tok</span>
+            <button id="btn-send" class="btn btn-primary">Send</button>
+          </div>
+        </div>
+      </footer>
+    </main>
+
+    <div id="resizer-right" class="resizer" title="Drag to resize right panel"></div>
+
+    <!-- Right Drawer: Files, Terminal, Backups, Git -->
+    <aside class="drawer">
+      <nav class="drawer-tabs">
+        <button class="drawer-tab active" data-tab="files">Files</button>
+        <button class="drawer-tab" data-tab="terminal">Terminal</button>
+        <button class="drawer-tab" data-tab="git">Git</button>
+        <button class="drawer-tab" data-tab="backups">Backups</button>
+      </nav>
+
+      <div id="tab-files" class="drawer-pane active">
+        <div class="pane-toolbar">
+          <input id="file-tree-filter" class="text-input mono" type="text" placeholder="Filter visible files..." />
+          <button id="btn-refresh-tree" class="btn btn-ghost btn-sm">Refresh</button>
+        </div>
+        <div id="file-tree-list" class="tree-list"></div>
+      </div>
+
+      <div id="tab-terminal" class="drawer-pane">
+        <div class="pane-toolbar">
+          <input id="custom-cmd-input" class="text-input mono" type="text" placeholder="python developer/tools/run_tests.py" />
+          <button id="btn-run-custom" class="btn btn-primary btn-sm">Run</button>
+        </div>
+        <div id="preset-buttons" class="preset-row"></div>
+        <div class="output-header">
+          <span id="terminal-meta" class="meta-line mono tabular">No command run yet</span>
+          <button id="btn-paste-terminal" class="btn btn-secondary btn-sm" disabled>Paste into Prompt</button>
+        </div>
+        <pre id="terminal-output" class="terminal-output"></pre>
+      </div>
+
+      <div id="tab-git" class="drawer-pane">
+        <div class="pane-toolbar">
+          <span id="git-branch-label" class="meta-line mono">Branch: -</span>
+          <button id="btn-git-refresh" class="btn btn-ghost btn-sm">Refresh</button>
+        </div>
+        <div id="git-files-list" class="git-files-list"></div>
+        <div class="git-commit-box">
+          <div class="row-between">
+            <label class="field-label" for="git-message-input">Commit Message</label>
+            <button id="btn-git-draft" class="btn btn-secondary btn-sm">Draft with Gemini</button>
+          </div>
+          <textarea id="git-message-input" class="text-input mono" rows="3" placeholder="feat: describe changes..."></textarea>
+          <div class="row-gap mt-2">
+            <button id="btn-git-commit" class="btn btn-secondary btn-sm">Commit</button>
+            <button id="btn-git-commit-push" class="btn btn-primary btn-sm">Commit &amp; Push</button>
+          </div>
+          <div id="git-result" class="meta-line mt-2"></div>
+        </div>
+      </div>
+
+      <div id="tab-backups" class="drawer-pane">
+        <div class="pane-toolbar">
+          <span class="meta-line">Stored in project backup/</span>
+          <button id="btn-refresh-backups" class="btn btn-ghost btn-sm">Refresh</button>
+        </div>
+        <div id="backup-list" class="backup-list"></div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Project Profile Modal -->
+  <dialog id="project-modal" class="modal">
+    <form id="project-form" method="dialog" class="modal-card">
+      <h3 id="project-modal-title">Project Profile</h3>
+      <label class="field-label">Project Name</label>
+      <input id="proj-name" class="text-input" required placeholder="MocGuard" />
+
+      <label class="field-label mt-2">Project Root Directory (Absolute Path)</label>
+      <div class="row-gap">
+        <input id="proj-root" class="text-input mono" required placeholder="C:\Projects\MocGuard" />
+        <button id="btn-browse-root" type="button" class="btn btn-secondary btn-sm">Browse...</button>
+      </div>
+
+      <div class="row-gap mt-2">
+        <div class="col-half">
+          <label class="field-label">Python Executable (Optional)</label>
+          <div class="row-gap">
+            <input id="proj-python" class="text-input mono" placeholder="Auto-detect .venv" />
+            <button id="btn-browse-python" type="button" class="btn btn-secondary btn-sm">Browse...</button>
+          </div>
+        </div>
+        <div class="col-half">
+          <label class="field-label">Backup Folder (Relative)</label>
+          <input id="proj-backup" class="text-input mono" value="backup" />
+        </div>
+      </div>
+
+      <div class="row-gap mt-2">
+        <div class="col-half">
+          <label class="field-label">Directives .md (Relative)</label>
+          <div class="row-gap">
+            <input id="proj-directives" class="text-input mono" placeholder="Directives_for_Core_Coding.md" />
+            <button id="btn-browse-directives" type="button" class="btn btn-secondary btn-sm">Browse...</button>
+          </div>
+        </div>
+        <div class="col-half">
+          <label class="field-label">Chrome CDP Port</label>
+          <input id="proj-cdp-port" type="number" class="text-input mono tabular" value="9222" />
+        </div>
+      </div>
+
+      <label class="field-label mt-2">Post-Patch Test Command (Optional)</label>
+      <input id="proj-post-cmd" class="text-input mono" placeholder="python developer/tools/run_tests.py --silent" />
+
+      <label class="field-label mt-2">Extra Ignore Globs (comma-separated)</label>
+      <input id="proj-ignores" class="text-input mono" placeholder="*.log, tmp/" />
+
+      <div class="modal-actions mt-3">
+        <button id="btn-cancel-project" type="button" class="btn btn-ghost">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save Project</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Local Filesystem Picker Modal -->
+  <dialog id="fs-browser-modal" class="modal">
+    <div class="modal-card">
+      <h3 id="fs-browser-title">Select Path</h3>
+      <div class="row-gap">
+        <div id="fs-browser-roots" class="row-gap"></div>
+        <button id="fs-btn-up" type="button" class="btn btn-secondary btn-sm">Up</button>
+        <input id="fs-current-path" type="text" class="text-input mono" readonly />
+      </div>
+      <div id="fs-browser-list" class="fs-browser-list"></div>
+      <div class="modal-actions mt-3">
+        <button id="fs-btn-cancel" type="button" class="btn btn-ghost">Cancel</button>
+        <button id="fs-btn-select" type="button" class="btn btn-primary">Use Selected</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Gemini API Key Modal -->
+  <dialog id="api-key-modal" class="modal">
+    <form id="api-key-form" method="dialog" class="modal-card">
+      <h3>Gemini API Key</h3>
+      <p id="api-key-status-msg" class="meta-line modal-status">
+        Stored locally in data/gemini_key.json.
+      </p>
+
+      <label class="field-label mt-2" for="api-key-input">API Key</label>
+      <div class="row-gap">
+        <input
+          id="api-key-input"
+          class="text-input mono"
+          type="password"
+          autocomplete="off"
+          placeholder="AIza..."
+          required
+        />
+        <button id="btn-toggle-key-vis" type="button" class="btn btn-secondary btn-sm">Show</button>
+      </div>
+
+      <div id="api-key-error" class="error-line"></div>
+
+      <div class="row-between mt-3">
+        <button id="btn-clear-api-key" type="button" class="btn btn-danger btn-sm">Remove Saved Key</button>
+        <div class="modal-actions">
+          <button id="btn-cancel-api-key" type="button" class="btn btn-ghost">Cancel</button>
+          <button id="btn-save-api-key" type="submit" class="btn btn-primary">Save &amp; Verify</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="/static/js/main.js"></script>
+</body>
+</html>
