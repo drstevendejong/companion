@@ -1212,3 +1212,46 @@ body.mode-api .bridge-only {
   padding: 4px 8px;
   font-size: 12px;
 }
+
+/* Inline prompt-box AI command detection bar */
+.bridge-detect-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.bridge-detect-bar .meta-line {
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Console savepoint action bar after manual test/command runs */
+.terminal-savepoint-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--card-checkpoint-border);
+  background: var(--card-checkpoint-bg);
+  flex-shrink: 0;
+}
+
+.terminal-savepoint-bar.is-ready {
+  border-color: var(--success-border);
+  background: var(--success-soft);
+}
+
+.terminal-savepoint-bar.is-ready .meta-line {
+  color: var(--success-text);
+  font-weight: 600;
+}
+

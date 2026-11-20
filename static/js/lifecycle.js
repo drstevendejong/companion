@@ -1,4 +1,6 @@
-// lifecycle.js - Sleep-proof WebSocket keepalive & mutual teardown (tab close <-> server exit)
+// lifecycle.js - Sleep-proof WebSocket keepalive, mutual teardown, and live command streaming
+
+import { emit } from "./state.js";
 
 function makeClientId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -135,6 +137,12 @@ export function initLifecycle() {
             sock.send(JSON.stringify({ type: "pong" }));
           } else if (msg.type === "server_shutdown") {
             handleServerShutdown();
+          } else if (
+            msg.type === "exec_start" ||
+            msg.type === "exec_chunk" ||
+            msg.type === "exec_done"
+          ) {
+            emit("terminal:stream-event", msg);
           }
         } catch {
           // ignore malformed keepalive payload

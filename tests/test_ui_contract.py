@@ -58,37 +58,58 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn("flex-shrink: 0", css)
         for req_id in (
             "btn-bridge-directives-pill",
-            "btn-bridge-manual-paste",
             "btn-bridge-close-paste",
-            "btn-bridge-stage-clipboard",
             "btn-bridge-clipboard-parse",
             "bridge-prompt-slot",
+            "bridge-prompt-detect-bar",
+            "btn-prompt-run-detected",
+            "btn-prompt-keep-text",
             "bridge-paste-wrap",
             "bridge-paste-hint",
-            "btn-bridge-parse-stage",
             "btn-bridge-parse",
             "btn-bridge-copy-bundle",
+            "terminal-savepoint-bar",
+            "btn-terminal-commit-checkpoint",
+            "btn-terminal-restore-checkpoint",
         ):
             self.assertIn(f'id="{req_id}"', html)
-        for removed_id in ("chk-bridge-directives", "btn-bridge-tab-prompt", "btn-bridge-tab-paste"):
+        for removed_id in (
+            "chk-bridge-directives",
+            "btn-bridge-tab-prompt",
+            "btn-bridge-tab-paste",
+            "btn-bridge-manual-paste",
+            "btn-bridge-stage-clipboard",
+            "btn-bridge-parse-stage",
+        ):
             self.assertNotIn(f'id="{removed_id}"', html)
+        self.assertIn('>Console</button>', html)
 
         comp_css = (COMPANION_ROOT / "static" / "css" / "components.css").read_text(encoding="utf-8")
         self.assertIn(".gates-batch-bar", comp_css)
         self.assertIn("position: sticky", comp_css)
         self.assertIn("top: 0", comp_css)
+        self.assertIn(".bridge-detect-bar", comp_css)
+        self.assertIn(".terminal-savepoint-bar", comp_css)
 
         chat_js = (COMPANION_ROOT / "static" / "js" / "chat.js").read_text(encoding="utf-8")
         drawer_js = (COMPANION_ROOT / "static" / "js" / "drawer.js").read_text(encoding="utf-8")
         gates_js = (COMPANION_ROOT / "static" / "js" / "tool_gates.js").read_text(encoding="utf-8")
         bridge_js = (COMPANION_ROOT / "static" / "js" / "bridge.js").read_text(encoding="utf-8")
+        lifecycle_js = (COMPANION_ROOT / "static" / "js" / "lifecycle.js").read_text(encoding="utf-8")
+        composer_js = (COMPANION_ROOT / "static" / "js" / "composer.js").read_text(encoding="utf-8")
         self.assertIn("Copy Error", chat_js)
         self.assertIn("Copy Full Output", chat_js)
         self.assertIn("createGateVisibilityButton", chat_js)
+        self.assertIn("chat:live-exec", chat_js)
         self.assertIn("buildCommandFailureReport", drawer_js)
         self.assertIn("extractFailureExcerpt", drawer_js)
+        self.assertIn("terminal:stream-event", drawer_js)
+        self.assertIn("terminal:stream-event", lifecycle_js)
         self.assertIn("gatesHiddenDueToError", gates_js)
+        self.assertIn("Run Script in Venv", gates_js)
         self.assertIn("buildErrorReasonForDeniedAction", bridge_js)
+        self.assertIn("looksLikeBridgeAiOutput", bridge_js)
+        self.assertIn("isDetectedPromptAiPending", composer_js)
 
         api_js = (COMPANION_ROOT / "static" / "js" / "api.js").read_text(encoding="utf-8")
         self.assertIn(".msg-checkpoint", comp_css)

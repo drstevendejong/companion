@@ -137,7 +137,14 @@ class BridgePackFilesRequest(BaseModel):
 
 
 class ToolGateDecision(BaseModel):
-    action: Literal["approve", "deny", "edit_range", "write_only", "write_and_run"]
+    action: Literal[
+        "approve",
+        "deny",
+        "edit_range",
+        "write_only",
+        "write_and_run",
+        "write_run_and_delete",
+    ]
     start_line: Optional[int] = None
     end_line: Optional[int] = None
     reason: Optional[str] = None

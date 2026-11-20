@@ -1,4 +1,4 @@
-// drawer.js - Right panel: Project File Tree, Terminal Runner (+ Paste into Prompt), and Project Backups/Undo
+// drawer.js - Right panel: Project File Tree, Console Runner (+ Paste into Prompt), Savepoint Commit, and Backups/Undo
 
 import { api } from "./api.js";
 import { copyTextToClipboard } from "./bridge.js";
@@ -18,11 +18,17 @@ const customCmdInput = document.getElementById("custom-cmd-input");
 const terminalMeta = document.getElementById("terminal-meta");
 const terminalOutput = document.getElementById("terminal-output");
 const pasteTermBtn = document.getElementById("btn-paste-terminal");
+const terminalSavepointBar = document.getElementById("terminal-savepoint-bar");
+const terminalSavepointLabel = document.getElementById("terminal-savepoint-label");
+const commitCpBtn = document.getElementById("btn-terminal-commit-checkpoint");
+const restoreCpBtn = document.getElementById("btn-terminal-restore-checkpoint");
 const postTestsBtn = document.getElementById("btn-run-post-tests");
 const backupList = document.getElementById("backup-list");
 
 const expandedDirs = new Set();
 const dirCache = new Map();
+let lastManualCommandPassed = false;
+let lastManualSessionId = null;
 
 export function initDrawer() {
   tabButtons.forEach((btn) => {
@@ -52,8 +58,11 @@ export function initDrawer() {
 
   pasteTermBtn.addEventListener("click", () => {
     if (!state.lastTerminalOutput) return;
-    emit("composer:paste-text", `[Terminal: ${state.lastTerminalLabel}]\n${state.lastTerminalOutput}`);
+    emit("composer:paste-text", `[Console: ${state.lastTerminalLabel}]\n${state.lastTerminalOutput}`);
   });
+
+  commitCpBtn.addEventListener("click", handleTerminalCommitCheckpoint);
+  restoreCpBtn.addEventListener("click", handleTerminalRestoreCheckpoint);
 
   document.getElementById("btn-refresh-backups").addEventListener("click", refreshBackups);
 
@@ -76,15 +85,21 @@ export function initDrawer() {
   on("drawer:switch-tab", (tabName) => {
     if (tabName && panes[tabName]) switchTab(tabName);
   });
+  on("chat:loaded", syncTerminalSavepointBar);
+  on("session:updated", syncTerminalSavepointBar);
   on("terminal:run-post-tests", triggerPostPatchTests);
   on("terminal:show-result", (res) => {
-    // Update terminal contents silently so split-screen collapsed drawer isn't forced open unnecessarily
+    // Update Console contents silently so split-screen collapsed drawer isn't forced open unnecessarily
     showTerminalResult(res, { suppressMdBar: true });
   });
+  on("terminal:stream-event", handleExecStreamEvent);
   on("terminal:suggest-post-tests", (cmd) => {
     customCmdInput.value = cmd;
     terminalMeta.textContent = `Patch applied · Click Run Tests (${cmd})`;
+    syncTerminalSavepointBar();
   });
+
+  syncTerminalSavepointBar();
 }
 
 function triggerPostPatchTests() {
@@ -317,6 +332,13 @@ async function runTerminalCommand(command, opts = {}) {
   const sid = state.activeSessionId;
   const reportInChat = Boolean(opts.reportInChat && sid);
   const actId = reportInChat ? `act-${Date.now()}` : null;
+  const matchesConfiguredTests =
+    Boolean(proj.post_patch_command) && command.trim() === proj.post_patch_command.trim();
+  const isTestRun = opts.isTestRun !== undefined ? Boolean(opts.isTestRun) : matchesConfiguredTests;
+
+  lastManualCommandPassed = false;
+  lastManualSessionId = sid;
+  syncTerminalSavepointBar();
 
   terminalMeta.textContent = `Running: ${command}...`;
   terminalOutput.textContent = "";
@@ -328,7 +350,7 @@ async function runTerminalCommand(command, opts = {}) {
       batchKey: actId,
       status: "running",
       title: `Running tests: ${command}`,
-      detail: "Waiting for process exit code...",
+      detail: "Streaming output live in Console...",
       preview: "",
       timestamp: new Date().toISOString(),
     });
@@ -338,19 +360,24 @@ async function runTerminalCommand(command, opts = {}) {
   try {
     const res = await api.runCommand(proj.id, command, {
       sessionId: sid,
-      isTestRun: Boolean(opts.isTestRun),
+      isTestRun,
     });
     if (Array.isArray(res.checkpoints)) {
       state.checkpoints = res.checkpoints;
     }
+    const rawOut = res.output || "";
+    const hasTraceback =
+      /Traceback \(most recent call last\):|\n(?:SyntaxError|AssertionError|ImportError|ModuleNotFoundError):/i.test(
+        rawOut
+      );
+    const ok = res.exit_code === 0 && !hasTraceback;
+    lastManualCommandPassed = Boolean(ok && !res.checkpoint_committed);
     showTerminalResult(res);
+    if (!reportInChat && res.checkpoint_committed) {
+      emit("git:refresh");
+      emit("chat:loaded");
+    }
     if (reportInChat) {
-      const rawOut = res.output || "";
-      const hasTraceback =
-        /Traceback \(most recent call last\):|\n(?:SyntaxError|AssertionError|ImportError|ModuleNotFoundError):/i.test(
-          rawOut
-        );
-      const ok = res.exit_code === 0 && !hasTraceback;
       if (ok) {
         const tailLines = rawOut.split("\n").filter((l) => l.trim()).slice(-6).join("\n").slice(0, 500);
         const commitNote = res.checkpoint_committed ? " · Savepoint committed ✓" : "";
@@ -446,12 +473,143 @@ function upsertActivity(sessionId, entry) {
   state.sessionActivities[sessionId] = list.slice(-10);
 }
 
+function handleExecStreamEvent(msg) {
+  if (!msg || !msg.type) return;
+  if (msg.type === "exec_start") {
+    state.liveExec = {
+      runId: msg.run_id || null,
+      command: msg.command || "",
+      source: msg.source || "console",
+      output: "",
+    };
+    terminalMeta.textContent = `Running: ${state.liveExec.command}...`;
+    terminalOutput.textContent = "";
+    pasteTermBtn.disabled = true;
+    emit("chat:live-exec", { type: "start", command: state.liveExec.command, output: "" });
+    return;
+  }
+  if (msg.type === "exec_chunk") {
+    if (!state.liveExec || (msg.run_id && state.liveExec.runId && msg.run_id !== state.liveExec.runId)) {
+      state.liveExec = {
+        runId: msg.run_id || null,
+        command: "",
+        source: msg.source || "console",
+        output: "",
+      };
+    }
+    state.liveExec.output += String(msg.chunk || "");
+    if (state.liveExec.output.length > 45000) {
+      state.liveExec.output = state.liveExec.output.slice(-45000);
+    }
+    terminalOutput.textContent = state.liveExec.output || "(Running...)";
+    terminalOutput.scrollTop = terminalOutput.scrollHeight;
+    const lineCount = state.liveExec.output.split("\n").length;
+    const cmdLabel = state.liveExec.command ? `: ${state.liveExec.command}` : "";
+    terminalMeta.textContent = `Running${cmdLabel} · ${lineCount} ${lineCount === 1 ? "line" : "lines"} streamed...`;
+    emit("chat:live-exec", { type: "chunk", command: state.liveExec.command, output: state.liveExec.output });
+    return;
+  }
+  if (msg.type === "exec_done") {
+    state.liveExec = null;
+    showTerminalResult(msg, { suppressMdBar: true });
+    emit("chat:live-exec", { type: "done", command: msg.command || "", output: msg.output || "" });
+  }
+}
+
+function getActiveSessionCheckpoint() {
+  const sid = state.activeSessionId;
+  if (!sid) return null;
+  const list = state.checkpoints || [];
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const cp = list[i];
+    if (cp.session_id === sid && cp.status === "active") return cp;
+  }
+  return null;
+}
+
+function syncTerminalSavepointBar() {
+  if (!terminalSavepointBar) return;
+  if (state.activeSessionId !== lastManualSessionId) {
+    lastManualSessionId = state.activeSessionId;
+    lastManualCommandPassed = false;
+  }
+  const activeCp = getActiveSessionCheckpoint();
+  if (!activeCp) {
+    terminalSavepointBar.classList.add("hidden");
+    terminalSavepointBar.classList.remove("is-ready");
+    return;
+  }
+  terminalSavepointBar.classList.remove("hidden");
+  terminalSavepointBar.classList.toggle("is-ready", lastManualCommandPassed);
+  commitCpBtn.disabled = false;
+  restoreCpBtn.disabled = false;
+  commitCpBtn.textContent = "Commit Savepoint";
+  restoreCpBtn.textContent = "Restore";
+  if (lastManualCommandPassed) {
+    terminalSavepointLabel.textContent = "Manual run exited 0 · Ready to commit savepoint";
+    commitCpBtn.className = "btn btn-primary btn-xs";
+  } else {
+    const n = Number(activeCp.files_count || 0);
+    terminalSavepointLabel.textContent = `Active savepoint (${n} ${n === 1 ? "file" : "files"}) · Commit after manual test pass`;
+    commitCpBtn.className = "btn btn-secondary btn-xs";
+  }
+}
+
+async function handleTerminalCommitCheckpoint() {
+  const cp = getActiveSessionCheckpoint();
+  if (!cp) return;
+  commitCpBtn.disabled = true;
+  restoreCpBtn.disabled = true;
+  commitCpBtn.textContent = "Committing...";
+  try {
+    const res = await api.commitCheckpoint(cp.id);
+    if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
+    lastManualCommandPassed = false;
+    syncTerminalSavepointBar();
+    emit("git:refresh");
+    emit("chat:loaded");
+  } catch (err) {
+    commitCpBtn.disabled = false;
+    restoreCpBtn.disabled = false;
+    commitCpBtn.textContent = "Commit Savepoint";
+    emit("chat:error", err.message);
+  }
+}
+
+async function handleTerminalRestoreCheckpoint() {
+  const cp = getActiveSessionCheckpoint();
+  if (!cp) return;
+  commitCpBtn.disabled = true;
+  restoreCpBtn.disabled = true;
+  restoreCpBtn.textContent = "Restoring...";
+  try {
+    const res = await api.restoreCheckpoint(cp.id);
+    if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
+    if (Array.isArray(res.pending_gates)) state.pendingGates = res.pending_gates;
+    state.gatesHiddenDueToError = false;
+    lastManualCommandPassed = false;
+    syncTerminalSavepointBar();
+    emit("backups:refresh");
+    emit("git:refresh");
+    emit("tree:refresh");
+    emit("session:updated");
+    emit("chat:loaded");
+  } catch (err) {
+    commitCpBtn.disabled = false;
+    restoreCpBtn.disabled = false;
+    restoreCpBtn.textContent = "Restore";
+    emit("chat:error", err.message);
+  }
+}
+
 function showTerminalResult(res, opts = {}) {
   state.lastTerminalLabel = `${res.command} (exit ${res.exit_code})`;
   state.lastTerminalOutput = res.output || "";
   terminalMeta.textContent = `Exit ${res.exit_code} · ${res.duration_ms}ms · ~${(res.estimated_tokens || 0).toLocaleString()} tok`;
   terminalOutput.textContent = res.output || "(No output)";
+  terminalOutput.scrollTop = terminalOutput.scrollHeight;
   pasteTermBtn.disabled = !state.lastTerminalOutput;
+  syncTerminalSavepointBar();
   if (!opts.suppressMdBar && res.generated_md_files && res.generated_md_files.length > 0) {
     emit("bridge:generated-md", res.generated_md_files);
   }

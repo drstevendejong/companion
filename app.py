@@ -43,7 +43,9 @@ def create_app(
     auto_shutdown: bool = False,
 ) -> FastAPI:
     app = FastAPI(title="Gemini Vibe Companion", version="0.1.0", lifespan=_lifespan)
-    app.state.db = CompanionDB(db_path or DB_PATH)
+    db = CompanionDB(db_path or DB_PATH)
+    db.cleanup_database()
+    app.state.db = db
     app.state.gemini = gemini_gateway or GeminiGateway()
     app.state.lifecycle = LifecycleTracker(enabled=auto_shutdown)
     app.state.lifecycle_sockets = set()

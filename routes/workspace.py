@@ -63,10 +63,12 @@ async def run_workspace_command(payload: RunCommandRequest, request: Request) ->
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
     try:
-        res = await runner.run_project_command(
+        res = await runner.stream_project_command(
+            getattr(request, "app", None),
             project.root_path,
             payload.command,
             configured_python=project.python_path,
+            source="console",
         )
         res["generated_md_files"] = bridge_svc.find_recent_markdown_outputs(
             project.root_path,

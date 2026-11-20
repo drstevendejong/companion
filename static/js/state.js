@@ -13,6 +13,7 @@ export const state = {
   catalog: { models: [], thinking_levels: [] },
   lastTerminalOutput: "",
   lastTerminalLabel: "",
+  liveExec: null,
   busy: false,
   pendingStatusText: null,
   resolvingGateId: null,

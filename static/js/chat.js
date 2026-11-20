@@ -17,6 +17,7 @@ const RECENT_COPY_BALLOON_LIMIT = 2;
 export function initChat() {
   on("chat:loaded", () => renderMessages({ preserveScroll: false }));
   on("chat:refresh-badges", () => renderMessages({ preserveScroll: true }));
+  on("chat:live-exec", updateLiveExecPreview);
   on("chat:error", async (msg) => {
     const text = String(msg || "Unknown error");
     const errKey = `err:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
@@ -92,7 +93,7 @@ function renderMessages({ preserveScroll = false } = {}) {
     chatStream.innerHTML = `
       <div class="empty-state">
         <h3>New Session Ready</h3>
-        <p>Write a prompt below, attach a file from the right panel, or click Paste &amp; Run Clipboard.</p>
+        <p>Write a prompt below, attach a file from the right panel, or click Paste &amp; Run AI Reply.</p>
       </div>
     `;
     emit("gates:changed");
@@ -227,6 +228,7 @@ function renderMessages({ preserveScroll = false } = {}) {
   }
 
   if (state.pendingStatusText) {
+    const liveSlice = formatLivePreviewSlice(state.liveExec && state.liveExec.output);
     const pendingCard = document.createElement("article");
     pendingCard.className = "msg-card msg-exec";
     pendingCard.innerHTML = `
@@ -235,6 +237,7 @@ function renderMessages({ preserveScroll = false } = {}) {
         <span class="exec-badge is-running">Running</span>
       </div>
       <div class="companion-summary-line">${escapeHtml(state.pendingStatusText)}</div>
+      <pre data-live-exec="gate" class="exec-preview${liveSlice ? "" : " hidden"}">${escapeHtml(liveSlice)}</pre>
     `;
     chatStream.appendChild(pendingCard);
   }
@@ -286,8 +289,11 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
     totalEstTokens += estimateToolPayloadTokens(name, resp);
 
     if (resp.applied) hasAppliedPatch = true;
-    if (resp.written && resp.executed) {
-      executedScripts.push(resp);
+    if (
+      (resp.written && resp.executed) ||
+      ((name === "run_script" || name === "run_and_delete_script") && resp.executed)
+    ) {
+      executedScripts.push({ ...resp, _toolName: name });
       if (Array.isArray(resp.generated_md_files)) {
         for (const f of resp.generated_md_files) {
           if (f && f.path && !generatedMdFiles.some((x) => x.path === f.path)) {
@@ -319,10 +325,25 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
     const lastExec = executedScripts[executedScripts.length - 1];
     const ok = lastExec.exit_code === 0 && !lastExec.has_traceback;
     card.classList.add("msg-exec", ok ? "is-ok" : "is-err");
-    badgeHtml = `<span class="exec-badge ${ok ? "is-ok" : "is-err"}">${
-      ok ? "Executed cleanly (exit 0)" : `Possible errors detected (exit ${lastExec.exit_code})`
-    }</span>`;
-    headline = `Proposed script executed: ${lastExec.path} (${lastExec.duration_ms ?? 0}ms) · View full output in Console`;
+    const badgeLabel = ok
+      ? lastExec.deleted
+        ? "Executed & auto-deleted (exit 0)"
+        : "Executed cleanly (exit 0)"
+      : lastExec.kept_for_patching
+        ? `Failed — script kept for patching (exit ${lastExec.exit_code})`
+        : `Possible errors detected (exit ${lastExec.exit_code})`;
+    badgeHtml = `<span class="exec-badge ${ok ? "is-ok" : "is-err"}">${escapeHtml(badgeLabel)}</span>`;
+    const prefix =
+      lastExec._toolName === "run_and_delete_script"
+        ? lastExec.deleted
+          ? "Executed & deleted script"
+          : "Script run (kept for patching)"
+        : lastExec._toolName === "run_script"
+          ? "Executed script"
+          : lastExec.deleted
+            ? "Proposed script executed & deleted"
+            : "Proposed script executed";
+    headline = `${prefix}: ${lastExec.path} (${lastExec.duration_ms ?? 0}ms) · View full output in Console`;
   } else if (testRuns.length > 0 && !hasErrors) {
     const lastTest = testRuns[testRuns.length - 1];
     const ok = Boolean(lastTest.passed) && lastTest.exit_code === 0 && !lastTest.has_traceback;
@@ -617,6 +638,13 @@ function renderActivityCard(act, isLatestActivity = false) {
     pre.className = "exec-preview";
     pre.textContent = act.preview;
     card.appendChild(pre);
+  } else if (act.status === "running") {
+    const liveSlice = formatLivePreviewSlice(state.liveExec && state.liveExec.output);
+    const pre = document.createElement("pre");
+    pre.className = `exec-preview${liveSlice ? "" : " hidden"}`;
+    pre.dataset.liveActivity = act.id;
+    pre.textContent = liveSlice;
+    card.appendChild(pre);
   }
 
   const timeStr = formatTimeHHMMSS(act.timestamp);
@@ -878,9 +906,22 @@ function formatSingleToolDetail(name, resp, bytes) {
   const sz = bytes > 0 ? ` (${formatBytes(bytes)})` : "";
   if (resp.denied_by_user) return `${name} — Denied`;
   if (resp.applied) return `${name}: Patched ${resp.path}`;
+  if (resp.renamed) return `${name}: Renamed ${resp.old_path} -> ${resp.new_path}`;
   if (resp.written) {
-    return `${name}: Wrote ${resp.path}${resp.executed ? ` (exit ${resp.exit_code})` : ""}`;
+    const delSuffix = resp.deleted ? ", auto-deleted" : "";
+    return `${name}: Wrote ${resp.path}${resp.executed ? ` (exit ${resp.exit_code}${delSuffix})` : ""}`;
   }
+  if ((name === "run_script" || name === "run_and_delete_script") && !resp.error) {
+    const statusText = resp.passed
+      ? resp.deleted
+        ? "OK & auto-deleted"
+        : "OK"
+      : resp.kept_for_patching
+        ? "FAILED (kept on disk)"
+        : "FAILED";
+    return `${name}(${resp.path || resp.command || "script"}) — ${statusText} (exit ${resp.exit_code ?? "?"})`;
+  }
+  if (resp.deleted) return `${name}: Deleted ${resp.path}`;
   if (name === "run_tests" && !resp.error) {
     return `${name}(${resp.command || "tests"}) — ${resp.passed ? "PASSED" : "FAILED"} (exit ${resp.exit_code ?? "?"})`;
   }
@@ -913,9 +954,40 @@ function formatToolCallSummary(tc) {
   if (name === "patch_literal") return `patch_literal(${a.path || ""})`;
   if (name === "patch_lines") return `patch_lines(${a.path || ""}:${a.start_line ?? "?"}-${a.end_line ?? "?"})`;
   if (name === "write_file") return `write_file(${a.path || ""})`;
+  if (name === "delete_file") return `delete_file(${a.path || ""})`;
+  if (name === "rename_file") return `rename_file(${a.old_path || ""} -> ${a.new_path || ""})`;
   if (name === "propose_script") return `propose_script(${a.path || ""})`;
+  if (name === "run_script") return `run_script(${a.path || ""}${a.args ? `, ${a.args}` : ""})`;
+  if (name === "run_and_delete_script") {
+    return `run_and_delete_script(${a.path || ""}${a.args ? `, ${a.args}` : ""})`;
+  }
   if (name === "run_tests") return a.summary ? `run_tests(${a.summary})` : "run_tests";
   return name;
+}
+
+function formatLivePreviewSlice(rawOutput) {
+  const text = String(rawOutput || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!text.trim()) return "";
+  return text.length > 2500 ? `...\n${text.slice(-2500)}` : text;
+}
+
+function updateLiveExecPreview(payload) {
+  const slice = formatLivePreviewSlice(payload && payload.output);
+  const targets = Array.from(document.querySelectorAll("[data-live-exec], [data-live-activity]"));
+
+  const wasNearBottom = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight < 48;
+  for (const el of targets) {
+    if (slice) {
+      el.classList.remove("hidden");
+      el.textContent = slice;
+      el.scrollTop = el.scrollHeight;
+    } else if (payload && payload.type === "start") {
+      el.textContent = "";
+    }
+  }
+  if (wasNearBottom) {
+    chatStream.scrollTop = chatStream.scrollHeight;
+  }
 }
 
 function escapeHtml(str) {

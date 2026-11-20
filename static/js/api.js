@@ -77,12 +77,12 @@ export const api = {
   retryChat: (sessionId, options = {}) =>
     requestJson("/api/chat/retry", { method: "POST", body: JSON.stringify({ session_id: sessionId }), timeoutMs: 120000, ...options }),
   resolveGate: (gateId, body, options = {}) =>
-    requestJson(`/api/chat/gate/${gateId}`, { method: "POST", body: JSON.stringify(body), timeoutMs: 120000, ...options }),
+    requestJson(`/api/chat/gate/${gateId}`, { method: "POST", body: JSON.stringify(body), timeoutMs: 300000, ...options }),
   resolveGatesBatch: (sessionId, decisions, options = {}) =>
     requestJson("/api/chat/gates/batch", {
       method: "POST",
       body: JSON.stringify({ session_id: sessionId, decisions }),
-      timeoutMs: 120000,
+      timeoutMs: 300000,
       ...options,
     }),
 
@@ -96,6 +96,7 @@ export const api = {
   runCommand: (projectId, command, opts = {}) =>
     requestJson("/api/workspace/run", {
       method: "POST",
+      timeoutMs: 300000,
       body: JSON.stringify({
         project_id: projectId,
         command,

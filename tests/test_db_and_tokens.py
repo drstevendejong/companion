@@ -61,6 +61,62 @@ class TestCompanionDB(unittest.TestCase):
         self.assertEqual(updated.token_stats.total_tokens, 135)
         self.assertEqual(len(self.db.list_messages(sess.id)), 1)
 
+    def test_automatic_message_pruning_compaction_and_vacuum(self) -> None:
+        import json as _json
+
+        proj = self.db.create_project(
+            ProjectCreate(name="CleanupDemo", root_path=self.tmp.name, backup_dir="backup")
+        )
+        sess = self.db.create_session(SessionCreate(project_id=proj.id, title="LongSession"))
+
+        # Insert 85 alternating messages including huge old tool_event and base64 image attachments
+        big_file_content = "x = 1\n" * 4000
+        big_b64_img = "data:image/png;base64," + ("A" * 24000)
+        from models import AttachmentItem
+
+        for i in range(42):
+            atts = (
+                [AttachmentItem(kind="image", label=f"shot_{i}.png", content=big_b64_img, mime_type="image/png", estimated_tokens=500)]
+                if i < 5
+                else []
+            )
+            self.db.add_message(sess.id, role="user", text=f"Turn {i}", attachments=atts)
+            self.db.add_message(
+                sess.id,
+                role="model",
+                text=f"Step {i}",
+                tool_calls=[{"id": f"c{i}", "name": "read_file", "args": {"path": "app.py"}}],
+            )
+            self.db.add_message(
+                sess.id,
+                role="tool_event",
+                text=_json.dumps({
+                    "tool_name": "read_file",
+                    "call_id": f"c{i}",
+                    "response": {"path": "app.py", "total_lines": 4000, "content": big_file_content},
+                }),
+            )
+
+        # Create & resolve 30 gates so pruning removes >10 resolved gates
+        for g_idx in range(30):
+            g = self.db.create_gate(
+                sess.id,
+                "read_file",
+                {"path": "app.py"},
+                {"title": f"Read {g_idx}", "diff": "D" * 8000},
+            )
+            self.db.resolve_gate(g["id"], "approved", {"path": "app.py", "content": big_file_content})
+
+        # Automatic pruning inside add_message/resolve_gate should keep DB bounded well under 100 messages
+        kept = self.db.list_messages(sess.id)
+        self.assertLessEqual(len(kept), 65)
+        self.assertNotEqual(kept[0].role, "tool_event")
+
+        # Run explicit cleanup with VACUUM and confirm file size shrinks substantially
+        stats = self.db.cleanup_database(force_vacuum=True)
+        self.assertTrue(stats["vacuumed"])
+        self.assertLess(stats["db_bytes_after"], 200_000)
+
 
 if __name__ == "__main__":
     unittest.main()

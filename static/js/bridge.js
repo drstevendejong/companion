@@ -1,23 +1,25 @@
 // bridge.js - Playground Bridge workflow (0 Gemini API tokens):
-// 1-click Paste & Run Clipboard primary CTA (auto-reads, gated writes/scripts), collapsible manual paste fallback,
+// 2 clear composer CTAs (Copy Starter/Prompt -> Playground & Paste & Run AI Reply),
+// automatic clipboard-blocked paste fallback, accidental prompt-box AI command detection,
 // persistent clipboard recovery, smart denial handoff, topbar Directives pill, and .md packer auto-copying.
 
 import { api } from "./api.js";
 import { emit, estimateTokensLocal, getActiveProject, on, state } from "./state.js";
 
 const promptInput = document.getElementById("prompt-input");
-const stageClipboardBtn = document.getElementById("btn-bridge-stage-clipboard");
 const clipboardParseBtn = document.getElementById("btn-bridge-clipboard-parse");
-const manualPasteBtn = document.getElementById("btn-bridge-manual-paste");
 
 const directivesPill = document.getElementById("btn-bridge-directives-pill");
 const copyImgBtn = document.getElementById("btn-bridge-copy-img");
 const copyBundleBtn = document.getElementById("btn-bridge-copy-bundle");
 
+const detectBar = document.getElementById("bridge-prompt-detect-bar");
+const detectKeepBtn = document.getElementById("btn-prompt-keep-text");
+const detectRunBtn = document.getElementById("btn-prompt-run-detected");
+
 const pasteWrap = document.getElementById("bridge-paste-wrap");
 const pasteInput = document.getElementById("bridge-response-input");
 const pasteHint = document.getElementById("bridge-paste-hint");
-const parseStageBtn = document.getElementById("btn-bridge-parse-stage");
 const parseBtn = document.getElementById("btn-bridge-parse");
 const clearPasteBtn = document.getElementById("btn-bridge-clear-paste");
 const closePasteBtn = document.getElementById("btn-bridge-close-paste");
@@ -36,6 +38,7 @@ let lastSyncedSessionId = null;
 let manualPasteOpen = false;
 let outputAutoHideTimer = null;
 let directivesOverride = null; // null = follow !session.directives_sent
+let dismissedDetectForText = null;
 
 const mdContentCache = new Map(); // `${projectId}:${path}` -> markdown text
 
@@ -43,9 +46,14 @@ export function initBridge() {
   copyBundleBtn.addEventListener("click", copyPromptBundle);
   copyImgBtn.addEventListener("click", copyNextCdpImage);
   clipboardParseBtn.addEventListener("click", () => handleClipboardQuickParse(true));
-  stageClipboardBtn.addEventListener("click", () => handleClipboardQuickParse(false));
-  manualPasteBtn.addEventListener("click", () => setManualPasteOpen(!manualPasteOpen, !manualPasteOpen));
   closePasteBtn.addEventListener("click", () => setManualPasteOpen(false, false));
+
+  detectKeepBtn.addEventListener("click", () => {
+    dismissedDetectForText = promptInput.value.trim();
+    syncPromptDetectBar();
+    promptInput.focus();
+  });
+  detectRunBtn.addEventListener("click", runDetectedBridgeFromPrompt);
 
   clearPasteBtn.addEventListener("click", () => {
     pasteInput.value = "";
@@ -53,7 +61,6 @@ export function initBridge() {
     pasteInput.focus();
   });
   parseBtn.addEventListener("click", () => parseRawMarkdown(pasteInput.value, true));
-  parseStageBtn.addEventListener("click", () => parseRawMarkdown(pasteInput.value, false));
   pasteInput.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
       ev.preventDefault();
@@ -71,17 +78,22 @@ export function initBridge() {
   });
 
   on("bridge:copy-bundle", copyPromptBundle);
+  on("bridge:run-detected-prompt", runDetectedBridgeFromPrompt);
   on("bridge:session-synced", syncDirectivesPillForSession);
   on("composer:attachments-changed", () => {
     syncImageCopyButton();
     syncCopyBundleHighlight();
   });
-  on("composer:updated", syncCopyBundleHighlight);
+  on("composer:updated", () => {
+    syncCopyBundleHighlight();
+    syncPromptDetectBar();
+  });
   on("app:mode-changed", () => {
     syncManualPasteVisibility();
     syncDirectivesPillForSession();
     syncImageCopyButton();
     syncCopyBundleHighlight();
+    syncPromptDetectBar();
   });
 
   on("bridge:auto-copy-result", async ({ key, text, mdCacheKey, mdContent }) => {
@@ -121,6 +133,7 @@ export function initBridge() {
   syncDirectivesPillForSession();
   syncImageCopyButton();
   syncCopyBundleHighlight();
+  syncPromptDetectBar();
 }
 
 export function isBridgeDirectivesChecked() {
@@ -165,23 +178,44 @@ export function formatBridgeToolResults(toolEvents) {
       );
     } else if (resp.applied) {
       blocks.push(`- **${name}**: Patch applied to \`${resp.path}\` (backup: \`${resp.backup_path}\`)`);
-    } else if (resp.deleted) {
-      blocks.push(`- **${name}**: Deleted \`${resp.path}\` (backup: \`${resp.backup_path}\`)`);
     } else if (resp.renamed) {
       blocks.push(
         `- **${name}**: Renamed \`${resp.old_path}\` → \`${resp.new_path}\` (backup: \`${resp.backup_path}\`)`
       );
     } else if (resp.written) {
       if (resp.executed) {
-        let line = `- **${name}**: Wrote \`${resp.path}\` and executed (exit code \`${resp.exit_code}\`).`;
+        const delNote = resp.deleted ? " and deleted temporary script" : "";
+        let line = `- **${name}**: Wrote \`${resp.path}\` and executed${delNote} (exit code \`${resp.exit_code}\`).`;
         const preview = String(resp.output_preview || "").trim();
-        if (((resp.exit_code ?? 0) !== 0 || resp.has_traceback) && preview) {
+        if (preview) {
           line += `\n\`\`\`text\n${preview}\n\`\`\``;
         }
         blocks.push(line);
       } else {
         blocks.push(`- **${name}**: Wrote \`${resp.path}\` to disk.`);
       }
+    } else if (name === "run_script" || name === "run_and_delete_script") {
+      const cmd = resp.command || resp.path || "script";
+      const code = resp.exit_code ?? "?";
+      const ok = code === 0 && !resp.has_traceback;
+      const statusLbl =
+        name === "run_and_delete_script"
+          ? ok && resp.deleted
+            ? "OK — script auto-deleted"
+            : ok
+              ? "OK"
+              : "FAILED (script kept on disk for patching)"
+          : ok
+            ? "OK"
+            : "FAILED";
+      let line = `- **${name}** (\`${cmd}\`): **${statusLbl}** (exit code \`${code}\`).`;
+      const preview = String(resp.output_preview || "").trim();
+      if (preview) {
+        line += `\n\`\`\`text\n${preview}\n\`\`\``;
+      }
+      blocks.push(line);
+    } else if (resp.deleted) {
+      blocks.push(`- **${name}**: Deleted \`${resp.path}\` (backup: \`${resp.backup_path}\`)`);
     } else if (name === "run_tests") {
       const cmd = resp.command || "tests";
       const code = resp.exit_code ?? "?";
@@ -257,9 +291,64 @@ function syncDirectivesPillForSession() {
     directivesPill.textContent = alreadySent ? "Directives ✓" : "Directives: Off";
   }
   if (!copyBundleBtn.disabled) {
-    copyBundleBtn.textContent = checked ? "Copy Session Starter" : "Copy Prompt";
+    copyBundleBtn.textContent = checked ? "Copy Starter \u2192 Playground" : "Copy Prompt \u2192 Playground";
   }
   syncCopyBundleHighlight();
+  syncPromptDetectBar();
+}
+
+export function looksLikeBridgeAiOutput(rawText) {
+  const trimmed = String(rawText || "").trim();
+  if (!trimmed || trimmed.length < 12) return false;
+  if (
+    trimmed.startsWith("## Local Workspace Tool Results") ||
+    trimmed.startsWith("# Session Context — Project:") ||
+    trimmed.startsWith("## Local Test / Command")
+  ) {
+    return false;
+  }
+  if (/^\s*```(?:json|jsonc|markdown|md)\b[\s\S]*"(?:tool|tool_name|name|action|actions|tool_calls)"\s*:/i.test(trimmed)) {
+    return true;
+  }
+  if (/^(?:jsonc?|application\/json)?\s*\n?\s*[\[{][\s\S]*"(?:tool|tool_name|name|action|actions|tool_calls)"\s*:/i.test(trimmed)) {
+    return true;
+  }
+  if (/```json[\s\S]*"(?:tool|tool_name|actions|tool_calls)"\s*:/i.test(trimmed)) {
+    return true;
+  }
+  if (/(?:^|\n)json\s*\n\s*[\[{][\s\S]*"(?:tool|tool_name)"\s*:/i.test(trimmed)) {
+    return true;
+  }
+  if (/^\s*```(?:python|py)\b[\s\S]*\b(?:import|from|def|Path)\b/i.test(trimmed)) {
+    return true;
+  }
+  return false;
+}
+
+export function isDetectedPromptAiPending() {
+  if (state.apiEnabled || !state.activeSessionId) return false;
+  const trimmed = String((promptInput && promptInput.value) || "").trim();
+  if (!trimmed) return false;
+  if (dismissedDetectForText && dismissedDetectForText === trimmed) return false;
+  return looksLikeBridgeAiOutput(trimmed);
+}
+
+function syncPromptDetectBar() {
+  if (!detectBar) return;
+  const trimmed = String((promptInput && promptInput.value) || "").trim();
+  if (!trimmed || (dismissedDetectForText && dismissedDetectForText !== trimmed)) {
+    dismissedDetectForText = null;
+  }
+  detectBar.classList.toggle("hidden", !isDetectedPromptAiPending());
+}
+
+async function runDetectedBridgeFromPrompt() {
+  if (state.apiEnabled || !state.activeSessionId) return;
+  const raw = String(promptInput.value || "").trim();
+  if (!raw) return;
+  dismissedDetectForText = null;
+  if (detectBar) detectBar.classList.add("hidden");
+  await parseRawMarkdown(raw, true, { clearPromptOnRun: true });
 }
 
 function syncImageCopyButton() {
@@ -314,11 +403,15 @@ async function copyPromptBundle() {
 
     copyBundleBtn.textContent = `Copied (~${Number(res.estimated_tokens || 0).toLocaleString()} tok)`;
     setTimeout(() => {
-      copyBundleBtn.textContent = isBridgeDirectivesChecked() ? "Copy Session Starter" : "Copy Prompt";
+      copyBundleBtn.textContent = isBridgeDirectivesChecked()
+        ? "Copy Starter \u2192 Playground"
+        : "Copy Prompt \u2192 Playground";
     }, 2000);
   } catch (err) {
     emit("chat:error", err.message);
-    copyBundleBtn.textContent = isBridgeDirectivesChecked() ? "Copy Session Starter" : "Copy Prompt";
+    copyBundleBtn.textContent = isBridgeDirectivesChecked()
+      ? "Copy Starter \u2192 Playground"
+      : "Copy Prompt \u2192 Playground";
   } finally {
     copyBundleBtn.disabled = false;
   }
@@ -367,7 +460,7 @@ async function handleClipboardQuickParse(autoApproveReads) {
   }
 }
 
-async function parseRawMarkdown(rawInput, autoApproveReads = true) {
+async function parseRawMarkdown(rawInput, autoApproveReads = true, opts = {}) {
   if (!state.activeSessionId) return;
   const raw = String(rawInput || "").trim();
   if (!raw) return;
@@ -385,11 +478,10 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true) {
   }
 
   parseBtn.disabled = true;
-  parseStageBtn.disabled = true;
   clipboardParseBtn.disabled = true;
-  stageClipboardBtn.disabled = true;
+  if (detectRunBtn) detectRunBtn.disabled = true;
   parseBtn.textContent = "Running...";
-  clipboardParseBtn.textContent = autoApproveReads ? "Running..." : "Staging...";
+  clipboardParseBtn.textContent = "Running...";
   let copyOutcome = null;
   let hasErrorOutcome = false;
   state.gatesHiddenDueToError = false;
@@ -399,6 +491,11 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true) {
     const res = await api.bridgeParse(state.activeSessionId, raw, autoApproveReads);
     pasteInput.value = "";
     pasteHint.textContent = DEFAULT_PASTE_HINT;
+    if (opts.clearPromptOnRun) {
+      promptInput.value = "";
+      dismissedDetectForText = null;
+      emit("composer:updated");
+    }
     hideOutputBar();
     setManualPasteOpen(false, false);
     state.activeSession = res.session;
@@ -441,22 +538,21 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true) {
     emit("chat:error", err.message);
   } finally {
     parseBtn.disabled = false;
-    parseStageBtn.disabled = false;
     clipboardParseBtn.disabled = false;
-    stageClipboardBtn.disabled = false;
-    parseBtn.textContent = "Run Reads & Stage Writes";
+    if (detectRunBtn) detectRunBtn.disabled = false;
+    parseBtn.textContent = "Run & Stage Tools";
     if (copyOutcome === "copied") {
-      clipboardParseBtn.textContent = hasErrorOutcome ? "Copied Error ✓" : "Copied Result ✓";
+      clipboardParseBtn.textContent = hasErrorOutcome ? "Copied Error \u2713" : "Copied Result \u2713";
       setTimeout(() => {
-        clipboardParseBtn.textContent = "Paste & Run Clipboard";
+        clipboardParseBtn.textContent = "Paste & Run AI Reply";
       }, 1800);
     } else if (copyOutcome === "blocked") {
       clipboardParseBtn.textContent = hasErrorOutcome ? "Click Copy Error" : "Click Copy in Balloon";
       setTimeout(() => {
-        clipboardParseBtn.textContent = "Paste & Run Clipboard";
+        clipboardParseBtn.textContent = "Paste & Run AI Reply";
       }, 2400);
     } else {
-      clipboardParseBtn.textContent = "Paste & Run Clipboard";
+      clipboardParseBtn.textContent = "Paste & Run AI Reply";
     }
   }
 }

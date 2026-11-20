@@ -23,7 +23,7 @@ from services.token_utils import estimate_tokens
 READ_ONLY_TOOLS = {"list_tree", "search_code", "read_lines", "read_file"}
 PATCH_TOOLS = {"patch_literal", "patch_lines", "write_file", "delete_file", "rename_file"}
 SCRIPT_TOOLS = {"propose_script"}
-COMMAND_TOOLS = {"run_tests"}
+COMMAND_TOOLS = {"run_tests", "run_script", "run_and_delete_script"}
 
 _FALLBACK_SYSTEM_PROMPT = """You are a senior coding partner connected to the user's local workspace via human-gated tools.
 Every tool round-trip re-sends conversation history and burns rate-limit tokens. Strictly minimize token usage and round-trips:
@@ -44,7 +44,7 @@ Every tool round-trip re-sends conversation history and burns rate-limit tokens.
 
 4. SURGICAL PATCHING, SCRIPTS & ATOMIC TEST LOOPS:
    - Prefer `patch_literal` (minimal unique context) over `patch_lines` or `write_file`. Only use `write_file` for new files or >70% rewrites. If `patch_literal` fails to match, Companion returns line-number and nearest-diff diagnostics for fast self-correction.
-   - Use `propose_script` for multi-file mechanical edits. If a large patch/script fails, PATCH the existing script with `patch_literal`/`patch_lines` instead of regenerating the full script.
+   - Use `propose_script` for multi-file mechanical edits or single-shot inspectors (set `"delete_on_success": true` if temporary). If a script fails, PATCH the existing script with `patch_literal`/`patch_lines` and call `run_script` (to keep it) or `run_and_delete_script` (to run and automatically delete once it passes).
    - Companion automatically saves a reversible project checkpoint before the first write in a batch. Do NOT run tests on intermediate half-finished edits—only emit `run_tests` once a coherent batch of changes is complete and ready to verify.
    - Git operations (`git status`, `git diff`, commit drafting, Commit / Commit & Push) are handled directly by the user inside Companion's right-drawer Git tab, not via autonomous model tools.
 """
@@ -212,15 +212,42 @@ def build_tool_declarations() -> types.Tool:
         ),
         types.FunctionDeclaration(
             name="propose_script",
-            description="Propose a Python probe, packer, or patcher script to write to disk and optionally run in the project venv.",
+            description="Propose a Python probe, packer, or patcher script to write to disk and optionally run in the project venv (optionally auto-deleting on pass if delete_on_success=true).",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
                     "path": types.Schema(type=types.Type.STRING, description="Relative script path, e.g. 'developer/probe_tmp.py'"),
                     "content": types.Schema(type=types.Type.STRING, description="Executable Python script content"),
+                    "delete_on_success": types.Schema(type=types.Type.BOOLEAN, description="Optional: auto-delete script once it exits cleanly (0 with no traceback); keeps on error for patching"),
                     "summary": types.Schema(type=types.Type.STRING, description="What this script checks or modifies"),
                 },
                 required=["path", "content"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="run_script",
+            description="Request human-gated execution of an existing (or earlier-in-batch) Python script inside the project venv.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "path": types.Schema(type=types.Type.STRING, description="Relative path to Python script inside project"),
+                    "args": types.Schema(type=types.Type.STRING, description="Optional CLI arguments string to pass to the script"),
+                    "summary": types.Schema(type=types.Type.STRING, description="Brief note on what running this script checks or performs"),
+                },
+                required=["path"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="run_and_delete_script",
+            description="Request human-gated execution of an inspection/temporary Python script in the project venv and automatically delete it once it succeeds cleanly (exit code 0 with no traceback). Keeps the script on failure so you can patch it.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "path": types.Schema(type=types.Type.STRING, description="Relative path to temporary/inspection Python script inside project"),
+                    "args": types.Schema(type=types.Type.STRING, description="Optional CLI arguments string to pass to the script"),
+                    "summary": types.Schema(type=types.Type.STRING, description="Brief note on what this inspection script checks before cleanup"),
+                },
+                required=["path"],
             ),
         ),
         types.FunctionDeclaration(
@@ -473,10 +500,58 @@ def prepare_tool_gate_preview(
             "title": f"Propose Script: {args['path']}",
             "summary": str(args.get("summary", "Executable Python script")),
             "script_content": str(args["content"]),
+            "delete_on_success": bool(args.get("delete_on_success", False)),
             "diff": preview["diff"],
             "ast_valid": preview["ast_valid"],
             "estimated_tokens": estimate_tokens(str(args["content"])),
             "prepared_patch": preview,
+        }
+
+    if tool_name in ("run_script", "run_and_delete_script"):
+        import shlex as _shlex
+
+        rel_path = str(args.get("path") or args.get("target") or "").strip()
+        if not rel_path:
+            raise ValueError(f"{tool_name} requires 'path'.")
+        target_abs = fs_tools.resolve_safe_path(root, rel_path)
+        if target_abs.suffix.lower() != ".py":
+            raise ValueError(f"{tool_name} only supports .py scripts inside project (got '{rel_path}').")
+        rel_posix = target_abs.relative_to(Path(root).resolve()).as_posix()
+        raw_args = args.get("args")
+        if isinstance(raw_args, list):
+            arg_list = [str(x) for x in raw_args if str(x) != ""]
+        elif isinstance(raw_args, str) and raw_args.strip():
+            arg_list = _shlex.split(raw_args.strip(), posix=(os.name != "nt"))
+        else:
+            arg_list = []
+        cmd = " ".join(["python", _shlex.quote(rel_posix), *(_shlex.quote(a) for a in arg_list)])
+        exists_note = "" if target_abs.is_file() else " (will run after earlier batch file edits)"
+        auto_delete = tool_name == "run_and_delete_script"
+        delete_note = (
+            f" · Deletes {rel_posix} automatically if exit code is 0 with no traceback (keeps on error for patching)."
+            if auto_delete
+            else ""
+        )
+        return {
+            "category": "command",
+            "title": (
+                f"Run & Delete on Pass: {rel_posix}"
+                if auto_delete
+                else f"Run Script: {rel_posix}"
+            ),
+            "summary": str(
+                args.get("summary")
+                or (
+                    f"Execute {rel_posix} and auto-delete if it succeeds"
+                    if auto_delete
+                    else f"Execute {rel_posix} in project Python"
+                )
+            ),
+            "detail": f"Command: {cmd}{delete_note}{exists_note}",
+            "command": cmd,
+            "script_path": rel_posix,
+            "auto_delete_on_success": auto_delete,
+            "estimated_tokens": 200,
         }
 
     if tool_name == "run_tests":

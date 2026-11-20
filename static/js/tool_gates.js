@@ -46,12 +46,21 @@ function renderPendingGates() {
       )
     );
   } else if (scriptOnly.length > 0) {
+    const allAutoDelete = scriptOnly.every((g) => Boolean((g.preview || {}).delete_on_success));
     batchBtns.appendChild(
-      makeBtn(`Write & Run All (${scriptOnly.length})`, "btn btn-primary btn-xs", () =>
-        decideBatchGates(
-          scriptOnly.map((g) => ({ gate_id: g.id, decision: { action: "write_and_run" } })),
-          true
-        )
+      makeBtn(
+        allAutoDelete
+          ? `Write, Run & Delete All (${scriptOnly.length})`
+          : `Write & Run All (${scriptOnly.length})`,
+        "btn btn-primary btn-xs",
+        () =>
+          decideBatchGates(
+            scriptOnly.map((g) => ({
+              gate_id: g.id,
+              decision: { action: (g.preview || {}).delete_on_success ? "write_run_and_delete" : "write_and_run" },
+            })),
+            true
+          )
       )
     );
   }
@@ -181,18 +190,35 @@ function renderPendingGates() {
         )
       );
     } else if (preview.category === "script") {
+      const preferDelete = Boolean(preview.delete_on_success);
       actions.appendChild(
         makeBtn("Write to Disk Only", "btn btn-secondary btn-sm", () =>
           decideGate(gate.id, { action: "write_only" })
         )
       );
       actions.appendChild(
-        makeBtn("Write & Run in Venv", "btn btn-primary btn-sm", () =>
-          decideGate(gate.id, { action: "write_and_run" })
+        makeBtn(
+          "Write & Run in Venv",
+          preferDelete ? "btn btn-secondary btn-sm" : "btn btn-primary btn-sm",
+          () => decideGate(gate.id, { action: "write_and_run" })
+        )
+      );
+      actions.appendChild(
+        makeBtn(
+          "Write, Run & Delete on Pass",
+          preferDelete ? "btn btn-primary btn-sm" : "btn btn-secondary btn-sm",
+          () => decideGate(gate.id, { action: "write_run_and_delete" })
         )
       );
     } else if (preview.category === "command") {
-      const runBtnLabel = preview.is_full_suite === false ? "Run Quick Check" : "Run Tests";
+      const runBtnLabel =
+        gate.tool_name === "run_and_delete_script"
+          ? "Run & Delete on Pass"
+          : gate.tool_name === "run_script"
+            ? "Run Script in Venv"
+            : preview.is_full_suite === false
+              ? "Run Quick Check"
+              : "Run Tests";
       actions.appendChild(
         makeBtn(runBtnLabel, "btn btn-primary btn-sm", () =>
           decideGate(gate.id, { action: "approve" })
@@ -236,8 +262,24 @@ async function decideGate(gateId, body) {
   state.activeAbortController = controller;
   state.busy = true;
   state.resolvingGateId = gateId;
-  if (gateObj && gateObj.tool_name === "propose_script" && body.action === "write_and_run") {
-    state.pendingStatusText = `Running proposed script${gatePath ? `: ${gatePath}` : ""}...`;
+  if (
+    gateObj &&
+    gateObj.tool_name === "propose_script" &&
+    (body.action === "write_and_run" || body.action === "write_run_and_delete")
+  ) {
+    state.pendingStatusText =
+      body.action === "write_run_and_delete"
+        ? `Running & auto-deleting on pass${gatePath ? `: ${gatePath}` : ""}...`
+        : `Running proposed script${gatePath ? `: ${gatePath}` : ""}...`;
+  } else if (
+    gateObj &&
+    (gateObj.tool_name === "run_script" || gateObj.tool_name === "run_and_delete_script") &&
+    body.action === "approve"
+  ) {
+    state.pendingStatusText =
+      gateObj.tool_name === "run_and_delete_script"
+        ? `Running & auto-deleting on pass${gatePath ? `: ${gatePath}` : ""}...`
+        : `Running script${gatePath ? `: ${gatePath}` : ""}...`;
   } else if (gateObj && gateObj.tool_name === "run_tests" && body.action === "approve") {
     const cmd = (gateObj.preview && gateObj.preview.command) || "tests";
     state.pendingStatusText = `Running ${gateObj.preview && gateObj.preview.is_full_suite === false ? "quick check" : "tests"}: ${cmd}...`;
@@ -313,17 +355,22 @@ function applyGateResponse(res, actionHint) {
   state.pendingGates = res.pending_gates || [];
   if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
 
+  const cmdResults = Array.isArray(res.command_results)
+    ? res.command_results
+    : res.command_result
+      ? [res.command_result]
+      : [];
   if (res.patch_record) {
     emit("backups:refresh");
     emit("git:refresh");
     emit("tree:refresh");
     const proj = getActiveProject();
-    if (proj && proj.post_patch_command && actionHint === "approve" && !res.command_result) {
+    if (proj && proj.post_patch_command && actionHint === "approve" && cmdResults.length === 0) {
       emit("terminal:suggest-post-tests", proj.post_patch_command);
     }
   }
-  if (res.command_result) {
-    emit("terminal:show-result", res.command_result);
+  for (const cr of cmdResults) {
+    emit("terminal:show-result", cr);
   }
   if (res.checkpoint_committed) {
     emit("git:refresh");

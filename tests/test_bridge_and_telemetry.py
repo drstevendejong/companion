@@ -1142,6 +1142,240 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                 else:
                     sys.modules[k] = orig
 
+    def test_propose_script_exit0_output_run_script_and_live_streaming(self) -> None:
+        import asyncio
+        import json as _json
+
+        has_pydantic = importlib.util.find_spec("pydantic") is not None
+        ctx = patch.dict(sys.modules, {}, clear=False) if has_pydantic else _load_bridge_with_stubs()
+        saved_mods = {
+            k: sys.modules.get(k)
+            for k in (
+                "models",
+                "storage.db",
+                "services.checkpoints",
+                "services.bridge",
+                "services.runner",
+                "services.gemini_client",
+                "routes.chat",
+                "fastapi",
+            )
+        }
+        try:
+            with ctx:
+                fastapi_mod = pytypes.ModuleType("fastapi")
+                fastapi_mod.APIRouter = lambda **_kw: SimpleNamespace(
+                    post=lambda *_a, **_k: (lambda fn: fn),
+                    get=lambda *_a, **_k: (lambda fn: fn),
+                )
+                fastapi_mod.HTTPException = Exception
+                fastapi_mod.Query = lambda default=None, **_kw: default
+                fastapi_mod.Request = object
+
+                for k in (
+                    "models",
+                    "storage.db",
+                    "services.checkpoints",
+                    "services.bridge",
+                    "services.runner",
+                    "services.gemini_client",
+                    "routes.chat",
+                ):
+                    sys.modules.pop(k, None)
+
+                with patch.dict(sys.modules, {"fastapi": fastapi_mod}, clear=False):
+                    from models import ProjectCreate, SessionCreate
+                    from routes import chat as route_chat
+                    from services import bridge, gemini_client
+                    from storage.db import CompanionDB
+
+                    with tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp) / "proj"
+                        root.mkdir()
+                        db = CompanionDB(Path(tmp) / "companion.db")
+                        proj = db.create_project(
+                            ProjectCreate(
+                                name="ScriptProj",
+                                root_path=str(root),
+                                python_path=sys.executable,
+                                directives_path=None,
+                                backup_dir="backup",
+                                cdp_port=9222,
+                                ignore_patterns=[],
+                                preset_commands=[],
+                            )
+                        )
+                        sess = db.create_session(
+                            SessionCreate(
+                                project_id=proj.id,
+                                title="S-script",
+                                api_enabled=False,
+                                model="gemini-4-hydrogen",
+                                thinking_level="HIGH",
+                                auto_approve_read_tokens=0,
+                            )
+                        )
+
+                        ws_events: list[dict] = []
+
+                        class FakeWS:
+                            async def send_text(self, raw: str) -> None:
+                                ws_events.append(_json.loads(raw))
+
+                        app_obj = SimpleNamespace(state=SimpleNamespace(db=db, gemini=None, lifecycle_sockets={FakeWS()}))
+                        req = SimpleNamespace(app=app_obj)
+
+                        # 1. propose_script exiting cleanly (exit 0) MUST include full stdout in bridge_reply_text AND stream over WebSocket
+                        script_code = (
+                            "import sys\n"
+                            "print('HEADER_LINE')\n"
+                            "sys.stdout.flush()\n"
+                            "print('PROBE_RESULT_42', ' '.join(sys.argv[1:]))\n"
+                        )
+                        g_prop = db.create_gate(
+                            sess.id,
+                            "propose_script",
+                            {"path": "probe.py", "content": script_code, "summary": "Run probe"},
+                            {"summary": "Run probe"},
+                        )
+                        res1 = asyncio.run(
+                            route_chat.resolve_tool_gate(
+                                g_prop["id"], SimpleNamespace(action="write_and_run", reason=None), req
+                            )
+                        )
+                        self.assertIn("HEADER_LINE", res1["bridge_reply_text"])
+                        self.assertIn("PROBE_RESULT_42", res1["bridge_reply_text"])
+                        self.assertIn("exit code `0`", res1["bridge_reply_text"])
+                        self.assertTrue(any(ev.get("type") == "exec_start" for ev in ws_events))
+                        self.assertTrue(any(ev.get("type") == "exec_chunk" and "PROBE_RESULT_42" in ev.get("chunk", "") for ev in ws_events))
+                        self.assertTrue(any(ev.get("type") == "exec_done" and ev.get("exit_code") == 0 for ev in ws_events))
+
+                        # 2. run_script executes patched/existing script with optional args behind a human gate
+                        parsed = bridge.parse_playground_markdown(
+                            'Re-running patched probe script.\n```json\n{"tool": "run_script", "path": "probe.py", "args": "--verbose demo", "summary": "Re-run probe"}\n```'
+                        )
+                        self.assertEqual(parsed["actions"][0]["tool"], "run_script")
+                        preview = gemini_client.prepare_tool_gate_preview(proj, "run_script", parsed["actions"][0]["args"])
+                        self.assertEqual(preview["category"], "command")
+                        self.assertEqual(preview["script_path"], "probe.py")
+
+                        g_run = db.create_gate(
+                            sess.id,
+                            "run_script",
+                            parsed["actions"][0]["args"],
+                            {k: v for k, v in preview.items() if k != "prepared_result"},
+                        )
+                        res2 = asyncio.run(
+                            route_chat.resolve_tool_gate(
+                                g_run["id"], SimpleNamespace(action="approve", reason=None), req
+                            )
+                        )
+                        self.assertIn("**run_script**", res2["bridge_reply_text"])
+                        self.assertIn("PROBE_RESULT_42 --verbose demo", res2["bridge_reply_text"])
+                        self.assertEqual(res2["command_results"][0]["exit_code"], 0)
+
+                        # 3. run_and_delete_script keeps failing script for patching, then auto-deletes once patched & passing
+                        probe2 = root / "inspect_tmp.py"
+                        probe2.write_text("import sys\nprint('ABOUT_TO_FAIL')\nsys.exit(2)\n", encoding="utf-8")
+                        parsed_fail = bridge.parse_playground_markdown(
+                            'Running inspection probe.\n```json\n{"tool": "run_and_delete_script", "path": "inspect_tmp.py", "summary": "Inspect state"}\n```'
+                        )
+                        self.assertEqual(parsed_fail["actions"][0]["tool"], "run_and_delete_script")
+                        prev_fail = gemini_client.prepare_tool_gate_preview(
+                            proj, "run_and_delete_script", parsed_fail["actions"][0]["args"]
+                        )
+                        self.assertTrue(prev_fail["auto_delete_on_success"])
+                        g_fail = db.create_gate(
+                            sess.id,
+                            "run_and_delete_script",
+                            parsed_fail["actions"][0]["args"],
+                            {k: v for k, v in prev_fail.items() if k != "prepared_result"},
+                        )
+                        db.add_message(sess.id, role="model", text="Running probe2")
+                        res_fail = asyncio.run(
+                            route_chat.resolve_tool_gate(
+                                g_fail["id"], SimpleNamespace(action="approve", reason=None), req
+                            )
+                        )
+                        self.assertTrue(probe2.is_file(), "Failing script must stay on disk for patching")
+                        self.assertIn("script kept on disk for patching", res_fail["bridge_reply_text"])
+
+                        db.add_message(sess.id, role="model", text="Patched inspect_tmp.py")
+                        probe2.write_text("print('INSPECTION_OK_99')\n", encoding="utf-8")
+                        g_pass = db.create_gate(
+                            sess.id,
+                            "run_and_delete_script",
+                            {"path": "inspect_tmp.py", "summary": "Re-run patched probe"},
+                            {k: v for k, v in prev_fail.items() if k != "prepared_result"},
+                        )
+                        res_pass = asyncio.run(
+                            route_chat.resolve_tool_gate(
+                                g_pass["id"], SimpleNamespace(action="approve", reason=None), req
+                            )
+                        )
+                        self.assertFalse(probe2.exists(), "Passing run_and_delete_script must delete the script")
+                        self.assertIn("INSPECTION_OK_99", res_pass["bridge_reply_text"])
+                        self.assertIn("script auto-deleted", res_pass["bridge_reply_text"])
+                        self.assertIsNotNone(res_pass.get("patch_record"))
+
+                        # 4. propose_script with action='write_run_and_delete' writes, executes, captures output, and deletes
+                        g_oneshot = db.create_gate(
+                            sess.id,
+                            "propose_script",
+                            {"path": "oneshot.py", "content": "print('ONESHOT_42')\n", "delete_on_success": True},
+                            {"summary": "One-shot check", "delete_on_success": True},
+                        )
+                        db.add_message(sess.id, role="model", text="One-shot check")
+                        res_oneshot = asyncio.run(
+                            route_chat.resolve_tool_gate(
+                                g_oneshot["id"], SimpleNamespace(action="write_run_and_delete", reason=None), req
+                            )
+                        )
+                        self.assertFalse((root / "oneshot.py").exists())
+                        self.assertIn("ONESHOT_42", res_oneshot["bridge_reply_text"])
+                        self.assertIn("deleted temporary script", res_oneshot["bridge_reply_text"])
+
+                        # 5. Automatic DB pruning + compaction + VACUUM keeps companion.db lean
+                        from models import AttachmentItem
+
+                        big_blob = "line = 1\n" * 3500
+                        big_img = "data:image/png;base64," + ("A" * 20000)
+                        for idx in range(30):
+                            atts = (
+                                [AttachmentItem(kind="image", label=f"p{idx}.png", content=big_img, mime_type="image/png", estimated_tokens=400)]
+                                if idx < 4
+                                else []
+                            )
+                            db.add_message(sess.id, role="user", text=f"Prompt {idx}", attachments=atts)
+                            db.add_message(
+                                sess.id,
+                                role="model",
+                                text=f"Reply {idx}",
+                                tool_calls=[{"id": f"k{idx}", "name": "read_file", "args": {"path": "x.py"}}],
+                            )
+                            db.add_message(
+                                sess.id,
+                                role="tool_event",
+                                text=_json.dumps({
+                                    "tool_name": "read_file",
+                                    "call_id": f"k{idx}",
+                                    "response": {"path": "x.py", "total_lines": 3500, "content": big_blob},
+                                }),
+                            )
+
+                        msgs_after = db.list_messages(sess.id)
+                        self.assertLessEqual(len(msgs_after), 65)
+                        self.assertNotEqual(msgs_after[0].role, "tool_event")
+                        stats = db.cleanup_database(force_vacuum=True)
+                        self.assertTrue(stats["vacuumed"])
+                        self.assertLess(stats["db_bytes_after"], 200_000)
+        finally:
+            for k, orig in saved_mods.items():
+                if orig is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = orig
+
 
 if __name__ == "__main__":
     unittest.main()

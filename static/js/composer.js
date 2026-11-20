@@ -1,7 +1,7 @@
 // composer.js - Prompt box, Ctrl+V image paste, attachment chips, and Paste-into-Prompt
 
 import { api } from "./api.js";
-import { isBridgeDirectivesChecked } from "./bridge.js";
+import { isBridgeDirectivesChecked, isDetectedPromptAiPending } from "./bridge.js";
 import { emit, estimateTokensLocal, on, state } from "./state.js";
 
 const promptInput = document.getElementById("prompt-input");
@@ -22,6 +22,8 @@ export function initComposer() {
       ev.preventDefault();
       if (state.apiEnabled) {
         sendCurrentPrompt();
+      } else if (isDetectedPromptAiPending()) {
+        emit("bridge:run-detected-prompt");
       } else {
         emit("bridge:copy-bundle");
       }

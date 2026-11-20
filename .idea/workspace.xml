@@ -4,55 +4,32 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="755dfcc9-53f5-49c7-a40f-350c41d0b337" name="Changes" comment="Workflow improvements.">
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/routes/bridge.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/services/bridge.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/services/model_catalog.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/services/quota_parser.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/static/js/bridge.js" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/tests/test_bridge_and_telemetry.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/tests/test_quota_and_catalog.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/tests/test_thought_signature.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/gemini-vibe-companion.iml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" />
+    <list default="true" id="755dfcc9-53f5-49c7-a40f-350c41d0b337" name="Changes" comment="Major upgrade to workflows and theming.">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/models.py" beforeDir="false" afterPath="$PROJECT_DIR$/models.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/routes/chat.py" beforeDir="false" afterPath="$PROJECT_DIR$/routes/chat.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/routes/git.py" beforeDir="false" afterPath="$PROJECT_DIR$/routes/git.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/routes/lifecycle.py" beforeDir="false" afterPath="$PROJECT_DIR$/routes/lifecycle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/routes/sessions.py" beforeDir="false" afterPath="$PROJECT_DIR$/routes/sessions.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/routes/settings.py" beforeDir="false" afterPath="$PROJECT_DIR$/routes/settings.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/routes/workspace.py" beforeDir="false" afterPath="$PROJECT_DIR$/routes/workspace.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/services/fs_tools.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/fs_tools.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/bridge.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/bridge.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/services/gemini_client.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/gemini_client.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/services/key_store.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/key_store.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/services/lifecycle.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/lifecycle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/services/patch_tools.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/patch_tools.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/services/runner.py" beforeDir="false" afterPath="$PROJECT_DIR$/services/runner.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/css/components.css" beforeDir="false" afterPath="$PROJECT_DIR$/static/css/components.css" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/static/css/layout.css" beforeDir="false" afterPath="$PROJECT_DIR$/static/css/layout.css" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/static/index.html" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/js/api.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/api.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/static/js/cdp.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/cdp.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/static/js/bridge.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/bridge.js" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/js/chat.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/chat.js" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/js/composer.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/composer.js" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/js/drawer.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/drawer.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/static/js/git.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/git.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/static/js/layout.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/layout.js" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/js/lifecycle.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/lifecycle.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/static/js/main.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/main.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/static/js/sessions.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/sessions.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/static/js/settings.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/settings.js" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/js/state.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/state.js" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/static/js/tool_gates.js" beforeDir="false" afterPath="$PROJECT_DIR$/static/js/tool_gates.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/static/prompts/bridge_tool_contract.txt" beforeDir="false" afterPath="$PROJECT_DIR$/static/prompts/bridge_tool_contract.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/static/prompts/system_prompt.txt" beforeDir="false" afterPath="$PROJECT_DIR$/static/prompts/system_prompt.txt" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/storage/db.py" beforeDir="false" afterPath="$PROJECT_DIR$/storage/db.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_chat_workflow.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_chat_workflow.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_fs_tools.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_fs_tools.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_lifecycle.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_lifecycle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_patch_tools.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_patch_tools.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_bridge_and_telemetry.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_bridge_and_telemetry.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_db_and_tokens.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_db_and_tokens.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/tests/test_ui_contract.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_ui_contract.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -264,7 +241,15 @@
       <option name="project" value="LOCAL" />
       <updated>1794954300257</updated>
     </task>
-    <option name="localTasksCounter" value="6" />
+    <task id="LOCAL-00006" summary="Major upgrade to workflows and theming.">
+      <option name="closed" value="true" />
+      <created>1795177605896</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1795177605896</updated>
+    </task>
+    <option name="localTasksCounter" value="7" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -284,6 +269,7 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="Initial commit of the Gemini Vibe Code Companion." />
     <MESSAGE value="Workflow improvements." />
-    <option name="LAST_COMMIT_MESSAGE" value="Workflow improvements." />
+    <MESSAGE value="Major upgrade to workflows and theming." />
+    <option name="LAST_COMMIT_MESSAGE" value="Major upgrade to workflows and theming." />
   </component>
 </project>

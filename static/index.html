@@ -155,21 +155,27 @@
             placeholder="Paste AI Studio 'Copy as markdown' output, nested .md blocks, JSON tool calls, or a /packer.py script (Ctrl+Enter to run)..."
           ></textarea>
           <div class="row-between">
-            <span class="meta-line">Tip: Ctrl+Enter runs reads &amp; stages writes</span>
+            <span class="meta-line">Tip: Ctrl+Enter runs reads &amp; stages writes/scripts behind gates</span>
             <div class="row-gap">
-              <button id="btn-bridge-parse-stage" type="button" class="btn btn-secondary btn-sm">Stage All</button>
-              <button id="btn-bridge-parse" type="button" class="btn btn-primary btn-sm">Run Reads &amp; Stage Writes</button>
+              <button id="btn-bridge-parse" type="button" class="btn btn-primary btn-sm">Run &amp; Stage Tools</button>
             </div>
           </div>
         </div>
 
         <div id="bridge-prompt-slot" class="composer-slot">
+          <div id="bridge-prompt-detect-bar" class="bridge-detect-bar hidden bridge-only">
+            <span id="bridge-prompt-detect-msg" class="meta-line">AI tool command / script detected in prompt box — run it instead of sending as a prompt?</span>
+            <div class="row-gap">
+              <button id="btn-prompt-keep-text" type="button" class="btn btn-ghost btn-xs">Keep as Prompt</button>
+              <button id="btn-prompt-run-detected" type="button" class="btn btn-primary btn-xs">Run &amp; Stage Tools</button>
+            </div>
+          </div>
           <div id="attachment-strip" class="attachment-strip hidden"></div>
           <textarea
             id="prompt-input"
             class="prompt-textarea"
             rows="4"
-            placeholder="Write a prompt (Ctrl+Enter to copy), Ctrl+V a screenshot, or click Paste &amp; Run Clipboard below..."
+            placeholder="Write a prompt (Ctrl+Enter to copy for Playground), Ctrl+V a screenshot, or click Paste &amp; Run AI Reply..."
           ></textarea>
         </div>
 
@@ -184,11 +190,9 @@
             <button id="btn-retry-turn" type="button" class="btn btn-secondary btn-sm hidden api-only" title="Retry unfinished Gemini turn">Retry Turn</button>
             <button id="btn-cancel-req" type="button" class="btn btn-danger btn-sm hidden api-only" title="Abort waiting on Gemini">Cancel</button>
             <button id="btn-send" class="btn btn-primary api-only">Send</button>
-            <button id="btn-bridge-manual-paste" type="button" class="btn btn-ghost btn-xs bridge-only" title="Open manual paste box">Manual Paste</button>
             <button id="btn-bridge-copy-img" type="button" class="btn btn-secondary btn-sm hidden bridge-only" title="Copy attached CDP image to clipboard for Ctrl+V into Playground">Copy CDP Image</button>
-            <button id="btn-bridge-copy-bundle" type="button" class="btn btn-secondary btn-sm bridge-only">Copy Session Starter</button>
-            <button id="btn-bridge-stage-clipboard" type="button" class="btn btn-secondary btn-sm bridge-only" title="Read clipboard and hold ALL actions behind approval gates">Stage Clipboard</button>
-            <button id="btn-bridge-clipboard-parse" type="button" class="btn btn-primary bridge-cta-main bridge-only" title="Read clipboard, auto-run read-only searches/reads, gate writes/scripts, and auto-copy result">Paste &amp; Run Clipboard</button>
+            <button id="btn-bridge-copy-bundle" type="button" class="btn btn-secondary btn-sm bridge-only" title="Bundle prompt &amp; attachments to clipboard for AI Studio Playground (Ctrl+Enter)">Copy Starter &rarr; Playground</button>
+            <button id="btn-bridge-clipboard-parse" type="button" class="btn btn-primary bridge-cta-main bridge-only" title="Read AI reply from clipboard, run safe reads, and stage writes/scripts behind approval gates">Paste &amp; Run AI Reply</button>
           </div>
         </div>
       </footer>
@@ -196,11 +200,11 @@
 
     <div id="resizer-right" class="resizer" title="Drag to resize right panel"></div>
 
-    <!-- Right Drawer: Files, Terminal, Backups, Git -->
+    <!-- Right Drawer: Files, Console, Git, Backups -->
     <aside class="drawer">
       <nav class="drawer-tabs">
         <button class="drawer-tab active" data-tab="files">Files</button>
-        <button class="drawer-tab" data-tab="terminal">Terminal</button>
+        <button class="drawer-tab" data-tab="terminal">Console</button>
         <button class="drawer-tab" data-tab="git">Git</button>
         <button class="drawer-tab" data-tab="backups">Backups</button>
         <button id="btn-collapse-drawer" type="button" class="btn btn-ghost btn-xs pane-collapse-btn pane-collapse-drawer" title="Collapse Files panel" aria-label="Collapse Files panel">&gt;</button>
@@ -227,6 +231,13 @@
         <div class="output-header">
           <span id="terminal-meta" class="meta-line mono tabular">No command run yet</span>
           <button id="btn-paste-terminal" class="btn btn-secondary btn-sm" disabled>Paste into Prompt</button>
+        </div>
+        <div id="terminal-savepoint-bar" class="terminal-savepoint-bar hidden">
+          <span id="terminal-savepoint-label" class="meta-line"></span>
+          <div class="row-gap">
+            <button id="btn-terminal-restore-checkpoint" type="button" class="btn btn-danger btn-xs" title="Revert changes back to savepoint">Restore</button>
+            <button id="btn-terminal-commit-checkpoint" type="button" class="btn btn-secondary btn-xs" title="Keep current changes and commit active savepoint">Commit Savepoint</button>
+          </div>
         </div>
         <pre id="terminal-output" class="terminal-output"></pre>
       </div>

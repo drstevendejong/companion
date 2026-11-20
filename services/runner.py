@@ -5,12 +5,16 @@ services/runner.py - Project-scoped command execution using target venv Python w
 from __future__ import annotations
 
 import asyncio
+import codecs
+import inspect
+import json
 import os
 import shlex
 import sys
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config import COMMAND_TIMEOUT_SECONDS, MAX_COMMAND_OUTPUT_CHARS
 from services.token_utils import estimate_tokens
@@ -43,13 +47,39 @@ def _prepare_argv(command: str, python_exe: str) -> List[str]:
     return tokens
 
 
+async def _emit_callback(cb: Optional[Callable[[str], Any]], text: str) -> None:
+    if cb is None or not text:
+        return
+    try:
+        res = cb(text)
+        if inspect.isawaitable(res):
+            await res
+    except Exception:
+        pass
+
+
+async def broadcast_exec_event(app: Any, payload: Dict[str, Any]) -> None:
+    """Broadcasts live command execution updates to connected UI lifecycle WebSockets."""
+    state_obj = getattr(app, "state", None)
+    sockets = getattr(state_obj, "lifecycle_sockets", None) if state_obj is not None else None
+    if not sockets:
+        return
+    raw = json.dumps(payload)
+    for ws in list(sockets):
+        try:
+            await ws.send_text(raw)
+        except Exception:
+            pass
+
+
 async def run_project_command(
     project_root: str | Path,
     command: str,
     configured_python: Optional[str] = None,
     timeout_seconds: int = COMMAND_TIMEOUT_SECONDS,
+    on_output: Optional[Callable[[str], Any]] = None,
 ) -> Dict[str, Any]:
-    """Executes a command inside project_root and captures stdout/stderr + token estimate."""
+    """Executes a command inside project_root, streaming stdout/stderr chunks + token estimate."""
     root = Path(project_root).resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Project root directory not found: {root}")
@@ -58,22 +88,77 @@ async def run_project_command(
     argv = _prepare_argv(command, python_exe)
 
     started = time.monotonic()
+    deadline = started + timeout_seconds
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    chunks: List[str] = []
     timed_out = False
+
     try:
-        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        timed_out = True
-        proc.kill()
-        stdout_bytes, _ = await proc.communicate()
+        while proc.stdout is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                raw_bytes = await asyncio.wait_for(proc.stdout.read(2048), timeout=remaining)
+            except asyncio.TimeoutError:
+                timed_out = True
+                break
+            if not raw_bytes:
+                break
+            text = decoder.decode(raw_bytes, final=False)
+            if text:
+                chunks.append(text)
+                await _emit_callback(on_output, text)
+
+        if timed_out:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            if proc.stdout is not None:
+                try:
+                    leftover = await asyncio.wait_for(proc.stdout.read(), timeout=2.0)
+                    if leftover:
+                        tail_txt = decoder.decode(leftover, final=False)
+                        if tail_txt:
+                            chunks.append(tail_txt)
+                            await _emit_callback(on_output, tail_txt)
+                except Exception:
+                    pass
+            await proc.wait()
+        else:
+            remaining = max(0.5, deadline - time.monotonic())
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                timed_out = True
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+
+        flushed = decoder.decode(b"", final=True)
+        if flushed:
+            chunks.append(flushed)
+            await _emit_callback(on_output, flushed)
+    finally:
+        if proc.returncode is None and timed_out:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    output = stdout_bytes.decode("utf-8", errors="replace")
+    output = "".join(chunks)
     truncated = False
     if len(output) > MAX_COMMAND_OUTPUT_CHARS:
         output = output[-MAX_COMMAND_OUTPUT_CHARS:]
@@ -89,6 +174,80 @@ async def run_project_command(
         "truncated": truncated,
         "estimated_tokens": estimate_tokens(output),
     }
+
+
+async def stream_project_command(
+    app: Any,
+    project_root: str | Path,
+    command: str,
+    configured_python: Optional[str] = None,
+    timeout_seconds: int = COMMAND_TIMEOUT_SECONDS,
+    source: str = "console",
+) -> Dict[str, Any]:
+    """Runs a project command while broadcasting live start/chunk/done events to UI WebSockets."""
+    run_id = uuid.uuid4().hex[:10]
+    await broadcast_exec_event(
+        app,
+        {
+            "type": "exec_start",
+            "run_id": run_id,
+            "command": command,
+            "source": source,
+        },
+    )
+
+    async def _on_chunk(chunk: str) -> None:
+        await broadcast_exec_event(
+            app,
+            {
+                "type": "exec_chunk",
+                "run_id": run_id,
+                "chunk": chunk,
+                "source": source,
+            },
+        )
+
+    try:
+        res = await run_project_command(
+            project_root,
+            command,
+            configured_python=configured_python,
+            timeout_seconds=timeout_seconds,
+            on_output=_on_chunk,
+        )
+    except Exception as exc:
+        await broadcast_exec_event(
+            app,
+            {
+                "type": "exec_done",
+                "run_id": run_id,
+                "command": command,
+                "source": source,
+                "exit_code": -1,
+                "duration_ms": 0,
+                "estimated_tokens": 0,
+                "timed_out": False,
+                "output": str(exc),
+                "error": str(exc),
+            },
+        )
+        raise
+
+    await broadcast_exec_event(
+        app,
+        {
+            "type": "exec_done",
+            "run_id": run_id,
+            "command": command,
+            "source": source,
+            "exit_code": res["exit_code"],
+            "duration_ms": res["duration_ms"],
+            "estimated_tokens": res["estimated_tokens"],
+            "timed_out": res["timed_out"],
+            "output": res["output"],
+        },
+    )
+    return res
 
 
 def _quick_check_command_for_target(

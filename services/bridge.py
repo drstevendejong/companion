@@ -31,15 +31,19 @@ To inspect files or propose edits for human-gated diff review and auto-backup, e
 - {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block", "new_text": "replacement", "summary": "1-line reason"} (returns nearest line-number + diff diagnostics if old_text mismatches)
 - {"tool": "patch_lines", "path": "path/to/file", "start_line": 10, "end_line": 20, "new_text": "replacement", "summary": "1-line reason"}
 - {"tool": "write_file", "path": "path/to/file", "content": "full file text", "summary": "1-line reason"}
-- {"tool": "propose_script", "path": "packer.py", "content": "python helper script text", "summary": "e.g. Pack target files into packed_context.md"}
-- {"tool": "run_tests", "summary": "1-line reason"} (human-gated run of configured test suite; do NOT call on broken intermediate steps—only at the end of a complete edit batch)
+- {"tool": "delete_file", "path": "path/to/file", "summary": "1-line reason"} (human-gated delete; auto-backed up first)
+- {"tool": "rename_file", "old_path": "old/path", "new_path": "new/path", "summary": "1-line reason"} (human-gated move/rename; auto-backed up first)
+- {"tool": "propose_script", "path": "packer.py", "content": "python helper script text", "summary": "e.g. Pack target files into packed_context.md"} (optional `"delete_on_success": true` for one-shot inspection scripts)
+- {"tool": "run_script", "path": "packer.py", "summary": "1-line reason"} (human-gated run of an existing/patched .py script in project Python; optional `"args": "--flag"`)
+- {"tool": "run_and_delete_script", "path": "probe.py", "summary": "1-line reason"} (human-gated run of an inspection/temporary .py script; automatically deletes the script if exit code is 0 with no traceback, or keeps it on disk on error so you can patch & re-run; optional `"args": "--flag"`)
+- {"tool": "run_tests", "summary": "1-line reason"} (human-gated full suite — auto-commits savepoint on pass; optional `"fast": true` / `"target": "file"` runs quick check without committing savepoint; never call on broken intermediate steps)
 - {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
 - {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120}
 - {"tool": "read_file", "path": "path/to/file"}
 - {"tool": "list_tree", "subpath": ".", "max_depth": 3}
 
 Notes:
-- When you need multiple files/fragments from disk, emit a `propose_script` (e.g. `packer.py`) that writes a clean `.md` bundle file so the user can run it locally in 1 click and paste the `.md` back.
+- When you need multiple files/fragments from disk, emit a `propose_script` (e.g. `packer.py`) that writes a clean `.md` bundle file or prints stdout directly (Companion captures stdout automatically). If a temporary/inspection script errors and you patch it, call `run_and_delete_script` to re-run it and clean it up automatically once it succeeds (or `run_script` to keep it).
 - Git status, diff viewing, commit message drafting, Commit, and Commit & Push are triggered by the user in Companion's right-drawer Git tab (not via JSON tool calls)."""
 
 
@@ -63,6 +67,8 @@ KNOWN_TOOLS = {
     "delete_file",
     "rename_file",
     "propose_script",
+    "run_script",
+    "run_and_delete_script",
     "run_tests",
 }
 
@@ -100,6 +106,7 @@ KNOWN_TOOL_JSON_KEYS = {
     "reason",
     "fast",
     "target",
+    "delete_on_success",
 }
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -828,6 +835,23 @@ _FAILURE_LINE_RE = re.compile(
 )
 
 
+def format_command_output_preview(raw_output: str, max_chars: int = 12000) -> str:
+    """Normalizes command stdout/stderr for clipboard/AI handoff, preserving head + tail if oversized."""
+    text = (raw_output or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    head_len = int(max_chars * 0.45)
+    tail_len = max_chars - head_len - 80
+    omitted = len(text) - head_len - max(0, tail_len)
+    return (
+        f"{text[:head_len].rstrip()}\n\n"
+        f"... [{omitted:,} middle chars omitted; full output is in Companion Console] ...\n\n"
+        f"{text[-max(200, tail_len):].lstrip()}"
+    )
+
+
 def extract_failure_excerpt(raw_output: str, max_chars: int = 3500) -> str:
     """Extracts high-signal error/traceback windows (or tail fallback) from arbitrary command output."""
     text = (raw_output or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -907,21 +931,42 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
             )
         elif resp.get("applied"):
             blocks.append(f"- **{name}**: Patch applied to `{resp.get('path')}` (backup: `{resp.get('backup_path')}`)")
-        elif resp.get("deleted"):
-            blocks.append(f"- **{name}**: Deleted `{resp.get('path')}` (backup: `{resp.get('backup_path')}`)")
         elif resp.get("renamed"):
             blocks.append(
                 f"- **{name}**: Renamed `{resp.get('old_path')}` → `{resp.get('new_path')}` (backup: `{resp.get('backup_path')}`)"
             )
         elif resp.get("written"):
             if resp.get("executed"):
-                line = f"- **{name}**: Wrote `{resp.get('path')}` and executed (exit code `{resp.get('exit_code')}`)."
+                del_note = " and deleted temporary script" if resp.get("deleted") else ""
+                line = (
+                    f"- **{name}**: Wrote `{resp.get('path')}` and executed"
+                    f"{del_note} (exit code `{resp.get('exit_code')}`)."
+                )
                 preview = (resp.get("output_preview") or "").strip()
-                if (resp.get("exit_code", 0) != 0 or resp.get("has_traceback")) and preview:
+                if preview:
                     line += f"\n```text\n{preview}\n```"
                 blocks.append(line)
             else:
                 blocks.append(f"- **{name}**: Wrote `{resp.get('path')}` to disk.")
+        elif name in ("run_script", "run_and_delete_script"):
+            cmd = resp.get("command") or resp.get("path") or "script"
+            code = resp.get("exit_code", "?")
+            ok = (code == 0) and (not resp.get("has_traceback"))
+            if name == "run_and_delete_script":
+                status_lbl = (
+                    "OK — script auto-deleted"
+                    if ok and resp.get("deleted")
+                    else ("OK" if ok else "FAILED (script kept on disk for patching)")
+                )
+            else:
+                status_lbl = "OK" if ok else "FAILED"
+            line = f"- **{name}** (`{cmd}`): **{status_lbl}** (exit code `{code}`)."
+            preview = (resp.get("output_preview") or "").strip()
+            if preview:
+                line += f"\n```text\n{preview}\n```"
+            blocks.append(line)
+        elif resp.get("deleted"):
+            blocks.append(f"- **{name}**: Deleted `{resp.get('path')}` (backup: `{resp.get('backup_path')}`)")
         elif name == "run_tests":
             cmd = resp.get("command", "tests")
             code = resp.get("exit_code", "?")

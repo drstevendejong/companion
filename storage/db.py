@@ -14,6 +14,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from config import (
+    DB_KEEP_FULL_TOOL_EVENTS_TAIL,
+    DB_MAX_MESSAGES_PER_SESSION,
+    DB_MAX_PATCH_RECORDS_PER_PROJECT,
+    DB_MAX_RESOLVED_CHECKPOINTS_PER_PROJECT,
+    DB_MAX_RESOLVED_GATES,
+    DB_VACUUM_MIN_BYTES,
+)
 from models import (
     AttachmentItem,
     CheckpointRecord,
@@ -192,6 +200,15 @@ class CompanionDB:
 
                 CREATE INDEX IF NOT EXISTS idx_checkpoints_session
                     ON checkpoints(session_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_messages_session
+                    ON messages(session_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_pending_gates_session
+                    ON pending_gates(session_id, status, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_patch_history_project
+                    ON patch_history(project_id, created_at);
                 """
             )
             project_cols = {
@@ -518,6 +535,18 @@ class CompanionDB:
                 ),
             )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
+            msg_count_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            should_prune = bool(msg_count_row and int(msg_count_row["cnt"] or 0) > DB_MAX_MESSAGES_PER_SESSION + 5)
+            deleted_msgs = 0
+            compacted_msgs = 0
+            if should_prune:
+                compacted_msgs = self._compact_older_session_messages_conn(conn, session_id)
+                deleted_msgs = self._prune_session_messages_conn(conn, session_id)
+        if should_prune and (deleted_msgs + compacted_msgs) >= 10:
+            self._maybe_vacuum_file()
         return MessageRecord(
             id=msg_id,
             session_id=session_id,
@@ -580,11 +609,20 @@ class CompanionDB:
     def resolve_gate(
         self, gate_id: str, status: str, result: Optional[Dict[str, Any]] = None
     ) -> None:
+        result_str = json.dumps(result) if result is not None else None
+        if result_str and len(result_str) > 8192 and isinstance(result, dict):
+            compact_res = {
+                k: v for k, v in result.items()
+                if k not in ("content", "matches", "tree", "output_preview")
+            }
+            compact_res["compacted"] = True
+            result_str = json.dumps(compact_res)
         with self._connect() as conn:
             conn.execute(
-                "UPDATE pending_gates SET status = ?, result_json = ? WHERE id = ?",
-                (status, json.dumps(result) if result is not None else None, gate_id),
+                "UPDATE pending_gates SET status = ?, result_json = ?, preview_json = '{}' WHERE id = ?",
+                (status, result_str, gate_id),
             )
+            self._prune_resolved_gates_conn(conn)
 
     def list_pending_gates(self, session_id: str) -> List[Dict[str, Any]]:
         with self._connect() as conn:
@@ -639,6 +677,7 @@ class CompanionDB:
                     now,
                 ),
             )
+            self._prune_patch_history_conn(conn, project_id)
         return PatchRecord(
             id=patch_id,
             session_id=session_id,
@@ -944,14 +983,302 @@ class CompanionDB:
                 (status, resolution_note, now, checkpoint_id),
             )
             row = conn.execute("SELECT * FROM checkpoints WHERE id = ?", (checkpoint_id,)).fetchone()
+            if row:
+                self._prune_checkpoints_conn(conn, row["project_id"])
         return self._row_to_checkpoint(row) if row else None
 
     def cancel_pending_gates(self, session_id: str, reason: str = "Checkpoint restored") -> int:
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE pending_gates SET status = 'cancelled', result_json = ? WHERE session_id = ? AND status = 'pending'",
+                "UPDATE pending_gates SET status = 'cancelled', result_json = ?, preview_json = '{}' WHERE session_id = ? AND status = 'pending'",
                 (json.dumps({"cancelled": True, "reason": reason}), session_id),
             )
+            self._prune_resolved_gates_conn(conn)
             return int(cur.rowcount or 0)
+
+    # --- Automatic DB Retention, Compaction & VACUUM ---
+
+    def _compact_older_session_messages_conn(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        keep_full_tail: int = DB_KEEP_FULL_TOOL_EVENTS_TAIL,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT id, role, length(text) AS text_len, length(attachments_json) AS att_len
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (session_id,),
+        ).fetchall()
+        cutoff_idx = len(rows) - max(0, int(keep_full_tail))
+        if cutoff_idx <= 0:
+            return 0
+
+        compacted = 0
+        for row in rows[:cutoff_idx]:
+            msg_id = row["id"]
+            if row["role"] == "tool_event" and int(row["text_len"] or 0) > 2048:
+                raw_row = conn.execute("SELECT text FROM messages WHERE id = ?", (msg_id,)).fetchone()
+                if raw_row and raw_row["text"]:
+                    try:
+                        payload = json.loads(raw_row["text"])
+                    except Exception:
+                        payload = None
+                    if isinstance(payload, dict) and isinstance(payload.get("response"), dict):
+                        resp = payload["response"]
+                        if not resp.get("compacted"):
+                            orig_bytes = 0
+                            changed = False
+                            for field in ("content", "matches", "tree", "output_preview"):
+                                val = resp.get(field)
+                                if isinstance(val, str):
+                                    orig_bytes += len(val.encode("utf-8", errors="ignore"))
+                                    if len(val) > 512:
+                                        resp[field] = f"[Compacted from older history ({len(val):,} chars)]"
+                                        changed = True
+                            if changed:
+                                resp["compacted"] = True
+                                if orig_bytes and not resp.get("output_bytes"):
+                                    resp["output_bytes"] = orig_bytes
+                                conn.execute(
+                                    "UPDATE messages SET text = ? WHERE id = ?",
+                                    (json.dumps(payload), msg_id),
+                                )
+                                compacted += 1
+
+            if int(row["att_len"] or 0) > 4096:
+                att_row = conn.execute(
+                    "SELECT attachments_json FROM messages WHERE id = ?", (msg_id,)
+                ).fetchone()
+                if att_row and att_row["attachments_json"]:
+                    try:
+                        atts = json.loads(att_row["attachments_json"])
+                    except Exception:
+                        atts = None
+                    if isinstance(atts, list):
+                        att_changed = False
+                        for item in atts:
+                            if not isinstance(item, dict):
+                                continue
+                            content_str = str(item.get("content") or "")
+                            if item.get("kind") == "image" and len(content_str) > 4096:
+                                item["kind"] = "snippet"
+                                item["mime_type"] = None
+                                item["content"] = "[Image omitted from older history to keep DB compact]"
+                                att_changed = True
+                            elif len(content_str) > 2048:
+                                item["content"] = "[Older attachment omitted from DB history]"
+                                att_changed = True
+                        if att_changed:
+                            conn.execute(
+                                "UPDATE messages SET attachments_json = ? WHERE id = ?",
+                                (json.dumps(atts), msg_id),
+                            )
+                            compacted += 1
+        return compacted
+
+    def _prune_session_messages_conn(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        max_messages: int = DB_MAX_MESSAGES_PER_SESSION,
+    ) -> int:
+        rows = conn.execute(
+            "SELECT id, role FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
+            (session_id,),
+        ).fetchall()
+        total = len(rows)
+        if total <= max_messages:
+            return 0
+
+        cut = total - max_messages
+        while cut < total and rows[cut]["role"] == "tool_event":
+            cut += 1
+        if cut <= 0:
+            return 0
+
+        delete_ids = [r["id"] for r in rows[:cut]]
+        for i in range(0, len(delete_ids), 200):
+            chunk = delete_ids[i : i + 200]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", chunk)
+
+        conn.execute(
+            """
+            UPDATE checkpoints
+            SET after_msg_index = CASE
+                WHEN after_msg_index > ? THEN after_msg_index - ?
+                ELSE 0
+            END
+            WHERE session_id = ?
+            """,
+            (cut, cut, session_id),
+        )
+        return len(delete_ids)
+
+    def _prune_resolved_gates_conn(
+        self, conn: sqlite3.Connection, keep: int = DB_MAX_RESOLVED_GATES
+    ) -> int:
+        rows = conn.execute(
+            "SELECT id FROM pending_gates WHERE status != 'pending' ORDER BY created_at DESC, rowid DESC"
+        ).fetchall()
+        if len(rows) <= keep:
+            return 0
+        delete_ids = [r["id"] for r in rows[keep:]]
+        for i in range(0, len(delete_ids), 200):
+            chunk = delete_ids[i : i + 200]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(f"DELETE FROM pending_gates WHERE id IN ({placeholders})", chunk)
+        return len(delete_ids)
+
+    def _prune_patch_history_conn(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        keep: int = DB_MAX_PATCH_RECORDS_PER_PROJECT,
+    ) -> int:
+        rows = conn.execute(
+            "SELECT id FROM patch_history WHERE project_id = ? ORDER BY created_at DESC, rowid DESC",
+            (project_id,),
+        ).fetchall()
+        if len(rows) <= keep:
+            return 0
+        delete_ids = [r["id"] for r in rows[keep:]]
+        for i in range(0, len(delete_ids), 200):
+            chunk = delete_ids[i : i + 200]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(f"DELETE FROM patch_history WHERE id IN ({placeholders})", chunk)
+        return len(delete_ids)
+
+    def _prune_checkpoints_conn(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        keep: int = DB_MAX_RESOLVED_CHECKPOINTS_PER_PROJECT,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT id FROM checkpoints
+            WHERE project_id = ? AND status != 'active'
+            ORDER BY created_at DESC, rowid DESC
+            """,
+            (project_id,),
+        ).fetchall()
+        if len(rows) <= keep:
+            return 0
+        delete_ids = [r["id"] for r in rows[keep:]]
+        for i in range(0, len(delete_ids), 200):
+            chunk = delete_ids[i : i + 200]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(f"DELETE FROM checkpoints WHERE id IN ({placeholders})", chunk)
+        return len(delete_ids)
+
+    def _maybe_vacuum_file(self, *, force: bool = False) -> bool:
+        try:
+            db_bytes = self.db_path.stat().st_size if self.db_path.is_file() else 0
+        except OSError:
+            db_bytes = 0
+        if not force and db_bytes < DB_VACUUM_MIN_BYTES:
+            return False
+
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=15.0, isolation_level=None)
+            try:
+                free_pages = int((conn.execute("PRAGMA freelist_count;").fetchone() or [0])[0] or 0)
+                if force or free_pages >= 32:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    conn.execute("VACUUM;")
+                    return True
+                return False
+            finally:
+                conn.close()
+        except Exception:
+            return False
+
+    def cleanup_database(
+        self,
+        *,
+        max_messages_per_session: int = DB_MAX_MESSAGES_PER_SESSION,
+        keep_full_tail: int = DB_KEEP_FULL_TOOL_EVENTS_TAIL,
+        force_vacuum: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Prunes old resolved gates, excess session messages, oversized historical payloads,
+        and old patch/checkpoint records, running WAL checkpoint + VACUUM when space can be reclaimed.
+        """
+        try:
+            bytes_before = self.db_path.stat().st_size if self.db_path.is_file() else 0
+        except OSError:
+            bytes_before = 0
+
+        messages_deleted = 0
+        messages_compacted = 0
+        gates_deleted = 0
+        patches_deleted = 0
+        checkpoints_deleted = 0
+        usage_deleted = 0
+
+        with self._connect() as conn:
+            # 1. Strip bloated preview_json from any legacy resolved gates
+            conn.execute(
+                "UPDATE pending_gates SET preview_json = '{}' WHERE status != 'pending' AND length(preview_json) > 1024"
+            )
+            gates_deleted += self._prune_resolved_gates_conn(conn)
+
+            # 2. Compact and prune per-session messages
+            sess_rows = conn.execute("SELECT id FROM sessions").fetchall()
+            for sr in sess_rows:
+                sid = sr["id"]
+                messages_compacted += self._compact_older_session_messages_conn(
+                    conn, sid, keep_full_tail=keep_full_tail
+                )
+                messages_deleted += self._prune_session_messages_conn(
+                    conn, sid, max_messages=max_messages_per_session
+                )
+
+            # 3. Prune per-project patch_history and resolved checkpoints
+            proj_rows = conn.execute("SELECT id FROM projects").fetchall()
+            for pr in proj_rows:
+                pid = pr["id"]
+                patches_deleted += self._prune_patch_history_conn(conn, pid)
+                checkpoints_deleted += self._prune_checkpoints_conn(conn, pid)
+
+            # 4. Prune old API usage telemetry
+            cur_usage = conn.execute(
+                "DELETE FROM api_usage_events WHERE created_ts < ?",
+                (time.time() - 14 * 86400,),
+            )
+            usage_deleted = int(cur_usage.rowcount or 0)
+
+        total_changed = (
+            messages_deleted
+            + messages_compacted
+            + gates_deleted
+            + patches_deleted
+            + checkpoints_deleted
+            + usage_deleted
+        )
+        vacuumed = self._maybe_vacuum_file(
+            force=force_vacuum or (total_changed > 0 and bytes_before >= DB_VACUUM_MIN_BYTES)
+        )
+        try:
+            bytes_after = self.db_path.stat().st_size if self.db_path.is_file() else 0
+        except OSError:
+            bytes_after = bytes_before
+
+        return {
+            "messages_deleted": messages_deleted,
+            "messages_compacted": messages_compacted,
+            "gates_deleted": gates_deleted,
+            "patches_deleted": patches_deleted,
+            "checkpoints_deleted": checkpoints_deleted,
+            "usage_deleted": usage_deleted,
+            "vacuumed": vacuumed,
+            "db_bytes_before": bytes_before,
+            "db_bytes_after": bytes_after,
+        }
 
 
