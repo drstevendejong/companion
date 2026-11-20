@@ -16,7 +16,7 @@ from google.genai import types
 
 from config import GEMINI_KEY_PATH
 from models import AttachmentItem, ProjectProfile, SessionInfo, TokenStats
-from services import fs_tools, key_store, patch_tools
+from services import fs_tools, key_store, model_catalog, patch_tools
 from services.token_utils import estimate_tokens
 
 
@@ -25,13 +25,24 @@ PATCH_TOOLS = {"patch_literal", "patch_lines", "write_file"}
 SCRIPT_TOOLS = {"propose_script"}
 
 BASE_SYSTEM_PROMPT = """You are a senior coding partner connected to the user's local workspace via human-gated tools.
+Every tool round-trip re-sends conversation history and burns rate-limit tokens. Strictly minimize token usage and round-trips:
 
-TOKEN & EDITING DISCIPLINE:
-1. Explore with `list_tree` and `search_code` BEFORE requesting `read_lines` or `read_file`.
-2. Prefer `read_lines(path, start_line, end_line)` over `read_file` whenever files are large (note: `read_file` returns raw content without line numbers to save tokens; `search_code` and `read_lines` include compact line numbers).
-3. Prefer `patch_literal` over `patch_lines` or `write_file` unless creating a new file or replacing most of a file.
-4. For multi-file structural changes or custom code probes/packers, use `propose_script` so the user can review, write to disk, and run it locally.
-5. Every tool call is gated by the user—explain briefly what you need and why. Be concise and direct.
+1. BRIEF RESPONSES:
+   - Be terse and direct. State findings, root causes, and next steps in a few crisp lines—never five-paragraph walkthroughs quoting code the user didn't ask to see.
+   - Optionally end with "Need details before we proceed?" when deeper explanation could help.
+   - Before calling tools, output at most 1 short sentence (or no prose if self-explanatory).
+
+2. DIRECTIVES SELF-CHECK (CRITICAL):
+   - When Project Directives are loaded below, audit EVERY planned design, edit, and script against ALL Directives BEFORE proposing patches or scripts. Never emit code that violates Directives and forces a costly redo.
+
+3. BATCHED & SINGLE-SHOT CODE INSPECTION:
+   - Never dribble 1–2 small reads/searches across many turns. Batch all needed `search_code` / `read_lines` / `read_file` calls together in ONE turn.
+   - For repo-wide audits, dependency graphs, impact analysis, or multi-file inspection, prefer ONE `propose_script` single-shot inspector/packer that prints a compact structured summary instead of 5–10 iterative tool hops.
+   - Prefer `search_code` (with `path_glob`) + targeted `read_lines(path, start_line, end_line)` over full `read_file` unless you truly need the whole file (`read_file` omits line numbers to save tokens).
+
+4. SURGICAL PATCHING & PATCHING SCRIPTS:
+   - Prefer `patch_literal` (minimal unique context) over `patch_lines` or `write_file`. Only use `write_file` for new files or >70% rewrites.
+   - Use `propose_script` for multi-file mechanical edits. If a large patch/script fails, PATCH the existing script with `patch_literal`/`patch_lines` instead of regenerating the full script.
 """
 
 
@@ -51,13 +62,14 @@ def build_tool_declarations() -> types.Tool:
         ),
         types.FunctionDeclaration(
             name="search_code",
-            description="Search codebase by substring or regex and return matching lines with context.",
+            description="Search all text files and filenames across the codebase (any language) by substring or regex, returning every match. Case-insensitive by default.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
                     "pattern": types.Schema(type=types.Type.STRING, description="Substring or regex pattern"),
                     "is_regex": types.Schema(type=types.Type.BOOLEAN, description="Treat pattern as regex"),
-                    "path_glob": types.Schema(type=types.Type.STRING, description="Optional glob filter e.g. '*.py' or 'core/**/*.py'"),
+                    "ignore_case": types.Schema(type=types.Type.BOOLEAN, description="Case-insensitive match (default true); set false for exact case"),
+                    "path_glob": types.Schema(type=types.Type.STRING, description="Optional glob filter, e.g. '*.{py,js,html}' or 'src/**'. Omit to search all text files."),
                     "context_lines": types.Schema(type=types.Type.INTEGER, description="Context lines around each match, default 2"),
                 },
                 required=["pattern"],
@@ -196,34 +208,47 @@ def prepare_tool_gate_preview(
     ignores = project.ignore_patterns
 
     if tool_name == "list_tree":
+        sub = str(args.get("subpath") or args.get("path") or ".")
+        depth = int(args.get("max_depth", 3))
         res = fs_tools.list_tree(
             root,
-            subpath=str(args.get("subpath", ".")),
-            max_depth=int(args.get("max_depth", 3)),
+            subpath=sub,
+            max_depth=depth,
             extra_ignores=ignores,
         )
         return {
             "category": "read",
-            "title": f"List Tree: {args.get('subpath', '.')}",
+            "title": f"List Tree: {sub}",
             "estimated_tokens": res["estimated_tokens"],
-            "detail": f"Depth {args.get('max_depth', 3)} · {len(res['entries'])} entries",
+            "detail": f"Depth {depth} · {len(res['entries'])} entries",
             "prepared_result": res,
         }
 
     if tool_name == "search_code":
+        pattern = str(args.get("pattern", ""))
+        path_glob = str(args.get("path_glob") or "").strip()
+        is_regex = bool(args.get("is_regex", False))
+        ignore_case = bool(args.get("ignore_case", True))
+        raw_max = args.get("max_matches")
+        max_matches = int(raw_max) if raw_max is not None and int(raw_max) > 0 else None
         res = fs_tools.search_code(
             root,
-            pattern=str(args.get("pattern", "")),
-            is_regex=bool(args.get("is_regex", False)),
-            path_glob=args.get("path_glob"),
+            pattern=pattern,
+            is_regex=is_regex,
+            path_glob=path_glob or None,
             context_lines=int(args.get("context_lines", 2)),
+            max_matches=max_matches,
             extra_ignores=ignores,
+            ignore_case=ignore_case,
         )
+        scope_label = f" in {path_glob}" if path_glob else " across project"
+        mode_label = "regex" if is_regex else "text"
+        case_label = "ignore-case" if ignore_case else "exact-case"
         return {
             "category": "read",
-            "title": f"Search Code: {args.get('pattern', '')}",
+            "title": f"Search Code: {pattern}{scope_label}",
             "estimated_tokens": res["estimated_tokens"],
-            "detail": f"{res['shown_hits']}/{res['total_hits']} matches",
+            "detail": f"{res['shown_hits']}/{res['total_hits']} matches · {mode_label} · {case_label} · scope: {path_glob or '*'}",
             "prepared_result": res,
         }
 
@@ -368,6 +393,45 @@ class GeminiGateway:
     def verify_key(self, api_key: str) -> tuple[bool, str]:
         return self._key_validator(api_key)
 
+    @property
+    def catalog_cache_path(self) -> Path:
+        return self._key_path.parent / "model_catalog_cache.json"
+
+    def get_model_catalog(self, force_refresh: bool = False, probe: bool = True) -> Dict[str, Any]:
+        """Lists live Gemini chat models filtered to free-usable models when on a Free Tier key."""
+        api_key = ""
+        if self._client_factory is not None:
+            api_key = "injected-test-client"
+            client = self._get_client()
+        else:
+            api_key, _source = key_store.load_api_key(self._key_path)
+            if not api_key:
+                return model_catalog.get_fallback_catalog(
+                    notice="Configure a Gemini API key to load live models"
+                )
+            client = self._get_client()
+
+        try:
+            return model_catalog.fetch_dynamic_model_catalog(
+                client=client,
+                api_key=api_key,
+                cache_path=self.catalog_cache_path,
+                force_refresh=force_refresh,
+                probe=probe,
+            )
+        except Exception:
+            return model_catalog.get_fallback_catalog()
+
+    def record_runtime_error(self, model_id: str, error_text: Any) -> Optional[str]:
+        """Updates cached free/paid model knowledge if a live request hits a 429 or 404."""
+        if self._client_factory is not None:
+            api_key = "injected-test-client"
+        else:
+            api_key, _ = key_store.load_api_key(self._key_path)
+        return model_catalog.record_model_runtime_error(
+            self.catalog_cache_path, api_key, model_id, error_text
+        )
+
     def _get_client(self) -> Any:
         if self._cached_client is not None:
             return self._cached_client
@@ -400,7 +464,7 @@ class GeminiGateway:
             "system_instruction": sys_instruction,
             "tools": [build_tool_declarations()],
         }
-        if session.model.startswith("gemini-4") or session.model.startswith("gemini-3"):
+        if not session.model.startswith(("gemini-1.", "gemini-2.")):
             try:
                 config_kwargs["thinking_config"] = types.ThinkingConfig(
                     thinking_level=getattr(types.ThinkingLevel, thinking_val)
@@ -419,17 +483,31 @@ class GeminiGateway:
         candidates = getattr(response, "candidates", None) or []
         if candidates and getattr(candidates[0], "content", None):
             for part in candidates[0].content.parts or []:
-                if getattr(part, "text", None):
+                if getattr(part, "text", None) and not getattr(part, "thought", False):
                     text_parts.append(part.text)
                 fc = getattr(part, "function_call", None)
                 if fc:
                     args_dict = dict(fc.args) if fc.args else {}
-                    function_calls.append({
+                    tc_entry: Dict[str, Any] = {
                         "name": fc.name,
                         "args": args_dict,
-                    })
+                    }
+                    fc_id = getattr(fc, "id", None)
+                    if fc_id:
+                        tc_entry["id"] = fc_id
+                    thought_sig = getattr(part, "thought_signature", None)
+                    if thought_sig:
+                        if isinstance(thought_sig, (bytes, bytearray)):
+                            tc_entry["thought_signature_b64"] = base64.b64encode(
+                                bytes(thought_sig)
+                            ).decode("ascii")
+                        elif isinstance(thought_sig, str):
+                            tc_entry["thought_signature_b64"] = base64.b64encode(
+                                thought_sig.encode("utf-8")
+                            ).decode("ascii")
+                    function_calls.append(tc_entry)
 
-        if not text_parts and getattr(response, "text", None):
+        if not text_parts and not function_calls and not candidates and getattr(response, "text", None):
             text_parts.append(response.text)
 
         return {

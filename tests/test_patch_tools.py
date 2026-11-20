@@ -75,6 +75,47 @@ class TestPatchTools(unittest.TestCase):
         self.assertEqual(undo_new["action"], "removed_new_file")
         self.assertFalse(new_file.exists())
 
+    def test_backup_dir_self_cleans_by_count_age_and_size(self) -> None:
+        import os
+        import time
+
+        backup_root = self.root / "backup"
+        # Create 6 timestamped snapshots
+        for idx in range(6):
+            snap = backup_root / f"20261117_00000{idx}_000001"
+            snap.mkdir(parents=True, exist_ok=True)
+            f = snap / "module.py"
+            f.write_text(f"v={idx}\n" + ("x" * 200), encoding="utf-8")
+
+        # Prune down to max_snapshots=3 -> keeps 3 newest (000005, 000004, 000003)
+        stats = patch_tools.prune_backup_directory(
+            self.root, "backup", max_snapshots=3, max_age_days=30, max_bytes=10_000_000, min_keep=1
+        )
+        self.assertEqual(stats["kept_count"], 3)
+        self.assertEqual(stats["removed_count"], 3)
+        remaining = sorted(p.name for p in backup_root.iterdir() if p.is_dir())
+        self.assertEqual(
+            remaining,
+            ["20261117_000003_000001", "20261117_000004_000001", "20261117_000005_000001"],
+        )
+
+        # Age test: mark oldest remaining snapshot as 15 days old (beyond min_keep=1 and max_age_days=7)
+        now = time.time()
+        old_snap = backup_root / "20261117_000003_000001"
+        os.utime(old_snap, (now - 15 * 86400, now - 15 * 86400))
+        stats_age = patch_tools.prune_backup_directory(
+            self.root, "backup", max_snapshots=10, max_age_days=7, max_bytes=10_000_000, min_keep=1, now_ts=now
+        )
+        self.assertFalse(old_snap.exists())
+        self.assertEqual(stats_age["kept_count"], 2)
+
+        # Size test: cap total bytes so only newest 1 snapshot fits
+        stats_size = patch_tools.prune_backup_directory(
+            self.root, "backup", max_snapshots=10, max_age_days=30, max_bytes=250, min_keep=1, now_ts=now
+        )
+        self.assertEqual(stats_size["kept_count"], 1)
+        self.assertTrue((backup_root / "20261117_000005_000001").is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 // drawer.js - Right panel: Project File Tree, Terminal Runner (+ Paste into Prompt), and Project Backups/Undo
 
 import { api } from "./api.js";
+import { copyTextToClipboard } from "./bridge.js";
 import { emit, getActiveProject, on, state } from "./state.js";
 
 const tabButtons = document.querySelectorAll(".drawer-tab");
@@ -32,6 +33,8 @@ export function initDrawer() {
     dirCache.clear();
     refreshTree();
   });
+  document.getElementById("btn-copy-tree").addEventListener("click", handleCopyTree);
+  document.getElementById("btn-pack-filtered").addEventListener("click", handlePackFiltered);
   fileTreeFilter.addEventListener("input", renderTreeFromCache);
   document.getElementById("btn-run-custom").addEventListener("click", () => {
     const cmd = customCmdInput.value.trim();
@@ -45,15 +48,7 @@ export function initDrawer() {
     }
   });
 
-  postTestsBtn.addEventListener("click", () => {
-    const proj = getActiveProject();
-    if (!proj || !proj.post_patch_command) {
-      emit("chat:error", "No Post-Patch Test Command configured. Click Edit next to Active Project to set one.");
-      return;
-    }
-    switchTab("terminal");
-    runTerminalCommand(proj.post_patch_command);
-  });
+  postTestsBtn.addEventListener("click", triggerPostPatchTests);
 
   pasteTermBtn.addEventListener("click", () => {
     if (!state.lastTerminalOutput) return;
@@ -74,14 +69,27 @@ export function initDrawer() {
   });
 
   on("backups:refresh", refreshBackups);
+  on("drawer:switch-tab", (tabName) => {
+    if (tabName && panes[tabName]) switchTab(tabName);
+  });
+  on("terminal:run-post-tests", triggerPostPatchTests);
   on("terminal:show-result", (res) => {
-    switchTab("terminal");
-    showTerminalResult(res);
+    // Update terminal contents silently so split-screen collapsed drawer isn't forced open unnecessarily
+    showTerminalResult(res, { suppressMdBar: true });
   });
   on("terminal:suggest-post-tests", (cmd) => {
     customCmdInput.value = cmd;
     terminalMeta.textContent = `Patch applied · Click Run Tests (${cmd})`;
   });
+}
+
+function triggerPostPatchTests() {
+  const proj = getActiveProject();
+  if (!proj || !proj.post_patch_command) {
+    emit("chat:error", "No Post-Patch Test Command configured. Click Edit next to Active Project to set one.");
+    return;
+  }
+  runTerminalCommand(proj.post_patch_command, { reportInChat: true, label: "tests" });
 }
 
 export function switchTab(tabName) {
@@ -185,28 +193,139 @@ function renderFolderChildren(projId, folderPath, depth, filter) {
   }
 }
 
-async function runTerminalCommand(command) {
+async function runTerminalCommand(command, opts = {}) {
   const proj = getActiveProject();
   if (!proj) return;
+  const sid = state.activeSessionId;
+  const reportInChat = Boolean(opts.reportInChat && sid);
+  const actId = reportInChat ? `act-${Date.now()}` : null;
+
   terminalMeta.textContent = `Running: ${command}...`;
   terminalOutput.textContent = "";
   pasteTermBtn.disabled = true;
 
+  if (reportInChat) {
+    upsertActivity(sid, {
+      id: actId,
+      status: "running",
+      title: `Running tests: ${command}`,
+      detail: "Waiting for process exit code...",
+      preview: "",
+      timestamp: new Date().toISOString(),
+    });
+    emit("chat:loaded");
+  }
+
   try {
     const res = await api.runCommand(proj.id, command);
     showTerminalResult(res);
+    if (reportInChat) {
+      const rawOut = res.output || "";
+      const hasTraceback = /Traceback \(most recent call last\):|\nSyntaxError:/i.test(rawOut);
+      const ok = res.exit_code === 0 && !hasTraceback;
+      const tailLines = rawOut.split("\n").filter((l) => l.trim()).slice(-6).join("\n").slice(0, 500);
+      upsertActivity(sid, {
+        id: actId,
+        status: ok ? "ok" : "err",
+        title: ok ? `Validated & tested cleanly (exit 0)` : `Possible errors detected (exit ${res.exit_code})`,
+        detail: `${command} · ${res.duration_ms}ms · View full output in Console`,
+        preview: tailLines,
+        showConsoleBtn: true,
+        timestamp: new Date().toISOString(),
+      });
+      emit("chat:loaded");
+    }
   } catch (err) {
     terminalMeta.textContent = "Command failed";
     terminalOutput.textContent = err.message;
+    if (reportInChat) {
+      upsertActivity(sid, {
+        id: actId,
+        status: "err",
+        title: "Test execution failed",
+        detail: err.message,
+        preview: "",
+        showConsoleBtn: true,
+        timestamp: new Date().toISOString(),
+      });
+      emit("chat:loaded");
+    }
   }
 }
 
-function showTerminalResult(res) {
+function upsertActivity(sessionId, entry) {
+  if (!sessionId) return;
+  const list = state.sessionActivities[sessionId] || [];
+  const idx = list.findIndex((a) => a.id === entry.id);
+  if (idx >= 0) {
+    const anchored = {
+      ...entry,
+      afterMsgIndex: list[idx].afterMsgIndex ?? (state.messages || []).length,
+    };
+    list[idx] = anchored;
+  } else {
+    list.push({
+      ...entry,
+      afterMsgIndex: (state.messages || []).length,
+    });
+  }
+  state.sessionActivities[sessionId] = list.slice(-10);
+}
+
+function showTerminalResult(res, opts = {}) {
   state.lastTerminalLabel = `${res.command} (exit ${res.exit_code})`;
   state.lastTerminalOutput = res.output || "";
   terminalMeta.textContent = `Exit ${res.exit_code} · ${res.duration_ms}ms · ~${(res.estimated_tokens || 0).toLocaleString()} tok`;
   terminalOutput.textContent = res.output || "(No output)";
   pasteTermBtn.disabled = !state.lastTerminalOutput;
+  if (!opts.suppressMdBar && res.generated_md_files && res.generated_md_files.length > 0) {
+    emit("bridge:generated-md", res.generated_md_files);
+  }
+}
+
+async function handleCopyTree() {
+  const proj = getActiveProject();
+  if (!proj) return;
+  const btn = document.getElementById("btn-copy-tree");
+  const filter = (fileTreeFilter.value || "").trim().toLowerCase();
+  try {
+    const res = await api.getTree(proj.id, ".", 5);
+    const lines = filter
+      ? (res.entries || []).filter((e) => e.path.toLowerCase().includes(filter)).map((e) => `${e.path}${e.is_dir ? "/" : ""}`)
+      : [res.tree];
+    await copyTextToClipboard(lines.join("\n"));
+    btn.textContent = "Tree Copied ✓";
+    setTimeout(() => {
+      btn.textContent = "Copy Tree";
+    }, 1800);
+  } catch (err) {
+    emit("chat:error", err.message);
+  }
+}
+
+async function handlePackFiltered() {
+  const proj = getActiveProject();
+  if (!proj) return;
+  const btn = document.getElementById("btn-pack-filtered");
+  const filter = (fileTreeFilter.value || "").trim();
+  btn.disabled = true;
+  btn.textContent = "Packing...";
+  try {
+    const res = await api.bridgePackFiles(proj.id, filter);
+    if (!res.content) {
+      throw new Error("No matching readable files found to pack.");
+    }
+    await copyTextToClipboard(res.content);
+    btn.textContent = `Copied ${res.count} files (~${Number(res.estimated_tokens || 0).toLocaleString()} tok)`;
+    setTimeout(() => {
+      btn.textContent = "Pack Visible (.md)";
+    }, 2200);
+  } catch (err) {
+    emit("chat:error", err.message);
+    btn.textContent = "Pack Visible (.md)";
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function refreshBackups() {
@@ -225,16 +344,21 @@ async function refreshBackups() {
     for (const rec of items) {
       const row = document.createElement("div");
       row.className = "backup-row";
+      const isCleaned = !rec.reverted && rec.backup_exists === false;
+      const statusSuffix = rec.reverted ? " · Reverted" : isCleaned ? " · Auto-cleaned" : "";
       row.innerHTML = `
         <div style="min-width:0; flex:1;">
           <div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(rec.file_path)}</div>
-          <div class="meta-line">${escapeHtml(rec.summary)}${rec.reverted ? " · Reverted" : ""}</div>
+          <div class="meta-line">${escapeHtml(rec.summary)}${statusSuffix}</div>
         </div>
       `;
       const btn = document.createElement("button");
       btn.className = "btn btn-secondary btn-sm";
-      btn.textContent = rec.reverted ? "Reverted" : "Undo";
-      btn.disabled = rec.reverted;
+      btn.textContent = rec.reverted ? "Reverted" : isCleaned ? "Cleaned" : "Undo";
+      btn.disabled = Boolean(rec.reverted || isCleaned);
+      if (isCleaned) {
+        btn.title = "Snapshot exceeded backup retention limit and was auto-cleaned";
+      }
       btn.addEventListener("click", async () => {
         try {
           await api.undoPatch(rec.id);

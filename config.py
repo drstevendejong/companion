@@ -40,13 +40,23 @@ DEFAULT_IGNORE_PATTERNS: FrozenSet[str] = frozenset({
     "data",
     ".pytest_cache",
     ".mypy_cache",
+    ".ruff_cache",
     ".idea",
+    ".DS_Store",
+    "Thumbs.db",
     "dist",
     "build",
     "*.pyc",
     "*.pyo",
+    "*.egg-info",
 })
 
 MAX_READ_CHARS_SOFT: int = 120_000
 MAX_COMMAND_OUTPUT_CHARS: int = 150_000
 COMMAND_TIMEOUT_SECONDS: int = 180
+
+BACKUP_MAX_SNAPSHOTS: int = 20
+BACKUP_MAX_AGE_DAYS: int = 7
+BACKUP_MAX_BYTES: int = 20 * 1024 * 1024
+BACKUP_MIN_KEEP: int = 3
+

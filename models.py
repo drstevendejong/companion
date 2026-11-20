@@ -57,6 +57,7 @@ class ProjectProfile(BaseModel):
 class SessionCreate(BaseModel):
     project_id: str
     title: str = "New Session"
+    api_enabled: bool = False
     model: str = "gemini-4-hydrogen"
     thinking_level: str = "HIGH"
     auto_approve_read_tokens: int = 0
@@ -67,6 +68,7 @@ class SessionUpdate(BaseModel):
     model: Optional[str] = None
     thinking_level: Optional[str] = None
     auto_approve_read_tokens: Optional[int] = None
+    directives_sent: Optional[bool] = None
 
 
 class TokenStats(BaseModel):
@@ -74,15 +76,18 @@ class TokenStats(BaseModel):
     output_tokens: int = 0
     thinking_tokens: int = 0
     total_tokens: int = 0
+    last_context_tokens: int = 0
 
 
 class SessionInfo(BaseModel):
     id: str
     project_id: str
     title: str
+    api_enabled: bool = True
     model: str
     thinking_level: str
     auto_approve_read_tokens: int = 0
+    directives_sent: bool = False
     token_stats: TokenStats = Field(default_factory=TokenStats)
     created_at: str
     updated_at: str
@@ -103,11 +108,46 @@ class ChatSendRequest(BaseModel):
     attachments: List[AttachmentItem] = Field(default_factory=list)
 
 
+class ChatRetryRequest(BaseModel):
+    session_id: str
+
+
+class BridgeBundleRequest(BaseModel):
+    session_id: str
+    prompt: str = ""
+    attachments: List[AttachmentItem] = Field(default_factory=list)
+    include_directives: Optional[bool] = None
+    record_turn: bool = True
+
+
+class BridgeParseRequest(BaseModel):
+    session_id: str
+    raw_markdown: str = Field(..., min_length=1)
+    auto_approve_reads: bool = False
+
+
+class BridgePackFilesRequest(BaseModel):
+    project_id: str
+    paths: List[str] = Field(default_factory=list)
+    filter_text: str = ""
+    max_files: int = 25
+
+
 class ToolGateDecision(BaseModel):
     action: Literal["approve", "deny", "edit_range", "write_only", "write_and_run"]
     start_line: Optional[int] = None
     end_line: Optional[int] = None
     reason: Optional[str] = None
+
+
+class BatchGateItem(BaseModel):
+    gate_id: str
+    decision: ToolGateDecision
+
+
+class BatchGateDecisionRequest(BaseModel):
+    session_id: str
+    decisions: List[BatchGateItem] = Field(default_factory=list)
 
 
 class RunCommandRequest(BaseModel):
@@ -144,6 +184,7 @@ class PatchRecord(BaseModel):
     diff: str
     created_at: str
     reverted: bool = False
+    backup_exists: bool = True
 
 
 class MessageRecord(BaseModel):

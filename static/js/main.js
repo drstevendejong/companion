@@ -1,5 +1,6 @@
 // main.js - Bootstrap modular companion frontend
 
+import { initBridge } from "./bridge.js";
 import { initCdp } from "./cdp.js";
 import { initChat } from "./chat.js";
 import { initComposer } from "./composer.js";
@@ -16,6 +17,7 @@ async function bootstrap() {
   initLayoutResizers();
   initChat();
   initComposer();
+  initBridge();
   initToolGates();
   initDrawer();
   initGit();

@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from models import PatchRecord, RunCommandRequest
+from services import bridge as bridge_svc
 from services import fs_tools, patch_tools, runner
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
@@ -60,11 +61,16 @@ async def run_workspace_command(payload: RunCommandRequest, request: Request) ->
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
     try:
-        return await runner.run_project_command(
+        res = await runner.run_project_command(
             project.root_path,
             payload.command,
             configured_python=project.python_path,
         )
+        res["generated_md_files"] = bridge_svc.find_recent_markdown_outputs(
+            project.root_path,
+            res.get("output", ""),
+        )
+        return res
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -74,10 +80,20 @@ def list_project_backups(
     request: Request,
     project_id: str = Query(...),
 ) -> List[PatchRecord]:
+    from pathlib import Path as _Path
+
     db = request.app.state.db
-    if db.get_project(project_id) is None:
+    project = db.get_project(project_id)
+    if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
-    return db.list_patch_records(project_id)
+    patch_tools.prune_backup_directory(project.root_path, project.backup_dir)
+    records = db.list_patch_records(project_id)
+    for rec in records:
+        if rec.existed_before:
+            rec.backup_exists = bool(rec.backup_path and _Path(rec.backup_path).is_file())
+        else:
+            rec.backup_exists = True
+    return records
 
 
 @router.post("/undo/{patch_id}")

@@ -1,7 +1,7 @@
-// settings.js - Gemini API key modal and startup validation check
+// settings.js - Gemini API Key modal & key verification (0 startup API calls)
 
 import { api } from "./api.js";
-import { on } from "./state.js";
+import { on, state } from "./state.js";
 
 const keyBtn = document.getElementById("btn-api-key");
 const modal = document.getElementById("api-key-modal");
@@ -14,9 +14,26 @@ const clearBtn = document.getElementById("btn-clear-api-key");
 const cancelBtn = document.getElementById("btn-cancel-api-key");
 const saveBtn = document.getElementById("btn-save-api-key");
 
+let keyPromptResolver = null;
+
+function resolvePendingKeyPrompt(configured) {
+  if (keyPromptResolver) {
+    const resolve = keyPromptResolver;
+    keyPromptResolver = null;
+    resolve(Boolean(configured));
+  }
+}
+
 export async function initSettings() {
   keyBtn.addEventListener("click", () => openKeyModal(false));
-  cancelBtn.addEventListener("click", () => modal.close());
+  cancelBtn.addEventListener("click", () => {
+    modal.close();
+    resolvePendingKeyPrompt(false);
+  });
+  modal.addEventListener("close", () => {
+    resolvePendingKeyPrompt(false);
+  });
+
   toggleBtn.addEventListener("click", () => {
     const hidden = keyInput.type === "password";
     keyInput.type = hidden ? "text" : "password";
@@ -27,19 +44,28 @@ export async function initSettings() {
 
   on("settings:open-key-modal", (reason) => openKeyModal(true, reason));
 
-  await checkKeyOnStartup();
+  await refreshKeyStatus();
 }
 
-async function checkKeyOnStartup() {
+export async function refreshKeyStatus() {
   try {
-    const status = await api.getApiKeyStatus(true);
+    const status = await api.getApiKeyStatus(false);
+    state.hasApiKey = Boolean(status && status.configured);
     updateButtonBadge(status);
-    if (!status.configured || status.valid === false) {
-      openKeyModal(true, status.error || "Enter your Gemini API key to begin.");
-    }
-  } catch (err) {
-    openKeyModal(true, err.message);
+    return status;
+  } catch {
+    state.hasApiKey = false;
+    updateButtonBadge({ configured: false });
+    return { configured: false };
   }
+}
+
+export function requestApiKeyForSessionSetup(reason = "") {
+  resolvePendingKeyPrompt(false);
+  return new Promise((resolve) => {
+    keyPromptResolver = resolve;
+    void openKeyModal(true, reason);
+  });
 }
 
 async function openKeyModal(forceNotice = false, customError = "") {
@@ -50,6 +76,7 @@ async function openKeyModal(forceNotice = false, customError = "") {
 
   try {
     const status = await api.getApiKeyStatus(false);
+    state.hasApiKey = Boolean(status.configured);
     updateButtonBadge(status);
     if (status.configured) {
       statusMsg.textContent = `Current key (${status.source}): ${status.masked_preview} · Stored at ${status.key_file}`;
@@ -65,6 +92,7 @@ async function openKeyModal(forceNotice = false, customError = "") {
   if (!modal.open) {
     modal.showModal();
   }
+  keyInput.focus();
 }
 
 async function handleSaveKey(ev) {
@@ -78,8 +106,19 @@ async function handleSaveKey(ev) {
 
   try {
     const res = await api.saveApiKey(raw, true);
-    updateButtonBadge({ configured: true, valid: true, masked_preview: res.masked_preview });
+    state.hasApiKey = true;
+    updateButtonBadge({
+      configured: true,
+      valid: true,
+      masked_preview: res.masked_preview,
+      source: res.source,
+    });
+    const resolver = keyPromptResolver;
+    keyPromptResolver = null;
     modal.close();
+    if (resolver) {
+      resolver(true);
+    }
   } catch (err) {
     errorEl.textContent = err.message;
   } finally {
@@ -92,8 +131,9 @@ async function handleClearKey() {
   errorEl.textContent = "";
   try {
     await api.clearApiKey();
-    updateButtonBadge({ configured: false, valid: false });
-    statusMsg.textContent = "Saved key removed. Enter a new Gemini API key below.";
+    state.hasApiKey = false;
+    updateButtonBadge({ configured: false });
+    statusMsg.textContent = "Saved key removed. Only Playground Bridge sessions can run until a key is saved.";
   } catch (err) {
     errorEl.textContent = err.message;
   }
@@ -104,7 +144,7 @@ function updateButtonBadge(status) {
     keyBtn.textContent = "Key ✓";
     keyBtn.title = `Gemini API Key configured (${status.masked_preview || status.source})`;
   } else {
-    keyBtn.textContent = "Key !";
-    keyBtn.title = "Gemini API Key missing or invalid — click to configure";
+    keyBtn.textContent = "Key";
+    keyBtn.title = "No Gemini API key configured (optional for Playground Bridge sessions)";
   }
 }

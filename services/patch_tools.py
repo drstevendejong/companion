@@ -8,10 +8,17 @@ from __future__ import annotations
 import ast
 import difflib
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from config import (
+    BACKUP_MAX_AGE_DAYS,
+    BACKUP_MAX_BYTES,
+    BACKUP_MAX_SNAPSHOTS,
+    BACKUP_MIN_KEEP,
+)
 from services.fs_tools import resolve_safe_path
 from services.token_utils import estimate_tokens
 
@@ -139,12 +146,94 @@ def preview_full_write(
     }
 
 
+def _dir_size_bytes(directory: Path) -> int:
+    total = 0
+    try:
+        for p in directory.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return total
+
+
+def prune_backup_directory(
+    project_root: str | Path,
+    backup_dir_rel: str,
+    *,
+    max_snapshots: int = BACKUP_MAX_SNAPSHOTS,
+    max_age_days: int = BACKUP_MAX_AGE_DAYS,
+    max_bytes: int = BACKUP_MAX_BYTES,
+    min_keep: int = BACKUP_MIN_KEEP,
+    now_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Self-cleans old backup snapshots in <project_root>/<backup_dir>/ by enforcing
+    count, age, and total disk size limits while always preserving the newest snapshot.
+    """
+    root = Path(project_root).resolve()
+    backup_base = Path(backup_dir_rel)
+    if not backup_base.is_absolute():
+        backup_base = (root / backup_base).resolve()
+
+    if not backup_base.is_dir():
+        return {"removed_count": 0, "kept_count": 0, "kept_bytes": 0}
+
+    ts = float(now_ts if now_ts is not None else time.time())
+    max_age_sec = max(0, max_age_days) * 86400.0
+    snapshots: List[Tuple[float, str, Path, int]] = []
+
+    try:
+        children = list(backup_base.iterdir())
+    except OSError:
+        return {"removed_count": 0, "kept_count": 0, "kept_bytes": 0}
+
+    for entry in children:
+        if entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            snapshots.append((mtime, entry.name, entry, _dir_size_bytes(entry)))
+
+    # Newest first (mtime, then timestamp folder name descending)
+    snapshots.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    kept_count = 0
+    kept_bytes = 0
+    removed_count = 0
+
+    for idx, (mtime, _name, path_obj, size_b) in enumerate(snapshots):
+        must_keep_first = idx == 0
+        too_many = idx >= max_snapshots
+        too_old = idx >= min_keep and max_age_days > 0 and (ts - mtime) > max_age_sec
+        too_big = (not must_keep_first) and max_bytes > 0 and (kept_bytes + size_b) > max_bytes
+
+        if too_many or too_old or too_big:
+            shutil.rmtree(path_obj, ignore_errors=True)
+            removed_count += 1
+        else:
+            kept_count += 1
+            kept_bytes += size_b
+
+    return {
+        "removed_count": removed_count,
+        "kept_count": kept_count,
+        "kept_bytes": kept_bytes,
+    }
+
+
 def _backup_target_file(
     project_root: str | Path,
     backup_dir_rel: str,
     rel_path: str,
 ) -> Optional[str]:
-    """Copies the pre-patch file into <project_root>/<backup_dir>/<timestamp>/..."""
+    """Copies the pre-patch file into <project_root>/<backup_dir>/<timestamp>/... and self-cleans old snapshots."""
     root = Path(project_root).resolve()
     target = resolve_safe_path(root, rel_path)
     if not target.exists():
@@ -158,6 +247,7 @@ def _backup_target_file(
     dest = backup_base / stamp / rel_path
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(target, dest)
+    prune_backup_directory(root, backup_dir_rel)
     return str(dest)
 
 

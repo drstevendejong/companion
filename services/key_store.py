@@ -69,7 +69,7 @@ def mask_api_key(api_key: str) -> str:
 
 
 def validate_api_key_with_gemini(api_key: str) -> Tuple[bool, str]:
-    """Performs a lightweight models.get check via google-genai to verify key validity."""
+    """Performs a lightweight models.list check via google-genai to verify key validity."""
     clean = api_key.strip()
     if not clean:
         return False, "API key is empty."
@@ -78,7 +78,8 @@ def validate_api_key_with_gemini(api_key: str) -> Tuple[bool, str]:
 
     try:
         client = genai.Client(api_key=clean)
-        client.models.get(model="gemini-4-hydrogen")
+        pager = client.models.list(config={"page_size": 5})
+        next(iter(pager), None)
         return True, ""
     except Exception as exc:
         return False, str(exc)

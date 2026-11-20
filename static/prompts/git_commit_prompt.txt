@@ -1,0 +1,5 @@
+Write a concise, accurate git commit message (1-line subject <= 72 chars, optional short bullet body only if multiple logical changes exist) for this diff. Return ONLY the commit message text, no markdown fences.
+
+```diff
+{diff}
+```

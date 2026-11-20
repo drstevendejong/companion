@@ -1,19 +1,22 @@
 // git.js - Git status, Gemini commit message drafting, Commit, and Commit & Push
 
 import { api } from "./api.js";
-import { getActiveProject, on, state } from "./state.js";
+import { copyTextToClipboard } from "./bridge.js";
+import { emit, getActiveProject, on, state } from "./state.js";
 
 const branchLabel = document.getElementById("git-branch-label");
 const filesList = document.getElementById("git-files-list");
 const msgInput = document.getElementById("git-message-input");
 const resultLabel = document.getElementById("git-result");
 const draftBtn = document.getElementById("btn-git-draft");
+const copyDiffBtn = document.getElementById("btn-git-copy-diff");
 const commitBtn = document.getElementById("btn-git-commit");
 const pushBtn = document.getElementById("btn-git-commit-push");
 
 export function initGit() {
   document.getElementById("btn-git-refresh").addEventListener("click", refreshGitStatus);
   draftBtn.addEventListener("click", draftMessage);
+  copyDiffBtn.addEventListener("click", copyDiffForPlayground);
   commitBtn.addEventListener("click", () => commitChanges(false));
   pushBtn.addEventListener("click", () => commitChanges(true));
 
@@ -63,11 +66,32 @@ async function draftMessage() {
     const res = await api.gitDraftMessage(proj.id, model);
     msgInput.value = res.message;
     resultLabel.textContent = `Drafted from ~${res.diff_tokens} diff tokens`;
+    if (res.telemetry) emit("telemetry:updated", res.telemetry);
   } catch (err) {
     resultLabel.textContent = err.message;
   } finally {
     draftBtn.disabled = false;
     draftBtn.textContent = "Draft with Gemini";
+  }
+}
+
+async function copyDiffForPlayground() {
+  const proj = getActiveProject();
+  if (!proj) return;
+  try {
+    const status = await api.gitStatus(proj.id);
+    if (!status.is_repo || !status.changed_files.length) {
+      resultLabel.textContent = "Working tree clean; no diff to copy.";
+      return;
+    }
+    const diffBody =
+      status.diff ||
+      status.changed_files.map((f) => `${f.status} ${f.path}`).join("\n");
+    const promptText = `Write a concise git commit message (1-line subject <= 72 chars) for this diff:\n\n\`\`\`diff\n${diffBody}\n\`\`\``;
+    await copyTextToClipboard(promptText);
+    resultLabel.textContent = `Copied git diff (~${Number(status.diff_tokens || 0).toLocaleString()} tok) to clipboard.`;
+  } catch (err) {
+    resultLabel.textContent = err.message;
   }
 }
 

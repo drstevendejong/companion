@@ -25,7 +25,10 @@ export async function refreshTabs() {
   const port = getCdpPort();
   try {
     const res = await api.cdpTabs(port);
-    if (!res.connected || !res.tabs.length) {
+    const hasTabs = Boolean(res.connected && res.tabs && res.tabs.length > 0);
+    shotBtn.classList.toggle("hidden", !hasTabs);
+    consoleBtn.classList.toggle("hidden", !hasTabs);
+    if (!hasTabs) {
       tabSelect.innerHTML = `<option value="">Chrome :${port} (${res.connected ? "0 tabs" : "Offline"})</option>`;
       return;
     }
@@ -37,6 +40,8 @@ export async function refreshTabs() {
       tabSelect.value = prev;
     }
   } catch {
+    shotBtn.classList.add("hidden");
+    consoleBtn.classList.add("hidden");
     tabSelect.innerHTML = `<option value="">Chrome :${port} (Offline)</option>`;
   }
 }

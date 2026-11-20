@@ -4,7 +4,7 @@ routes/settings.py - Gemini API key status, validation, and local JSON persisten
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -19,6 +19,14 @@ class ApiKeySaveRequest(BaseModel):
     validate_key: bool = True
 
 
+@router.get("/telemetry")
+def get_telemetry(
+    request: Request,
+    model: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    return request.app.state.db.get_rate_telemetry(model=model)
+
+
 @router.get("/api-key")
 def get_api_key_status(
     request: Request,
@@ -26,6 +34,15 @@ def get_api_key_status(
 ) -> Dict[str, Any]:
     gemini = request.app.state.gemini
     key_path = gemini.key_path
+    if getattr(gemini, "_client_factory", None) is not None:
+        return {
+            "configured": True,
+            "valid": True,
+            "source": "test",
+            "masked_preview": "test-key",
+            "key_file": str(key_path),
+            "error": "",
+        }
     try:
         api_key, source = key_store.load_api_key(key_path)
     except RuntimeError as exc:

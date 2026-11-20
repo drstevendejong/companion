@@ -9,7 +9,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from models import GitCommitRequest, GitDraftMessageRequest
-from services import git_tools
+from services import git_tools, key_store
 
 router = APIRouter(prefix="/api/git", tags=["git"])
 
@@ -27,7 +27,22 @@ def git_status(request: Request, project_id: str = Query(...)) -> Dict[str, Any]
 
 @router.post("/draft-message")
 def draft_commit_message(payload: GitDraftMessageRequest, request: Request) -> Dict[str, Any]:
-    project = request.app.state.db.get_project(payload.project_id)
+    db = request.app.state.db
+    gemini = request.app.state.gemini
+
+    if getattr(gemini, "_client_factory", None) is None:
+        try:
+            key_val, _ = key_store.load_api_key(gemini.key_path)
+            has_key = bool(key_val)
+        except RuntimeError:
+            has_key = False
+        if not has_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Configure a Gemini API key to draft commit messages.",
+            )
+
+    project = db.get_project(payload.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
     status = git_tools.get_git_status(project.root_path)
@@ -40,14 +55,16 @@ def draft_commit_message(payload: GitDraftMessageRequest, request: Request) -> D
         f"{f['status']} {f['path']}" for f in status["changed_files"]
     )
     try:
-        draft = request.app.state.gemini.draft_commit_message(diff_text, model=payload.model)
+        draft = gemini.draft_commit_message(diff_text, model=payload.model)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    db.record_api_usage(payload.model, draft["usage"])
     return {
         "message": draft["message"],
         "diff_tokens": status.get("diff_tokens", 0),
         "usage": draft["usage"].model_dump(),
+        "telemetry": db.get_rate_telemetry(model=payload.model),
     }
 
 

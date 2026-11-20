@@ -1,10 +1,42 @@
 // api.js - HTTP client wrapper for companion backend
 
 export async function requestJson(url, options = {}) {
-  const res = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
+  const { timeoutMs = 0, signal: externalSignal, headers: customHeaders, ...fetchOpts } = options;
+  let controller = null;
+  let timerId = null;
+  let signal = externalSignal || undefined;
+
+  if (timeoutMs > 0 || externalSignal) {
+    controller = new AbortController();
+    signal = controller.signal;
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener("abort", () => controller.abort(), { once: true });
+      }
+    }
+    if (timeoutMs > 0) {
+      timerId = setTimeout(() => controller.abort(new Error("Request timed out")), timeoutMs);
+    }
+  }
+
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { "Content-Type": "application/json", ...(customHeaders || {}) },
+      ...fetchOpts,
+      signal,
+    });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error("Request canceled or timed out. You can click Retry Turn or switch models.");
+    }
+    throw err;
+  } finally {
+    if (timerId) clearTimeout(timerId);
+  }
+
   const text = await res.text();
   let data = null;
   if (text) {
@@ -31,7 +63,8 @@ export const api = {
     requestJson(`/api/projects/browse-fs?path=${encodeURIComponent(path)}&include_files=${includeFiles ? "true" : "false"}`),
 
   // Sessions
-  getModelCatalog: () => requestJson("/api/sessions/models"),
+  getModelCatalog: (refresh = false, probe = false) =>
+    requestJson(`/api/sessions/models?refresh=${refresh ? "true" : "false"}&probe=${probe ? "true" : "false"}`),
   listSessions: (projectId) => requestJson(`/api/sessions?project_id=${encodeURIComponent(projectId)}`),
   createSession: (body) => requestJson("/api/sessions", { method: "POST", body: JSON.stringify(body) }),
   getSessionDetail: (id) => requestJson(`/api/sessions/${id}`),
@@ -39,8 +72,19 @@ export const api = {
   deleteSession: (id) => requestJson(`/api/sessions/${id}`, { method: "DELETE" }),
 
   // Chat & Tool Gates
-  sendChat: (body) => requestJson("/api/chat/send", { method: "POST", body: JSON.stringify(body) }),
-  resolveGate: (gateId, body) => requestJson(`/api/chat/gate/${gateId}`, { method: "POST", body: JSON.stringify(body) }),
+  sendChat: (body, options = {}) =>
+    requestJson("/api/chat/send", { method: "POST", body: JSON.stringify(body), timeoutMs: 120000, ...options }),
+  retryChat: (sessionId, options = {}) =>
+    requestJson("/api/chat/retry", { method: "POST", body: JSON.stringify({ session_id: sessionId }), timeoutMs: 120000, ...options }),
+  resolveGate: (gateId, body, options = {}) =>
+    requestJson(`/api/chat/gate/${gateId}`, { method: "POST", body: JSON.stringify(body), timeoutMs: 120000, ...options }),
+  resolveGatesBatch: (sessionId, decisions, options = {}) =>
+    requestJson("/api/chat/gates/batch", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId, decisions }),
+      timeoutMs: 120000,
+      ...options,
+    }),
 
   // Workspace
   getTree: (projectId, subpath = ".", maxDepth = 0) =>
@@ -67,7 +111,9 @@ export const api = {
   cdpConsole: (wsUrl) =>
     requestJson("/api/cdp/console", { method: "POST", body: JSON.stringify({ ws_url: wsUrl }) }),
 
-  // Settings (API Key)
+  // Settings (API Key, Telemetry)
+  getTelemetry: (model = null) =>
+    requestJson(`/api/settings/telemetry${model ? `?model=${encodeURIComponent(model)}` : ""}`),
   getApiKeyStatus: (verify = false) => requestJson(`/api/settings/api-key?verify=${verify ? "true" : "false"}`),
   saveApiKey: (apiKey, validateKey = true) =>
     requestJson("/api/settings/api-key", {
@@ -75,4 +121,28 @@ export const api = {
       body: JSON.stringify({ api_key: apiKey, validate_key: validateKey }),
     }),
   clearApiKey: () => requestJson("/api/settings/api-key", { method: "DELETE" }),
+
+  // Playground Bridge (0 API tokens)
+  bridgeBundle: (body) =>
+    requestJson("/api/bridge/bundle", { method: "POST", body: JSON.stringify(body) }),
+  bridgeParse: (sessionId, rawMarkdown, autoApproveReads = false) =>
+    requestJson("/api/bridge/parse", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: sessionId,
+        raw_markdown: rawMarkdown,
+        auto_approve_reads: Boolean(autoApproveReads),
+      }),
+    }),
+  bridgeReadMd: (projectId, path, sessionId = null, recordSummary = false) => {
+    const params = new URLSearchParams({ project_id: projectId, path });
+    if (sessionId) params.set("session_id", sessionId);
+    if (recordSummary) params.set("record_summary", "true");
+    return requestJson(`/api/bridge/read-md?${params.toString()}`);
+  },
+  bridgePackFiles: (projectId, filterText = "", paths = []) =>
+    requestJson("/api/bridge/pack-files", {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, filter_text: filterText, paths }),
+    }),
 };

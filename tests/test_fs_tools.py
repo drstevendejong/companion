@@ -58,6 +58,127 @@ class TestFsTools(unittest.TestCase):
         reg = fs_tools.search_code(self.root, r"def \w+\(", is_regex=True, path_glob="*.py")
         self.assertEqual(reg["total_hits"], 2)
 
+    def test_search_code_generic_languages_and_brace_globs(self) -> None:
+        (self.root / "app.js").write_text("function greet() { return 'hi'; }\n", encoding="utf-8")
+        (self.root / "index.html").write_text("<script>greet();</script>\n", encoding="utf-8")
+        (self.root / "lib.rs").write_text("fn greet() {}\n", encoding="utf-8")
+
+        all_files = fs_tools.search_code(self.root, "greet", path_glob=None)
+        self.assertEqual(all_files["total_hits"], 4)
+
+        brace_glob = fs_tools.search_code(self.root, "greet", path_glob="*.{js,html}")
+        matched_paths = {m["path"] for m in brace_glob["matches"]}
+        self.assertEqual(matched_paths, {"app.js", "index.html"})
+
+        comma_glob = fs_tools.search_code(self.root, "greet", path_glob="*.py, *.rs")
+        matched_comma = {m["path"] for m in comma_glob["matches"]}
+        self.assertEqual(matched_comma, {"src/alpha.py", "lib.rs"})
+
+    def test_search_code_ignore_case_filenames_and_non_utf8(self) -> None:
+        (self.root / "core").mkdir()
+        (self.root / "core" / "surveillance_tab.py").write_bytes(
+            b"# \xe9 Surveillance module\nSURVEILLANCE_KEY = 'ok'\n"
+        )
+        (self.root / "core" / "panel.html").write_text("<div id='Surveillance'></div>\n", encoding="utf-8")
+        (self.root / "core" / "panel.css").write_text(".surveillance-box {}\n", encoding="utf-8")
+
+        res_ic = fs_tools.search_code(
+            self.root,
+            "surveillance",
+            path_glob="*.py,*.js,*.html,*.css,*.json",
+            ignore_case=True,
+        )
+        # 1 filename + 2 content hits in surveillance_tab.py, 1 in panel.html, 1 in panel.css
+        self.assertEqual(res_ic["total_hits"], 5)
+        self.assertIn("[Filename match: core/surveillance_tab.py]", res_ic["formatted"])
+
+        res_exact = fs_tools.search_code(
+            self.root,
+            "SURVEILLANCE",
+            path_glob="*.py,*.js,*.html,*.css,*.json",
+            ignore_case=False,
+        )
+        self.assertEqual(res_exact["total_hits"], 1)
+
+    def test_list_tree_and_search_ignore_nested_dot_dirs_and_no_300_cap(self) -> None:
+        (self.root / ".image_cache").mkdir()
+        (self.root / ".image_cache" / "cached.png").write_bytes(b"png")
+        (self.root / "data-moc" / ".image_cache").mkdir(parents=True)
+        (self.root / "data-moc" / ".image_cache" / "surveillance.txt").write_text(
+            "surveillance in cache\n", encoding="utf-8"
+        )
+        many_dir = self.root / "bulk"
+        many_dir.mkdir()
+        for i in range(340):
+            (many_dir / f"f_{i:03d}.py").write_text("x = 1\n", encoding="utf-8")
+
+        tree = fs_tools.list_tree(self.root, max_depth=4)
+        self.assertFalse(tree["truncated"])
+        self.assertNotIn("Tree truncated", tree["tree"])
+        self.assertNotIn(".image_cache", tree["tree"])
+        self.assertGreaterEqual(len(tree["entries"]), 342)
+
+        hits = fs_tools.search_code(self.root, "surveillance")
+        self.assertEqual(hits["total_hits"], 0)
+
+    def test_search_code_returns_all_matches_without_40_cap(self) -> None:
+        many_lines = "\n".join(f"item_{i} = 'surveillance_{i}'" for i in range(250)) + "\n"
+        (self.root / "many.py").write_text(many_lines, encoding="utf-8")
+
+        res = fs_tools.search_code(self.root, "surveillance", context_lines=0)
+        self.assertEqual(res["total_hits"], 250)
+        self.assertEqual(res["shown_hits"], 250)
+        self.assertEqual(len(res["matches"]), 250)
+        self.assertNotIn("more matches omitted", res["formatted"])
+        self.assertIn("--- many.py:1-250 ---", res["formatted"])
+        self.assertIn("item_249 = 'surveillance_249'", res["formatted"])
+
+    def test_search_code_merges_overlapping_windows_skips_blank_lines_and_prefixes(self) -> None:
+        (self.root / "merged.py").write_text(
+            "def top():\n"
+            "\n"
+            "    alpha = 'surveillance_one'\n"
+            "    beta = 'surveillance_two'\n"
+            "\n"
+            "    return beta\n",
+            encoding="utf-8",
+        )
+        res = fs_tools.search_code(self.root, "surveillance", context_lines=2)
+        self.assertEqual(res["total_hits"], 2)
+        # Consecutive hits merge into a single hunk header with compact range
+        self.assertEqual(res["formatted"].count("--- merged.py:"), 1)
+        self.assertIn("--- merged.py:3-4 (L1-6) ---", res["formatted"])
+        # No per-line '3: ' prefixes and no blank context lines
+        self.assertNotIn("\n3: ", res["formatted"])
+        self.assertEqual(
+            res["formatted"].splitlines(),
+            [
+                "--- merged.py:3-4 (L1-6) ---",
+                "def top():",
+                "    alpha = 'surveillance_one'",
+                "    beta = 'surveillance_two'",
+                "    return beta",
+            ],
+        )
+
+    def test_search_code_truncates_massive_single_line_around_match(self) -> None:
+        prefix = '  <script id="diary-data" type="application/json">{"version":1,'
+        filler_before = '"pad":"' + ("a" * 20_000) + '",'
+        target = '"mode":"surveillance_tracker",'
+        filler_after = '"tail":"' + ("b" * 65_000) + '"'
+        postfix = ',"ok":true}</script>'
+        massive_line = prefix + filler_before + target + filler_after + postfix
+        (self.root / "dev_tool.html").write_text(f"<div>hi</div>\n{massive_line}\n", encoding="utf-8")
+
+        res = fs_tools.search_code(self.root, "surveillance", context_lines=1)
+        self.assertEqual(res["total_hits"], 1)
+        formatted = res["formatted"]
+        self.assertLess(len(formatted), 600)
+        self.assertIn('<script id="diary-data"', formatted)
+        self.assertIn('"mode":"surveillance_tracker"', formatted)
+        self.assertIn(',"ok":true}</script>', formatted)
+        self.assertIn("chars]...", formatted)
+
     def test_read_lines_and_full_file(self) -> None:
         slice_res = fs_tools.read_lines(self.root, "src/alpha.py", start_line=4, end_line=5)
         self.assertEqual(slice_res["start_line"], 4)

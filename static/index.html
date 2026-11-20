@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/static/css/layout.css" />
   <link rel="stylesheet" href="/static/css/components.css" />
 </head>
-<body>
+<body class="mode-bridge">
   <div id="app-shell" class="app-shell">
     <!-- Left Sidebar: Projects, Sessions, Model & Token Meter -->
     <aside class="sidebar">
@@ -17,6 +17,7 @@
         <div class="row-gap">
           <button id="btn-api-key" class="btn btn-ghost btn-xs" title="Configure Gemini API Key">Key</button>
           <button id="btn-new-project" class="btn btn-secondary btn-xs" title="Add or configure project profile">+ Project</button>
+          <button id="btn-collapse-sidebar" type="button" class="btn btn-ghost btn-xs pane-collapse-btn" title="Collapse Sessions panel" aria-label="Collapse Sessions panel">&lt;</button>
         </div>
       </div>
 
@@ -37,8 +38,11 @@
         <div id="session-list" class="session-list"></div>
       </div>
 
-      <div class="sidebar-block">
-        <label class="field-label" for="model-select">Model</label>
+      <div id="api-sidebar-block" class="sidebar-block">
+        <div class="block-header">
+          <label class="field-label" for="model-select">Model</label>
+          <button id="btn-refresh-models" class="btn btn-ghost btn-xs" title="Refresh live models &amp; probe free/paid access (uses 1 req/model)">&#8635;</button>
+        </div>
         <select id="model-select" class="select-input"></select>
 
         <div class="row-gap mt-2">
@@ -52,16 +56,35 @@
           </div>
         </div>
 
-        <div class="token-meter mt-3">
+        <div id="telemetry-block" class="token-meter mt-3">
           <div class="meter-row">
-            <span>Context Used</span>
+            <span>Context Window</span>
             <span id="token-total-label" class="mono tabular">0 / 1,048,576</span>
           </div>
           <div class="meter-track">
             <div id="token-meter-fill" class="meter-fill" style="width: 0%;"></div>
           </div>
-          <div id="token-breakdown" class="meta-line mono tabular">In 0 · Out 0 · Think 0</div>
+          <div class="rate-telemetry-grid">
+            <div class="rate-cell" title="Requests in the last 60 seconds for the selected model">
+              <span class="rate-lbl">RPM</span>
+              <span id="telemetry-rpm" class="rate-val mono tabular">0</span>
+            </div>
+            <div class="rate-cell" title="Input tokens in the last 60 seconds for the selected model">
+              <span class="rate-lbl">TPM</span>
+              <span id="telemetry-tpm" class="rate-val mono tabular">0</span>
+            </div>
+            <div class="rate-cell" title="Requests today since 00:00 Pacific Time">
+              <span class="rate-lbl">RPD</span>
+              <span id="telemetry-rpd" class="rate-val mono tabular">0</span>
+            </div>
+          </div>
+          <div id="token-breakdown" class="meta-line mono tabular">Resets: 60s · 00:00 PT</div>
         </div>
+      </div>
+
+      <div id="bridge-sidebar-block" class="sidebar-block">
+        <div class="field-label">Playground Bridge Active</div>
+        <div class="meta-line" style="white-space:normal;">0 Gemini API calls or tokens can be spent. Copy bundles to AI Studio Playground and paste responses back for AST-checked diff gates.</div>
       </div>
     </aside>
 
@@ -71,7 +94,10 @@
     <main class="main-stage">
       <header class="topbar">
         <div class="topbar-left">
+          <button id="btn-expand-sidebar" type="button" class="btn btn-secondary btn-xs pane-expand-btn" title="Show Sessions panel">Sessions &gt;</button>
           <input id="session-title-input" class="session-title-input" type="text" value="Select or create a session" disabled />
+          <span id="active-session-mode-badge" class="session-mode-tag is-bridge hidden">BRIDGE</span>
+          <button id="btn-bridge-directives-pill" type="button" class="directives-pill is-pending bridge-only" title="Toggle including Project Directives &amp; Tool Contract on next prompt copy">Directives: On</button>
           <span id="directives-meta" class="meta-line"></span>
         </div>
         <div class="topbar-right">
@@ -79,6 +105,7 @@
             <option value="">Chrome :9222 (Not connected)</option>
           </select>
           <button id="btn-cdp-refresh" class="btn btn-ghost btn-sm" title="Refresh Chrome :9222 tabs">Refresh Tabs</button>
+          <button id="btn-expand-drawer" type="button" class="btn btn-secondary btn-xs pane-expand-btn" title="Show Files &amp; Tools panel">&lt; Files</button>
         </div>
       </header>
 
@@ -92,22 +119,63 @@
       <section id="pending-gates" class="pending-gates hidden"></section>
 
       <footer class="composer">
-        <div id="attachment-strip" class="attachment-strip hidden"></div>
-        <textarea
-          id="prompt-input"
-          class="prompt-textarea"
-          rows="5"
-          placeholder="Write your prompt, or Ctrl+V a UI screenshot directly here..."
-        ></textarea>
+        <div id="bridge-output-bar" class="bridge-output-bar hidden">
+          <span id="bridge-output-label" class="meta-line mono"></span>
+          <div class="row-gap">
+            <button id="btn-bridge-copy-output" type="button" class="btn btn-primary btn-xs">Copy for Playground</button>
+            <button id="btn-bridge-dismiss-output" type="button" class="btn btn-ghost btn-xs" title="Dismiss">&times;</button>
+          </div>
+        </div>
+
+        <div id="bridge-paste-wrap" class="bridge-paste-wrap hidden bridge-only">
+          <div class="row-between">
+            <span id="bridge-paste-hint" class="meta-line">Manual Paste Fallback (used if clipboard read is blocked or empty)</span>
+            <div class="row-gap">
+              <button id="btn-bridge-clear-paste" type="button" class="btn btn-ghost btn-xs">Clear</button>
+              <button id="btn-bridge-close-paste" type="button" class="btn btn-ghost btn-xs" title="Close manual paste">&times;</button>
+            </div>
+          </div>
+          <textarea
+            id="bridge-response-input"
+            class="prompt-textarea bridge-paste-textarea"
+            rows="4"
+            placeholder="Paste AI Studio 'Copy as markdown' output, nested .md blocks, JSON tool calls, or a /packer.py script (Ctrl+Enter to run)..."
+          ></textarea>
+          <div class="row-between">
+            <span class="meta-line">Tip: Ctrl+Enter runs reads &amp; stages writes</span>
+            <div class="row-gap">
+              <button id="btn-bridge-parse-stage" type="button" class="btn btn-secondary btn-sm">Stage All</button>
+              <button id="btn-bridge-parse" type="button" class="btn btn-primary btn-sm">Run Reads &amp; Stage Writes</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="bridge-prompt-slot" class="composer-slot">
+          <div id="attachment-strip" class="attachment-strip hidden"></div>
+          <textarea
+            id="prompt-input"
+            class="prompt-textarea"
+            rows="4"
+            placeholder="Write a prompt (Ctrl+Enter to copy), Ctrl+V a screenshot, or click Paste &amp; Run Clipboard below..."
+          ></textarea>
+        </div>
+
         <div class="composer-bar">
           <div class="composer-actions">
-            <button id="btn-cdp-shot" class="btn btn-secondary btn-sm">CDP Screenshot</button>
-            <button id="btn-cdp-console" class="btn btn-secondary btn-sm">CDP Console</button>
             <button id="btn-run-post-tests" class="btn btn-secondary btn-sm">Run Tests</button>
+            <button id="btn-cdp-shot" class="btn btn-secondary btn-sm hidden" title="Capture Chrome screenshot">CDP Screenshot</button>
+            <button id="btn-cdp-console" class="btn btn-secondary btn-sm hidden" title="Capture Chrome console output">CDP Console</button>
           </div>
           <div class="composer-right">
-            <span id="composer-token-est" class="meta-line mono tabular">Prompt ~0 tok</span>
-            <button id="btn-send" class="btn btn-primary">Send</button>
+            <span id="composer-token-est" class="meta-line mono tabular">~0 tok</span>
+            <button id="btn-retry-turn" type="button" class="btn btn-secondary btn-sm hidden api-only" title="Retry unfinished Gemini turn">Retry Turn</button>
+            <button id="btn-cancel-req" type="button" class="btn btn-danger btn-sm hidden api-only" title="Abort waiting on Gemini">Cancel</button>
+            <button id="btn-send" class="btn btn-primary api-only">Send</button>
+            <button id="btn-bridge-manual-paste" type="button" class="btn btn-ghost btn-xs bridge-only" title="Open manual paste box">Manual Paste</button>
+            <button id="btn-bridge-copy-img" type="button" class="btn btn-secondary btn-sm hidden bridge-only" title="Copy attached CDP image to clipboard for Ctrl+V into Playground">Copy CDP Image</button>
+            <button id="btn-bridge-copy-bundle" type="button" class="btn btn-secondary btn-sm bridge-only">Copy Session Starter</button>
+            <button id="btn-bridge-stage-clipboard" type="button" class="btn btn-secondary btn-sm bridge-only" title="Read clipboard and hold ALL actions behind approval gates">Stage Clipboard</button>
+            <button id="btn-bridge-clipboard-parse" type="button" class="btn btn-primary bridge-cta-main bridge-only" title="Read clipboard, auto-run read-only searches/reads, gate writes/scripts, and auto-copy result">Paste &amp; Run Clipboard</button>
           </div>
         </div>
       </footer>
@@ -122,12 +190,17 @@
         <button class="drawer-tab" data-tab="terminal">Terminal</button>
         <button class="drawer-tab" data-tab="git">Git</button>
         <button class="drawer-tab" data-tab="backups">Backups</button>
+        <button id="btn-collapse-drawer" type="button" class="btn btn-ghost btn-xs pane-collapse-btn pane-collapse-drawer" title="Collapse Files panel" aria-label="Collapse Files panel">&gt;</button>
       </nav>
 
       <div id="tab-files" class="drawer-pane active">
         <div class="pane-toolbar">
           <input id="file-tree-filter" class="text-input mono" type="text" placeholder="Filter visible files..." />
           <button id="btn-refresh-tree" class="btn btn-ghost btn-sm">Refresh</button>
+        </div>
+        <div class="pane-toolbar">
+          <button id="btn-copy-tree" type="button" class="btn btn-secondary btn-xs" title="Copy filtered project tree to clipboard">Copy Tree</button>
+          <button id="btn-pack-filtered" type="button" class="btn btn-secondary btn-xs" title="Pack filtered files as .md into clipboard">Pack Visible (.md)</button>
         </div>
         <div id="file-tree-list" class="tree-list"></div>
       </div>
@@ -154,7 +227,8 @@
         <div class="git-commit-box">
           <div class="row-between">
             <label class="field-label" for="git-message-input">Commit Message</label>
-            <button id="btn-git-draft" class="btn btn-secondary btn-sm">Draft with Gemini</button>
+            <button id="btn-git-draft" class="btn btn-secondary btn-sm api-only">Draft with Gemini</button>
+            <button id="btn-git-copy-diff" type="button" class="btn btn-secondary btn-sm bridge-only">Copy Git Diff</button>
           </div>
           <textarea id="git-message-input" class="text-input mono" rows="3" placeholder="feat: describe changes..."></textarea>
           <div class="row-gap mt-2">
@@ -278,6 +352,45 @@
       </div>
     </form>
   </dialog>
+
+  <!-- Session Setup Modal -->
+  <dialog id="session-setup-modal" class="modal">
+    <form id="session-setup-form" method="dialog" class="modal-card">
+      <h3>Session Setup</h3>
+      <label class="field-label" for="new-session-name">Session Name</label>
+      <input id="new-session-name" class="text-input" type="text" required placeholder="Session 1" />
+
+      <div class="sidebar-block mode-switch-block mt-3" style="border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+        <label class="mode-toggle-row" for="new-session-api-toggle">
+          <span class="mode-toggle-copy">
+            <span class="field-label" style="margin:0;">Use Gemini API</span>
+            <span id="new-session-mode-hint" class="meta-line">OFF · Playground Bridge (0 API tokens, copy/paste)</span>
+          </span>
+          <input id="new-session-api-toggle" type="checkbox" class="toggle-switch" />
+        </label>
+      </div>
+
+      <div id="session-setup-error" class="error-line"></div>
+
+      <div class="modal-actions mt-3">
+        <button id="btn-cancel-session-setup" type="button" class="btn btn-ghost">Cancel</button>
+        <button id="btn-confirm-session-setup" type="submit" class="btn btn-primary">OK</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Disconnected Overlay (shown if Chrome blocks script window.close() on terminal exit) -->
+  <div id="server-closed-overlay" class="server-closed-overlay hidden">
+    <div class="modal-card server-closed-card">
+      <h3>Companion Server Stopped</h3>
+      <p class="meta-line modal-status">
+        The local terminal process has ended, so this Companion session is disconnected.
+      </p>
+      <div class="modal-actions mt-3">
+        <button id="btn-reconnect-server" type="button" class="btn btn-secondary">Retry Connection</button>
+      </div>
+    </div>
+  </div>
 
   <script type="module" src="/static/js/main.js"></script>
 </body>

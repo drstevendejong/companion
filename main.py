@@ -24,9 +24,15 @@ def _is_port_in_use(host: str, port: int) -> bool:
 
 def _start_shutdown_watchdog(app: object, server: object) -> None:
     def _watch() -> None:
+        prev_tick = time.monotonic()
         while not getattr(server, "should_exit", False):
             time.sleep(0.5)
-            if app.state.lifecycle.check_should_shutdown():
+            now = time.monotonic()
+            dt = now - prev_tick
+            prev_tick = now
+            if dt > 5.0:
+                app.state.lifecycle.on_system_wake(dt, now=now)
+            if app.state.lifecycle.check_should_shutdown(now=now):
                 logging.info("Companion browser tab closed — shutting down server cleanly.")
                 server.should_exit = True
                 return
@@ -39,6 +45,9 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("google_genai").setLevel(logging.WARNING)
 
     if not PackageManager.ensure_core_dependencies(auto_install=True):
         logging.error("Failed to verify or install required dependencies from pyproject.toml.")
@@ -68,7 +77,7 @@ def main() -> None:
         launch_chrome_when_ready(DEFAULT_HOST, DEFAULT_PORT)
 
     app = create_app(auto_shutdown=auto_shutdown)
-    config = uvicorn.Config(app, host=DEFAULT_HOST, port=DEFAULT_PORT)
+    config = uvicorn.Config(app, host=DEFAULT_HOST, port=DEFAULT_PORT, timeout_graceful_shutdown=2)
     server = uvicorn.Server(config)
     if auto_shutdown:
         _start_shutdown_watchdog(app, server)

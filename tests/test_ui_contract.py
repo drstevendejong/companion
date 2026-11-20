@@ -24,6 +24,68 @@ class TestUiDomContract(unittest.TestCase):
         missing = {k: v for k, v in sorted(referenced.items()) if k not in html_ids}
         self.assertEqual(missing, {}, f"JS files reference missing HTML IDs: {missing}")
 
+    def test_collapsible_grid_and_pane_button_placement(self) -> None:
+        html = (COMPANION_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        css = (COMPANION_ROOT / "static" / "css" / "layout.css").read_text(encoding="utf-8")
+
+        for selector, col in (
+            (".sidebar", "grid-column: 1"),
+            ("#resizer-left", "grid-column: 2"),
+            (".main-stage", "grid-column: 3"),
+            ("#resizer-right", "grid-column: 4"),
+            (".drawer", "grid-column: 5"),
+        ):
+            self.assertIn(selector, css)
+            self.assertIn(col, css)
+
+        self.assertIn(".app-shell:not(.sidebar-collapsed) #btn-expand-sidebar", css)
+        self.assertIn(".app-shell:not(.drawer-collapsed) #btn-expand-drawer", css)
+
+        sidebar_header = html.split('class="sidebar-header"', 1)[1].split("</aside>", 1)[0]
+        topbar = html.split('class="topbar"', 1)[1].split("</header>", 1)[0]
+        drawer_tabs = html.split('class="drawer-tabs"', 1)[1].split("</nav>", 1)[0]
+
+        self.assertIn('id="btn-collapse-sidebar"', sidebar_header)
+        self.assertIn('id="btn-collapse-drawer"', drawer_tabs)
+        self.assertIn('id="btn-expand-sidebar"', topbar)
+        self.assertIn('id="btn-expand-drawer"', topbar)
+
+    def test_chat_stream_and_bridge_composer_contract(self) -> None:
+        html = (COMPANION_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        css = (COMPANION_ROOT / "static" / "css" / "layout.css").read_text(encoding="utf-8")
+
+        self.assertIn(".chat-stream > *", css)
+        self.assertIn("flex-shrink: 0", css)
+        for req_id in (
+            "btn-bridge-directives-pill",
+            "btn-bridge-manual-paste",
+            "btn-bridge-close-paste",
+            "btn-bridge-stage-clipboard",
+            "btn-bridge-clipboard-parse",
+            "bridge-prompt-slot",
+            "bridge-paste-wrap",
+            "bridge-paste-hint",
+            "btn-bridge-parse-stage",
+            "btn-bridge-parse",
+            "btn-bridge-copy-bundle",
+        ):
+            self.assertIn(f'id="{req_id}"', html)
+        for removed_id in ("chk-bridge-directives", "btn-bridge-tab-prompt", "btn-bridge-tab-paste"):
+            self.assertNotIn(f'id="{removed_id}"', html)
+
+        comp_css = (COMPANION_ROOT / "static" / "css" / "components.css").read_text(encoding="utf-8")
+        self.assertIn(".gates-batch-bar", comp_css)
+        self.assertIn("position: sticky", comp_css)
+        self.assertIn("top: 0", comp_css)
+
+        chat_js = (COMPANION_ROOT / "static" / "js" / "chat.js").read_text(encoding="utf-8")
+        gates_js = (COMPANION_ROOT / "static" / "js" / "tool_gates.js").read_text(encoding="utf-8")
+        bridge_js = (COMPANION_ROOT / "static" / "js" / "bridge.js").read_text(encoding="utf-8")
+        self.assertIn("Copy Error", chat_js)
+        self.assertIn("createGateVisibilityButton", chat_js)
+        self.assertIn("gatesHiddenDueToError", gates_js)
+        self.assertIn("buildErrorReasonForDeniedAction", bridge_js)
+
 
 if __name__ == "__main__":
     unittest.main()

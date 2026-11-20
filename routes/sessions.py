@@ -8,21 +8,24 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from config import AVAILABLE_MODELS, THINKING_LEVELS
+from config import THINKING_LEVELS
 from models import SessionCreate, SessionInfo, SessionUpdate
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
 @router.get("/models")
-def get_model_catalog() -> Dict[str, Any]:
-    return {
-        "models": [
-            {"id": m_id, "label": label, "context_limit": ctx}
-            for m_id, label, ctx in AVAILABLE_MODELS
-        ],
-        "thinking_levels": THINKING_LEVELS,
-    }
+def get_model_catalog(
+    request: Request,
+    refresh: bool = Query(default=False),
+    probe: bool = Query(default=False),
+) -> Dict[str, Any]:
+    gemini = getattr(request.app.state, "gemini", None)
+    if gemini is not None and hasattr(gemini, "get_model_catalog"):
+        return gemini.get_model_catalog(force_refresh=refresh, probe=probe)
+    from services.model_catalog import get_fallback_catalog
+
+    return get_fallback_catalog()
 
 
 @router.get("", response_model=List[SessionInfo])
@@ -47,10 +50,20 @@ def get_session_detail(session_id: str, request: Request) -> Dict[str, Any]:
     session = db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
+    messages = db.list_messages(session_id)
+    if session.token_stats.last_context_tokens == 0 and session.token_stats.total_tokens > 0:
+        for msg in reversed(messages):
+            if msg.role == "model" and msg.token_usage:
+                u = msg.token_usage
+                session.token_stats.last_context_tokens = u.total_tokens or (
+                    u.input_tokens + u.output_tokens + u.thinking_tokens
+                )
+                break
     return {
         "session": session,
-        "messages": db.list_messages(session_id),
+        "messages": messages,
         "pending_gates": db.list_pending_gates(session_id),
+        "telemetry": db.get_rate_telemetry(model=session.model),
     }
 
 

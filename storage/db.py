@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from models import (
     AttachmentItem,
@@ -29,6 +31,35 @@ from models import (
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _pacific_midnight_utc(now_ts: float) -> tuple[float, str]:
+    """
+    Returns (utc_epoch_seconds_of_pacific_midnight, pacific_date_yyyy_mm_dd).
+    Uses America/Los_Angeles via zoneinfo when available, with DST-aware fallback.
+    """
+    dt_utc = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    try:
+        tz = ZoneInfo("America/Los_Angeles")
+        dt_pt = dt_utc.astimezone(tz)
+        mid_pt = dt_pt.replace(hour=0, minute=0, second=0, microsecond=0)
+        return mid_pt.astimezone(timezone.utc).timestamp(), mid_pt.strftime("%Y-%m-%d")
+    except ZoneInfoNotFoundError:
+        # Pure-Python US Pacific DST fallback (second Sunday of March .. first Sunday of Nov)
+        def _nth_sunday(year: int, month: int, nth: int) -> datetime:
+            d = datetime(year, month, 1, 2, 0, tzinfo=timezone.utc)
+            days_to_sun = (6 - d.weekday()) % 7
+            return d + timedelta(days=days_to_sun + (nth - 1) * 7)
+
+        approx_std = dt_utc - timedelta(hours=8)
+        y = approx_std.year
+        dst_start = _nth_sunday(y, 3, 2) + timedelta(hours=8)  # 02:00 PST -> 10:00 UTC
+        dst_end = _nth_sunday(y, 11, 1) + timedelta(hours=7)   # 02:00 PDT -> 09:00 UTC
+        offset_hours = -7 if dst_start <= dt_utc < dst_end else -8
+        pt_tz = timezone(timedelta(hours=offset_hours))
+        dt_pt = dt_utc.astimezone(pt_tz)
+        mid_pt = dt_pt.replace(hour=0, minute=0, second=0, microsecond=0)
+        return mid_pt.astimezone(timezone.utc).timestamp(), mid_pt.strftime("%Y-%m-%d")
 
 
 class CompanionDB:
@@ -75,13 +106,16 @@ class CompanionDB:
                     id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                     title TEXT NOT NULL,
+                    api_enabled INTEGER NOT NULL DEFAULT 0,
                     model TEXT NOT NULL,
                     thinking_level TEXT NOT NULL DEFAULT 'HIGH',
                     auto_approve_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    directives_sent INTEGER NOT NULL DEFAULT 0,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     thinking_tokens INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0,
+                    last_context_tokens INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -120,8 +154,41 @@ class CompanionDB:
                     reverted INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS api_usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    thinking_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_ts REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_api_usage_ts
+                    ON api_usage_events(created_ts);
                 """
             )
+            session_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "last_context_tokens" not in session_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN last_context_tokens INTEGER NOT NULL DEFAULT 0"
+                )
+            if "directives_sent" not in session_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN directives_sent INTEGER NOT NULL DEFAULT 0"
+                )
+            if "api_enabled" not in session_cols:
+                # Existing legacy sessions predate Bridge mode and are API sessions
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN api_enabled INTEGER NOT NULL DEFAULT 1"
+                )
 
     # --- Projects ---
 
@@ -229,18 +296,25 @@ class CompanionDB:
     # --- Sessions ---
 
     def _row_to_session(self, row: sqlite3.Row) -> SessionInfo:
+        row_keys = set(row.keys())
+        last_ctx = int(row["last_context_tokens"] or 0) if "last_context_tokens" in row_keys else 0
+        dir_sent = bool(row["directives_sent"]) if "directives_sent" in row_keys else False
+        api_enabled = bool(row["api_enabled"]) if "api_enabled" in row_keys else True
         return SessionInfo(
             id=row["id"],
             project_id=row["project_id"],
             title=row["title"],
+            api_enabled=api_enabled,
             model=row["model"],
             thinking_level=row["thinking_level"],
             auto_approve_read_tokens=row["auto_approve_read_tokens"],
+            directives_sent=dir_sent,
             token_stats=TokenStats(
                 input_tokens=row["input_tokens"],
                 output_tokens=row["output_tokens"],
                 thinking_tokens=row["thinking_tokens"],
                 total_tokens=row["total_tokens"],
+                last_context_tokens=last_ctx,
             ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -273,14 +347,15 @@ class CompanionDB:
             conn.execute(
                 """
                 INSERT INTO sessions (
-                    id, project_id, title, model, thinking_level,
+                    id, project_id, title, api_enabled, model, thinking_level,
                     auto_approve_read_tokens, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     data.project_id,
                     data.title,
+                    1 if data.api_enabled else 0,
                     data.model,
                     data.thinking_level,
                     data.auto_approve_read_tokens,
@@ -303,20 +378,24 @@ class CompanionDB:
         model = changes.get("model", existing.model)
         thinking_level = changes.get("thinking_level", existing.thinking_level)
         auto_read = changes.get("auto_approve_read_tokens", existing.auto_approve_read_tokens)
+        directives_sent = changes.get("directives_sent", existing.directives_sent)
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE sessions
                 SET title = ?, model = ?, thinking_level = ?,
-                    auto_approve_read_tokens = ?, updated_at = ?
+                    auto_approve_read_tokens = ?, directives_sent = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (title, model, thinking_level, auto_read, now, session_id),
+                (title, model, thinking_level, auto_read, 1 if directives_sent else 0, now, session_id),
             )
         return self.get_session(session_id)
 
     def add_session_tokens(self, session_id: str, usage: TokenStats) -> Optional[SessionInfo]:
         now = _utc_now()
+        latest_ctx = usage.total_tokens or (
+            usage.input_tokens + usage.output_tokens + usage.thinking_tokens
+        )
         with self._connect() as conn:
             conn.execute(
                 """
@@ -325,6 +404,7 @@ class CompanionDB:
                     output_tokens = output_tokens + ?,
                     thinking_tokens = thinking_tokens + ?,
                     total_tokens = total_tokens + ?,
+                    last_context_tokens = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -333,6 +413,7 @@ class CompanionDB:
                     usage.output_tokens,
                     usage.thinking_tokens,
                     usage.total_tokens,
+                    latest_ctx,
                     now,
                     session_id,
                 ),
@@ -584,3 +665,125 @@ class CompanionDB:
     def mark_patch_reverted(self, patch_id: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE patch_history SET reverted = 1 WHERE id = ?", (patch_id,))
+
+    # --- App Settings & API Mode ---
+
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def get_api_enabled(self, has_key: bool = False) -> bool:
+        if not has_key:
+            return False
+        raw = self.get_setting("api_enabled")
+        if raw is None:
+            return True
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    def set_api_enabled(self, enabled: bool) -> None:
+        self.set_setting("api_enabled", "true" if enabled else "false")
+
+    # --- Rate Telemetry (RPM, TPM, RPD since 00:00 Pacific) ---
+
+    def record_api_usage(
+        self,
+        model: str,
+        usage: TokenStats,
+        created_ts: Optional[float] = None,
+    ) -> None:
+        ts = float(created_ts if created_ts is not None else time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_usage_events (
+                    model, input_tokens, output_tokens, thinking_tokens, created_ts
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    model,
+                    int(usage.input_tokens or 0),
+                    int(usage.output_tokens or 0),
+                    int(usage.thinking_tokens or 0),
+                    ts,
+                ),
+            )
+            # Prune events older than 14 days so DB stays lean
+            conn.execute("DELETE FROM api_usage_events WHERE created_ts < ?", (ts - 14 * 86400,))
+
+    def get_rate_telemetry(
+        self,
+        model: Optional[str] = None,
+        now_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        ts = float(now_ts if now_ts is not None else time.time())
+        cutoff_min = ts - 60.0
+        midnight_ts, pacific_date = _pacific_midnight_utc(ts)
+
+        with self._connect() as conn:
+            all_min = conn.execute(
+                """
+                SELECT COUNT(*) AS rpm,
+                       COALESCE(SUM(input_tokens), 0) AS tpm,
+                       MIN(created_ts) AS oldest_ts
+                FROM api_usage_events
+                WHERE created_ts > ? AND created_ts <= ?
+                """,
+                (cutoff_min, ts),
+            ).fetchone()
+            all_day = conn.execute(
+                """
+                SELECT COUNT(*) AS rpd
+                FROM api_usage_events
+                WHERE created_ts >= ? AND created_ts <= ?
+                """,
+                (midnight_ts, ts),
+            ).fetchone()
+
+            if model:
+                mod_min = conn.execute(
+                    """
+                    SELECT COUNT(*) AS rpm,
+                           COALESCE(SUM(input_tokens), 0) AS tpm,
+                           MIN(created_ts) AS oldest_ts
+                    FROM api_usage_events
+                    WHERE model = ? AND created_ts > ? AND created_ts <= ?
+                    """,
+                    (model, cutoff_min, ts),
+                ).fetchone()
+                mod_day = conn.execute(
+                    """
+                    SELECT COUNT(*) AS rpd
+                    FROM api_usage_events
+                    WHERE model = ? AND created_ts >= ? AND created_ts <= ?
+                    """,
+                    (model, midnight_ts, ts),
+                ).fetchone()
+            else:
+                mod_min = all_min
+                mod_day = all_day
+
+        oldest_ts = mod_min["oldest_ts"] if mod_min else None
+        next_decay = max(0, int((float(oldest_ts) + 60.0 - ts) + 0.999)) if oldest_ts is not None else 0
+
+        return {
+            "model": model,
+            "rpm": int(mod_min["rpm"] or 0),
+            "tpm": int(mod_min["tpm"] or 0),
+            "rpd": int(mod_day["rpd"] or 0),
+            "all_rpm": int(all_min["rpm"] or 0),
+            "all_tpm": int(all_min["tpm"] or 0),
+            "all_rpd": int(all_day["rpd"] or 0),
+            "next_minute_reset_sec": next_decay,
+            "pacific_date": pacific_date,
+            "rpd_reset_label": "00:00 PT",
+        }
+

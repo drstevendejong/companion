@@ -28,8 +28,10 @@ if HAS_DEPS:
 class _FakeModels:
     def __init__(self, scripted_turns: List[Any]) -> None:
         self._turns = list(scripted_turns)
+        self.seen_contents: List[Any] = []
 
-    def generate_content(self, **_kwargs: Any) -> Any:
+    def generate_content(self, **kwargs: Any) -> Any:
+        self.seen_contents.append(kwargs.get("contents"))
         if not self._turns:
             raise AssertionError("Unexpected extra Gemini API call in test.")
         return self._turns.pop(0)
@@ -40,12 +42,22 @@ class _FakeClient:
         self.models = _FakeModels(scripted_turns)
 
 
-def _make_response(text: str = "", function_calls: List[tuple[str, dict]] | None = None) -> Any:
+def _make_response(
+    text: str = "",
+    function_calls: List[tuple[str, dict]] | None = None,
+    thought_signature: bytes | None = None,
+) -> Any:
     parts = []
     if text:
-        parts.append(SimpleNamespace(text=text, function_call=None))
-    for name, args in function_calls or []:
-        parts.append(SimpleNamespace(text=None, function_call=SimpleNamespace(name=name, args=args)))
+        parts.append(SimpleNamespace(text=text, thought=False, function_call=None))
+    for idx, (name, args) in enumerate(function_calls or []):
+        parts.append(
+            SimpleNamespace(
+                text=None,
+                thought_signature=thought_signature if idx == 0 else None,
+                function_call=SimpleNamespace(id=f"call-{idx}", name=name, args=args),
+            )
+        )
     return SimpleNamespace(
         text=text,
         candidates=[SimpleNamespace(content=SimpleNamespace(parts=parts))],
@@ -67,11 +79,12 @@ class TestHumanGatedWorkflow(unittest.TestCase):
         self.target_file = self.proj_dir / "service.py"
         self.target_file.write_text("STATUS = 'broken'\n", encoding="utf-8")
 
-        fake_client = _FakeClient([
+        self.fake_client = _FakeClient([
             # Turn 1: Gemini asks to read lines 1-5 of service.py
             _make_response(
                 text="Let me check service.py first.",
                 function_calls=[("read_lines", {"path": "service.py", "start_line": 1, "end_line": 5})],
+                thought_signature=b"sig-turn-1",
             ),
             # Turn 2: After user approves read, Gemini proposes a surgical patch
             _make_response(
@@ -85,12 +98,13 @@ class TestHumanGatedWorkflow(unittest.TestCase):
                         "summary": "Fix status constant",
                     },
                 )],
+                thought_signature=b"sig-turn-2",
             ),
             # Turn 3: After user approves patch, Gemini confirms
             _make_response(text="Patch applied. Run your tests to verify."),
         ])
 
-        gateway = GeminiGateway(client_factory=lambda: fake_client)
+        gateway = GeminiGateway(client_factory=lambda: self.fake_client)
         db_path = Path(self.tmp.name) / "companion.db"
         self.client = TestClient(create_app(db_path=db_path, gemini_gateway=gateway))
 
@@ -106,6 +120,7 @@ class TestHumanGatedWorkflow(unittest.TestCase):
         sess = self.client.post("/api/sessions", json={
             "project_id": proj["id"],
             "title": "Fix Status",
+            "api_enabled": True,
         }).json()
 
         # Step 1: Send user prompt -> pauses at read_lines gate
@@ -120,6 +135,11 @@ class TestHumanGatedWorkflow(unittest.TestCase):
 
         # Step 2: Approve read -> Gemini proposes patch_literal gate
         res2 = self.client.post(f"/api/chat/gate/{read_gate['id']}", json={"action": "approve"}).json()
+        model_contents = self.fake_client.models.seen_contents[1]
+        replayed_fc_parts = [
+            p for c in model_contents if c.role == "model" for p in c.parts if p.function_call is not None
+        ]
+        self.assertEqual(replayed_fc_parts[0].thought_signature, b"sig-turn-1")
         self.assertEqual(len(res2["pending_gates"]), 1)
         patch_gate = res2["pending_gates"][0]
         self.assertEqual(patch_gate["tool_name"], "patch_literal")
