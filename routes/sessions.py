@@ -63,6 +63,7 @@ def get_session_detail(session_id: str, request: Request) -> Dict[str, Any]:
         "session": session,
         "messages": messages,
         "pending_gates": db.list_pending_gates(session_id),
+        "checkpoints": db.list_checkpoints(session_id) if hasattr(db, "list_checkpoints") else [],
         "telemetry": db.get_rate_telemetry(model=session.model),
     }
 

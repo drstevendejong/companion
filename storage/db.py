@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from models import (
     AttachmentItem,
+    CheckpointRecord,
     MessageRecord,
     PatchRecord,
     PresetCommand,
@@ -95,6 +96,7 @@ class CompanionDB:
                     directives_path TEXT,
                     backup_dir TEXT NOT NULL DEFAULT 'backup',
                     post_patch_command TEXT,
+                    fast_test_command TEXT,
                     cdp_port INTEGER NOT NULL DEFAULT 9222,
                     ignore_patterns_json TEXT NOT NULL DEFAULT '[]',
                     preset_commands_json TEXT NOT NULL DEFAULT '[]',
@@ -171,8 +173,34 @@ class CompanionDB:
 
                 CREATE INDEX IF NOT EXISTS idx_api_usage_ts
                     ON api_usage_events(created_ts);
+
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    snapshot_dir TEXT NOT NULL,
+                    files_count INTEGER NOT NULL DEFAULT 0,
+                    modified_files_json TEXT NOT NULL DEFAULT '[]',
+                    created_files_json TEXT NOT NULL DEFAULT '[]',
+                    after_msg_index INTEGER NOT NULL DEFAULT 0,
+                    summary TEXT NOT NULL DEFAULT 'Current state of the project is saved.',
+                    resolution_note TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_checkpoints_session
+                    ON checkpoints(session_id, created_at);
                 """
             )
+            project_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()
+            }
+            if "fast_test_command" not in project_cols:
+                conn.execute(
+                    "ALTER TABLE projects ADD COLUMN fast_test_command TEXT"
+                )
             session_cols = {
                 r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()
             }
@@ -193,6 +221,7 @@ class CompanionDB:
     # --- Projects ---
 
     def _row_to_project(self, row: sqlite3.Row) -> ProjectProfile:
+        row_keys = set(row.keys())
         presets_raw = json.loads(row["preset_commands_json"] or "[]")
         presets = [PresetCommand(**p) for p in presets_raw]
         return ProjectProfile(
@@ -203,6 +232,7 @@ class CompanionDB:
             directives_path=row["directives_path"],
             backup_dir=row["backup_dir"],
             post_patch_command=row["post_patch_command"],
+            fast_test_command=row["fast_test_command"] if "fast_test_command" in row_keys else None,
             cdp_port=row["cdp_port"],
             ignore_patterns=json.loads(row["ignore_patterns_json"] or "[]"),
             preset_commands=presets,
@@ -232,10 +262,10 @@ class CompanionDB:
                 """
                 INSERT INTO projects (
                     id, name, root_path, python_path, directives_path,
-                    backup_dir, post_patch_command, cdp_port,
+                    backup_dir, post_patch_command, fast_test_command, cdp_port,
                     ignore_patterns_json, preset_commands_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -245,6 +275,7 @@ class CompanionDB:
                     data.directives_path,
                     data.backup_dir,
                     data.post_patch_command,
+                    data.fast_test_command,
                     data.cdp_port,
                     json.dumps(data.ignore_patterns),
                     json.dumps([p.model_dump() for p in data.preset_commands]),
@@ -268,7 +299,7 @@ class CompanionDB:
                 """
                 UPDATE projects SET
                     name = ?, root_path = ?, python_path = ?, directives_path = ?,
-                    backup_dir = ?, post_patch_command = ?, cdp_port = ?,
+                    backup_dir = ?, post_patch_command = ?, fast_test_command = ?, cdp_port = ?,
                     ignore_patterns_json = ?, preset_commands_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -279,6 +310,7 @@ class CompanionDB:
                     updated.directives_path,
                     updated.backup_dir,
                     updated.post_patch_command,
+                    updated.fast_test_command,
                     updated.cdp_port,
                     json.dumps(updated.ignore_patterns),
                     json.dumps([p.model_dump() for p in updated.preset_commands]),
@@ -786,4 +818,140 @@ class CompanionDB:
             "pacific_date": pacific_date,
             "rpd_reset_label": "00:00 PT",
         }
+
+    # --- Project Checkpoints (Transactional Savepoints) ---
+
+    def _row_to_checkpoint(self, row: sqlite3.Row) -> CheckpointRecord:
+        return CheckpointRecord(
+            id=row["id"],
+            project_id=row["project_id"],
+            session_id=row["session_id"],
+            status=row["status"],
+            snapshot_dir=row["snapshot_dir"],
+            files_count=int(row["files_count"] or 0),
+            modified_files=json.loads(row["modified_files_json"] or "[]"),
+            created_files=json.loads(row["created_files_json"] or "[]"),
+            after_msg_index=int(row["after_msg_index"] or 0),
+            summary=row["summary"],
+            resolution_note=row["resolution_note"],
+            created_at=row["created_at"],
+            resolved_at=row["resolved_at"],
+        )
+
+    def create_checkpoint(
+        self,
+        checkpoint_id: str,
+        project_id: str,
+        session_id: str,
+        snapshot_dir: str,
+        files_count: int,
+        after_msg_index: int,
+        summary: str = "Current state of the project is saved.",
+    ) -> CheckpointRecord:
+        now = _utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO checkpoints (
+                    id, project_id, session_id, status, snapshot_dir, files_count,
+                    modified_files_json, created_files_json, after_msg_index, summary,
+                    resolution_note, created_at, resolved_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, '[]', '[]', ?, ?, NULL, ?, NULL)
+                """,
+                (
+                    checkpoint_id,
+                    project_id,
+                    session_id,
+                    snapshot_dir,
+                    int(files_count),
+                    int(after_msg_index),
+                    summary,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM checkpoints WHERE id = ?", (checkpoint_id,)).fetchone()
+        return self._row_to_checkpoint(row)
+
+    def get_checkpoint(self, checkpoint_id: str) -> Optional[CheckpointRecord]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM checkpoints WHERE id = ?", (checkpoint_id,)).fetchone()
+        return self._row_to_checkpoint(row) if row else None
+
+    def get_active_checkpoint(
+        self, session_id: Optional[str] = None, project_id: Optional[str] = None
+    ) -> Optional[CheckpointRecord]:
+        with self._connect() as conn:
+            if session_id:
+                row = conn.execute(
+                    "SELECT * FROM checkpoints WHERE session_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            elif project_id:
+                row = conn.execute(
+                    "SELECT * FROM checkpoints WHERE project_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+                    (project_id,),
+                ).fetchone()
+            else:
+                row = None
+        return self._row_to_checkpoint(row) if row else None
+
+    def list_checkpoints(self, session_id: str) -> List[CheckpointRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM checkpoints WHERE session_id = ? ORDER BY created_at ASC",
+                (session_id,),
+            ).fetchall()
+        return [self._row_to_checkpoint(r) for r in rows]
+
+    def list_active_checkpoint_dirs(self, project_id: str) -> List[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT snapshot_dir FROM checkpoints WHERE project_id = ? AND status = 'active'",
+                (project_id,),
+            ).fetchall()
+        return [str(r["snapshot_dir"]) for r in rows if r["snapshot_dir"]]
+
+    def record_checkpoint_file(
+        self, checkpoint_id: str, rel_path: str, existed_before: bool
+    ) -> Optional[CheckpointRecord]:
+        norm = rel_path.replace("\\", "/").lstrip("./")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM checkpoints WHERE id = ?", (checkpoint_id,)).fetchone()
+            if not row:
+                return None
+            mods: List[str] = json.loads(row["modified_files_json"] or "[]")
+            created: List[str] = json.loads(row["created_files_json"] or "[]")
+            if existed_before:
+                if norm not in mods:
+                    mods.append(norm)
+            else:
+                if norm not in created:
+                    created.append(norm)
+            conn.execute(
+                "UPDATE checkpoints SET modified_files_json = ?, created_files_json = ? WHERE id = ?",
+                (json.dumps(mods), json.dumps(created), checkpoint_id),
+            )
+            updated = conn.execute("SELECT * FROM checkpoints WHERE id = ?", (checkpoint_id,)).fetchone()
+        return self._row_to_checkpoint(updated) if updated else None
+
+    def resolve_checkpoint(
+        self, checkpoint_id: str, status: str, resolution_note: Optional[str] = None
+    ) -> Optional[CheckpointRecord]:
+        now = _utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE checkpoints SET status = ?, resolution_note = ?, resolved_at = ? WHERE id = ?",
+                (status, resolution_note, now, checkpoint_id),
+            )
+            row = conn.execute("SELECT * FROM checkpoints WHERE id = ?", (checkpoint_id,)).fetchone()
+        return self._row_to_checkpoint(row) if row else None
+
+    def cancel_pending_gates(self, session_id: str, reason: str = "Checkpoint restored") -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE pending_gates SET status = 'cancelled', result_json = ? WHERE session_id = ? AND status = 'pending'",
+                (json.dumps({"cancelled": True, "reason": reason}), session_id),
+            )
+            return int(cur.rowcount or 0)
+
 

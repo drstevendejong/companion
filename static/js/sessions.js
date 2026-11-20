@@ -343,6 +343,7 @@ function clearActiveSession() {
   state.activeSession = null;
   state.messages = [];
   state.pendingGates = [];
+  state.checkpoints = [];
   state.gatesHiddenDueToError = false;
   state.lastErrorContext = null;
   sessionTitleInput.disabled = true;
@@ -435,6 +436,7 @@ export async function selectSession(sessionId) {
   state.activeSession = detail.session;
   state.messages = detail.messages || [];
   state.pendingGates = detail.pending_gates || [];
+  state.checkpoints = detail.checkpoints || [];
   state.gatesHiddenDueToError = false;
   state.lastErrorContext = null;
   if (detail.telemetry) {
@@ -541,6 +543,7 @@ function openProjectModal(proj) {
   document.getElementById("proj-directives").value = (proj && proj.directives_path) || "";
   document.getElementById("proj-cdp-port").value = (proj && proj.cdp_port) || 9222;
   document.getElementById("proj-post-cmd").value = (proj && proj.post_patch_command) || "";
+  document.getElementById("proj-fast-cmd").value = (proj && proj.fast_test_command) || "";
   document.getElementById("proj-ignores").value = proj ? (proj.ignore_patterns || []).join(", ") : "";
   projectModal.showModal();
 }
@@ -555,6 +558,7 @@ async function handleProjectSave(ev) {
     directives_path: document.getElementById("proj-directives").value.trim() || null,
     cdp_port: Number(document.getElementById("proj-cdp-port").value) || 9222,
     post_patch_command: document.getElementById("proj-post-cmd").value.trim() || null,
+    fast_test_command: document.getElementById("proj-fast-cmd").value.trim() || null,
     ignore_patterns: document
       .getElementById("proj-ignores")
       .value.split(",")

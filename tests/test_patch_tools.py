@@ -116,6 +116,88 @@ class TestPatchTools(unittest.TestCase):
         self.assertEqual(stats_size["kept_count"], 1)
         self.assertTrue((backup_root / "20261117_000005_000001").is_dir())
 
+    def test_literal_not_found_diagnostics_and_multi_match_lines(self) -> None:
+        (self.root / "sample.py").write_text(
+            "def first():\n"
+            "    value = 10\n"
+            "    return value + 1\n\n"
+            "def second():\n"
+            "    value = 10\n"
+            "    return value + 2\n",
+            encoding="utf-8",
+        )
+
+        # 1. Indentation/whitespace mismatch triggers line-range + actual-lines hint
+        with self.assertRaises(patch_tools.PatchValidationError) as ctx_ws:
+            patch_tools.preview_literal_patch(
+                self.root,
+                "sample.py",
+                "  value = 10\n  return value + 1",
+                "    value = 99\n    return value + 1",
+            )
+        msg_ws = str(ctx_ws.exception)
+        self.assertIn("Found matching lines at 2–3", msg_ws)
+        self.assertIn("Actual lines 2–3:", msg_ws)
+        self.assertIn("2:     value = 10", msg_ws)
+
+        # 2. Near match triggers difflib nearest-match range + diff + actual lines
+        with self.assertRaises(patch_tools.PatchValidationError) as ctx_near:
+            patch_tools.preview_literal_patch(
+                self.root,
+                "sample.py",
+                "def second():\n    value = 999\n    return value + 2",
+                "def second():\n    return 0",
+            )
+        msg_near = str(ctx_near.exception)
+        self.assertIn("Nearest match around lines 5–7", msg_near)
+        self.assertIn("expected (old_text)", msg_near)
+        self.assertIn("-    value = 999", msg_near)
+        self.assertIn("+    value = 10", msg_near)
+
+        # 3. Duplicate occurrence reports starting line numbers
+        with self.assertRaises(patch_tools.PatchValidationError) as ctx_dup:
+            patch_tools.preview_literal_patch(
+                self.root,
+                "sample.py",
+                "    value = 10",
+                "    value = 20",
+            )
+        msg_dup = str(ctx_dup.exception)
+        self.assertIn("matched 2 times", msg_dup)
+        self.assertIn("lines 2, 6", msg_dup)
+
+    def test_delete_and_rename_file_backup_and_validation(self) -> None:
+        (self.root / "obsolete.py").write_text("OLD_FLAG = True\n", encoding="utf-8")
+        del_prev = patch_tools.preview_delete_file(self.root, "obsolete.py")
+        self.assertEqual(del_prev["action"], "delete")
+        self.assertIn("-OLD_FLAG = True", del_prev["diff"])
+
+        del_res = patch_tools.apply_delete_file(self.root, "backup", del_prev)
+        self.assertTrue(del_res["deleted"])
+        self.assertFalse((self.root / "obsolete.py").exists())
+        self.assertIsNotNone(del_res["backup_path"])
+
+        # Undo restores the deleted file from backup/
+        undo_del = patch_tools.undo_patch_on_disk(
+            self.root, "obsolete.py", del_res["backup_path"], existed_before=True
+        )
+        self.assertEqual(undo_del["action"], "restored_from_backup")
+        self.assertEqual((self.root / "obsolete.py").read_text(encoding="utf-8"), "OLD_FLAG = True\n")
+
+        # Rename / move with parent dir creation and overwrite protection
+        ren_prev = patch_tools.preview_rename_file(self.root, "obsolete.py", "archive/legacy.py")
+        self.assertEqual(ren_prev["action"], "rename")
+        self.assertIn("rename obsolete.py -> archive/legacy.py", ren_prev["diff"])
+        ren_res = patch_tools.apply_rename_file(self.root, "backup", ren_prev)
+        self.assertTrue(ren_res["renamed"])
+        self.assertFalse((self.root / "obsolete.py").exists())
+        self.assertEqual((self.root / "archive" / "legacy.py").read_text(encoding="utf-8"), "OLD_FLAG = True\n")
+
+        # Overwrite blocked by default when target already exists
+        (self.root / "collision.py").write_text("X = 1\n", encoding="utf-8")
+        with self.assertRaises(patch_tools.PatchValidationError):
+            patch_tools.preview_rename_file(self.root, "archive/legacy.py", "collision.py", overwrite=False)
+
 
 if __name__ == "__main__":
     unittest.main()

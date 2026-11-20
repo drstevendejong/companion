@@ -14,23 +14,25 @@ from typing import Any, Callable, Dict, List, Optional
 from google import genai
 from google.genai import types
 
-from config import GEMINI_KEY_PATH
+from config import GEMINI_KEY_PATH, PROMPTS_DIR
 from models import AttachmentItem, ProjectProfile, SessionInfo, TokenStats
 from services import fs_tools, key_store, model_catalog, patch_tools
 from services.token_utils import estimate_tokens
 
 
 READ_ONLY_TOOLS = {"list_tree", "search_code", "read_lines", "read_file"}
-PATCH_TOOLS = {"patch_literal", "patch_lines", "write_file"}
+PATCH_TOOLS = {"patch_literal", "patch_lines", "write_file", "delete_file", "rename_file"}
 SCRIPT_TOOLS = {"propose_script"}
+COMMAND_TOOLS = {"run_tests"}
 
-BASE_SYSTEM_PROMPT = """You are a senior coding partner connected to the user's local workspace via human-gated tools.
+_FALLBACK_SYSTEM_PROMPT = """You are a senior coding partner connected to the user's local workspace via human-gated tools.
 Every tool round-trip re-sends conversation history and burns rate-limit tokens. Strictly minimize token usage and round-trips:
 
-1. BRIEF RESPONSES:
+1. BRIEF RESPONSES & ANTI-REPETITION:
    - Be terse and direct. State findings, root causes, and next steps in a few crisp lines—never five-paragraph walkthroughs quoting code the user didn't ask to see.
    - Optionally end with "Need details before we proceed?" when deeper explanation could help.
-   - Before calling tools, output at most 1 short sentence (or no prose if self-explanatory).
+   - Always add a single plain-English one-liner (preferably indicating progress, e.g. "Step 2/4: Reading IMAP sync handler...") right before every JSON/tool command.
+   - Generate all output ONCE ONLY—never repeat, duplicate, or re-emit the same prose or tool/JSON block inside a reply.
 
 2. DIRECTIVES SELF-CHECK (CRITICAL):
    - When Project Directives are loaded below, audit EVERY planned design, edit, and script against ALL Directives BEFORE proposing patches or scripts. Never emit code that violates Directives and forces a costly redo.
@@ -38,12 +40,49 @@ Every tool round-trip re-sends conversation history and burns rate-limit tokens.
 3. BATCHED & SINGLE-SHOT CODE INSPECTION:
    - Never dribble 1–2 small reads/searches across many turns. Batch all needed `search_code` / `read_lines` / `read_file` calls together in ONE turn.
    - For repo-wide audits, dependency graphs, impact analysis, or multi-file inspection, prefer ONE `propose_script` single-shot inspector/packer that prints a compact structured summary instead of 5–10 iterative tool hops.
-   - Prefer `search_code` (with `path_glob`) + targeted `read_lines(path, start_line, end_line)` over full `read_file` unless you truly need the whole file (`read_file` omits line numbers to save tokens).
+   - Prefer `search_code` (supports `is_regex`, `path_glob`, `subpath`, and `start_line`/`end_line`) + targeted `read_lines(path, start_line, end_line)` over full `read_file` unless you truly need the whole file (`read_file` omits line numbers to save tokens).
 
-4. SURGICAL PATCHING & PATCHING SCRIPTS:
-   - Prefer `patch_literal` (minimal unique context) over `patch_lines` or `write_file`. Only use `write_file` for new files or >70% rewrites.
+4. SURGICAL PATCHING, SCRIPTS & ATOMIC TEST LOOPS:
+   - Prefer `patch_literal` (minimal unique context) over `patch_lines` or `write_file`. Only use `write_file` for new files or >70% rewrites. If `patch_literal` fails to match, Companion returns line-number and nearest-diff diagnostics for fast self-correction.
    - Use `propose_script` for multi-file mechanical edits. If a large patch/script fails, PATCH the existing script with `patch_literal`/`patch_lines` instead of regenerating the full script.
+   - Companion automatically saves a reversible project checkpoint before the first write in a batch. Do NOT run tests on intermediate half-finished edits—only emit `run_tests` once a coherent batch of changes is complete and ready to verify.
+   - Git operations (`git status`, `git diff`, commit drafting, Commit / Commit & Push) are handled directly by the user inside Companion's right-drawer Git tab, not via autonomous model tools.
 """
+
+_FALLBACK_GIT_COMMIT_PROMPT = """Write a concise, accurate git commit message (1-line subject <= 72 chars, optional short bullet body only if multiple logical changes exist) for this diff. Return ONLY the commit message text, no markdown fences.
+
+```diff
+{diff}
+```"""
+
+
+def load_prompt_file(filename: str, fallback: str) -> str:
+    """Reads an externalized prompt template from static/prompts/, falling back safely if absent."""
+    try:
+        path = Path(PROMPTS_DIR) / filename
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                return text
+    except OSError:
+        pass
+    return fallback.strip()
+
+
+def get_base_system_prompt() -> str:
+    """Returns the latest system prompt from static/prompts/system_prompt.txt."""
+    return load_prompt_file("system_prompt.txt", _FALLBACK_SYSTEM_PROMPT)
+
+
+def get_git_commit_prompt(diff_text: str) -> str:
+    """Builds the git commit drafting prompt from static/prompts/git_commit_prompt.txt."""
+    template = load_prompt_file("git_commit_prompt.txt", _FALLBACK_GIT_COMMIT_PROMPT)
+    if "{diff}" in template:
+        return template.replace("{diff}", diff_text)
+    return f"{template}\n\n```diff\n{diff_text}\n```"
+
+
+BASE_SYSTEM_PROMPT = get_base_system_prompt()
 
 
 def build_tool_declarations() -> types.Tool:
@@ -62,14 +101,17 @@ def build_tool_declarations() -> types.Tool:
         ),
         types.FunctionDeclaration(
             name="search_code",
-            description="Search all text files and filenames across the codebase (any language) by substring or regex, returning every match. Case-insensitive by default.",
+            description="Search text files and filenames across the codebase (any language) by literal or regex (`is_regex: true`), optionally scoped by subpath, path_glob, or start_line/end_line.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
                     "pattern": types.Schema(type=types.Type.STRING, description="Substring or regex pattern"),
                     "is_regex": types.Schema(type=types.Type.BOOLEAN, description="Treat pattern as regex"),
                     "ignore_case": types.Schema(type=types.Type.BOOLEAN, description="Case-insensitive match (default true); set false for exact case"),
+                    "subpath": types.Schema(type=types.Type.STRING, description="Optional relative folder or single file to scope the search"),
                     "path_glob": types.Schema(type=types.Type.STRING, description="Optional glob filter, e.g. '*.{py,js,html}' or 'src/**'. Omit to search all text files."),
+                    "start_line": types.Schema(type=types.Type.INTEGER, description="Optional 1-based start line filter"),
+                    "end_line": types.Schema(type=types.Type.INTEGER, description="Optional 1-based end line filter"),
                     "context_lines": types.Schema(type=types.Type.INTEGER, description="Context lines around each match, default 2"),
                 },
                 required=["pattern"],
@@ -143,6 +185,32 @@ def build_tool_declarations() -> types.Tool:
             ),
         ),
         types.FunctionDeclaration(
+            name="delete_file",
+            description="Delete an obsolete project file after backing it up to backup/ (human-gated).",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "path": types.Schema(type=types.Type.STRING, description="Relative file path to delete"),
+                    "summary": types.Schema(type=types.Type.STRING, description="Short 1-line reason for deletion"),
+                },
+                required=["path"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="rename_file",
+            description="Rename or move an existing project file after backing it up to backup/ (human-gated).",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "old_path": types.Schema(type=types.Type.STRING, description="Current relative file path"),
+                    "new_path": types.Schema(type=types.Type.STRING, description="Destination relative file path"),
+                    "overwrite": types.Schema(type=types.Type.BOOLEAN, description="Allow overwriting existing destination file (default false)"),
+                    "summary": types.Schema(type=types.Type.STRING, description="Short 1-line reason for rename/move"),
+                },
+                required=["old_path", "new_path"],
+            ),
+        ),
+        types.FunctionDeclaration(
             name="propose_script",
             description="Propose a Python probe, packer, or patcher script to write to disk and optionally run in the project venv.",
             parameters=types.Schema(
@@ -155,13 +223,25 @@ def build_tool_declarations() -> types.Tool:
                 required=["path", "content"],
             ),
         ),
+        types.FunctionDeclaration(
+            name="run_tests",
+            description="Request human-gated execution of the project's test suite (auto-commits savepoint on full pass). Optional fast=true or target runs a quick single-file/targeted check while keeping the savepoint active.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "fast": types.Schema(type=types.Type.BOOLEAN, description="Optional fast/quick-check mode (keeps active savepoint open until full run_tests passes)"),
+                    "target": types.Schema(type=types.Type.STRING, description="Optional relative file path for quick syntax/targeted test check"),
+                    "summary": types.Schema(type=types.Type.STRING, description="Brief note on what this check verifies"),
+                },
+            ),
+        ),
     ]
     return types.Tool(function_declarations=decls)
 
 
 def load_system_instruction(project: ProjectProfile) -> str:
-    """Builds system instruction combining token discipline + optional project Directives .md."""
-    parts = [BASE_SYSTEM_PROMPT]
+    """Builds system instruction combining externalized system_prompt.txt + optional project Directives .md."""
+    parts = [get_base_system_prompt()]
     if project.directives_path:
         try:
             dpath = fs_tools.resolve_safe_path(project.root_path, project.directives_path)
@@ -227,6 +307,9 @@ def prepare_tool_gate_preview(
     if tool_name == "search_code":
         pattern = str(args.get("pattern", ""))
         path_glob = str(args.get("path_glob") or "").strip()
+        subpath = str(args.get("subpath") or args.get("path") or "").strip()
+        start_line = args.get("start_line")
+        end_line = args.get("end_line")
         is_regex = bool(args.get("is_regex", False))
         ignore_case = bool(args.get("ignore_case", True))
         raw_max = args.get("max_matches")
@@ -240,15 +323,25 @@ def prepare_tool_gate_preview(
             max_matches=max_matches,
             extra_ignores=ignores,
             ignore_case=ignore_case,
+            subpath=subpath or None,
+            start_line=int(start_line) if start_line is not None else None,
+            end_line=int(end_line) if end_line is not None else None,
         )
-        scope_label = f" in {path_glob}" if path_glob else " across project"
+        scope_bits: List[str] = []
+        if subpath and subpath != ".":
+            scope_bits.append(subpath)
+        if path_glob:
+            scope_bits.append(path_glob)
+        if start_line is not None or end_line is not None:
+            scope_bits.append(f"L{start_line or 1}-{end_line or 'end'}")
+        scope_label = f" in {' · '.join(scope_bits)}" if scope_bits else " across project"
         mode_label = "regex" if is_regex else "text"
         case_label = "ignore-case" if ignore_case else "exact-case"
         return {
             "category": "read",
             "title": f"Search Code: {pattern}{scope_label}",
             "estimated_tokens": res["estimated_tokens"],
-            "detail": f"{res['shown_hits']}/{res['total_hits']} matches · {mode_label} · {case_label} · scope: {path_glob or '*'}",
+            "detail": f"{res['shown_hits']}/{res['total_hits']} matches · {mode_label} · {case_label} · scope: {' · '.join(scope_bits) if scope_bits else '*'}",
             "prepared_result": res,
         }
 
@@ -335,6 +428,42 @@ def prepare_tool_gate_preview(
             "prepared_patch": preview,
         }
 
+    if tool_name == "delete_file":
+        rel_path = str(args.get("path") or args.get("target") or "").strip()
+        if not rel_path:
+            raise ValueError("delete_file requires 'path'.")
+        preview = patch_tools.preview_delete_file(root, rel_path)
+        return {
+            "category": "patch",
+            "title": f"Delete File: {rel_path}",
+            "summary": str(args.get("summary", "Remove obsolete file (backed up first)")),
+            "diff": preview["diff"],
+            "ast_valid": None,
+            "estimated_tokens": preview["estimated_tokens"],
+            "prepared_patch": preview,
+        }
+
+    if tool_name == "rename_file":
+        old_path = str(args.get("old_path") or args.get("from_path") or args.get("path") or "").strip()
+        new_path = str(args.get("new_path") or args.get("to_path") or "").strip()
+        if not old_path or not new_path:
+            raise ValueError("rename_file requires 'old_path' and 'new_path'.")
+        preview = patch_tools.preview_rename_file(
+            root,
+            old_path,
+            new_path,
+            overwrite=bool(args.get("overwrite", False)),
+        )
+        return {
+            "category": "patch",
+            "title": f"Rename File: {preview['old_path']} → {preview['new_path']}",
+            "summary": str(args.get("summary", "Rename/move file (backed up first)")),
+            "diff": preview["diff"],
+            "ast_valid": None,
+            "estimated_tokens": preview["estimated_tokens"],
+            "prepared_patch": preview,
+        }
+
     if tool_name == "propose_script":
         preview = patch_tools.preview_full_write(
             root, str(args["path"]), str(args["content"])
@@ -348,6 +477,32 @@ def prepare_tool_gate_preview(
             "ast_valid": preview["ast_valid"],
             "estimated_tokens": estimate_tokens(str(args["content"])),
             "prepared_patch": preview,
+        }
+
+    if tool_name == "run_tests":
+        from services import runner as _runner
+
+        fast = bool(args.get("fast", False))
+        target = str(args.get("target") or "").strip() or None
+        resolved = _runner.resolve_test_command(project, fast=fast, target=target)
+        cmd = resolved["command"]
+        is_full = bool(resolved["is_full_suite"])
+        title_prefix = "Run Tests" if is_full else "Run Quick Check"
+        default_summary = (
+            "Verify full project test suite and commit active savepoint if all pass"
+            if is_full
+            else resolved["note"]
+        )
+        return {
+            "category": "command",
+            "title": f"{title_prefix}: {cmd}",
+            "summary": str(args.get("summary") or default_summary),
+            "detail": f"Command: {cmd} · {resolved['note']}",
+            "command": cmd,
+            "is_full_suite": is_full,
+            "mode": resolved["mode"],
+            "target": resolved["target"],
+            "estimated_tokens": 180 if not is_full else 250,
         }
 
     raise ValueError(f"Unsupported tool: {tool_name}")
@@ -521,12 +676,7 @@ class GeminiGateway:
         if not diff_text.strip():
             return {"message": "chore: update workspace", "usage": TokenStats()}
         client = self._get_client()
-        prompt = (
-            "Write a concise, accurate git commit message (1-line subject <= 72 chars, "
-            "optional short bullet body only if multiple logical changes exist) for this diff. "
-            "Return ONLY the commit message text, no markdown fences.\n\n"
-            f"{diff_text}"
-        )
+        prompt = get_git_commit_prompt(diff_text)
         response = client.models.generate_content(
             model=model,
             contents=prompt,

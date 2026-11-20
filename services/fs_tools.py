@@ -236,110 +236,141 @@ def search_code(
     max_matches: Optional[int] = None,
     extra_ignores: Optional[Sequence[str]] = None,
     ignore_case: bool = True,
+    subpath: Optional[str] = None,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Searches any text files (and matching filenames) across the project with deduplicated hunks."""
+    """Searches any text files (and matching filenames) across the project or scoped subpath/line range."""
     root = Path(project_root).resolve()
+    sub_clean = (subpath or "").strip()
+    scan_root = resolve_safe_path(root, sub_clean) if sub_clean and sub_clean != "." else root
+    if not scan_root.exists():
+        raise FileNotFoundError(f"Search subpath not found: {subpath}")
+
     ignores = _merge_ignores(extra_ignores)
     flags = re.MULTILINE | (re.IGNORECASE if ignore_case else 0)
     compiled = re.compile(pattern if is_regex else re.escape(pattern), flags)
     glob_patterns = _expand_globs(path_glob) if path_glob and path_glob.strip() else []
     cap = max_matches if (max_matches is not None and max_matches > 0) else None
     ctx = max(0, context_lines)
+    s_bound = max(1, int(start_line)) if start_line is not None else None
+    e_bound = max(1, int(end_line)) if end_line is not None else None
+    if s_bound is not None and e_bound is not None and e_bound < s_bound:
+        s_bound, e_bound = e_bound, s_bound
 
     matches: List[Dict[str, Any]] = []
     formatted_blocks: List[str] = []
     total_hits = 0
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        cur = Path(dirpath)
-        rel_dir = cur.relative_to(root).as_posix()
-        dirnames[:] = sorted(
-            d for d in dirnames
-            if not _is_ignored(d, f"{rel_dir}/{d}".lstrip("./"), ignores, is_dir=True)
-        )
-        for fname in sorted(filenames):
-            fpath = cur / fname
-            rel_posix = fpath.relative_to(root).as_posix()
+    def _scan_single_file(fpath: Path, check_ignores_and_glob: bool = True) -> None:
+        nonlocal total_hits
+        rel_posix = fpath.relative_to(root).as_posix()
+        fname = fpath.name
+        if check_ignores_and_glob:
             if _is_ignored(fname, rel_posix, ignores, is_dir=False):
-                continue
+                return
             if glob_patterns and not _matches_path_glob(rel_posix, fname, glob_patterns):
+                return
+        try:
+            if fpath.stat().st_size > 1_500_000:
+                return
+            raw_bytes = fpath.read_bytes()
+        except OSError:
+            return
+
+        # Report filename/path matches when not constrained to a line-number range
+        if s_bound is None and e_bound is None and compiled.search(rel_posix):
+            total_hits += 1
+            if cap is None or len(matches) < cap:
+                fname_snippet = f"[Filename match: {rel_posix}]"
+                matches.append({
+                    "path": rel_posix,
+                    "line": 0,
+                    "snippet": fname_snippet,
+                })
+                formatted_blocks.append(f"--- {rel_posix} ---\n{fname_snippet}")
+
+        # Skip binary files (NUL byte in header), decode text permissively (UTF-8 / Latin-1 fallback)
+        if b"\x00" in raw_bytes[:4096]:
+            return
+        raw = raw_bytes.decode("utf-8", errors="replace")
+
+        file_lines = raw.splitlines()
+        matched_indices: List[int] = []
+        for idx, line in enumerate(file_lines):
+            line_num = idx + 1
+            if s_bound is not None and line_num < s_bound:
                 continue
-            try:
-                if fpath.stat().st_size > 1_500_000:
+            if e_bound is not None and line_num > e_bound:
+                continue
+            if compiled.search(line):
+                matched_indices.append(idx)
+        if not matched_indices:
+            return
+
+        included_indices: List[int] = []
+        for idx in matched_indices:
+            total_hits += 1
+            if cap is None or len(matches) < cap:
+                included_indices.append(idx)
+                matches.append({
+                    "path": rel_posix,
+                    "line": idx + 1,
+                    "snippet": _format_line_excerpt(file_lines[idx], compiled, is_hit=True),
+                })
+
+        if not included_indices:
+            return
+
+        min_line_idx = (s_bound - 1) if s_bound is not None else 0
+        max_line_idx = min(len(file_lines) - 1, (e_bound - 1) if e_bound is not None else len(file_lines) - 1)
+
+        # Merge overlapping or adjacent context windows inside this file into compact hunks
+        hunks: List[Dict[str, Any]] = []
+        for idx in included_indices:
+            w_start = max(min_line_idx, idx - ctx)
+            w_end = min(max_line_idx, idx + ctx)
+            if hunks and w_start <= hunks[-1]["end"] + 1:
+                hunks[-1]["end"] = max(hunks[-1]["end"], w_end)
+                hunks[-1]["hits"].append(idx)
+            else:
+                hunks.append({"start": w_start, "end": w_end, "hits": [idx]})
+
+        for h in hunks:
+            hit_set = set(h["hits"])
+            hit_label = _compact_line_ranges([i + 1 for i in h["hits"]])
+            non_empty_lines: List[str] = []
+            first_kept_line: Optional[int] = None
+            last_kept_line: Optional[int] = None
+            for li in range(h["start"], h["end"] + 1):
+                raw_line = file_lines[li]
+                is_hit = li in hit_set
+                if not raw_line.strip() and not is_hit:
                     continue
-                raw_bytes = fpath.read_bytes()
-            except OSError:
-                continue
+                if first_kept_line is None:
+                    first_kept_line = li + 1
+                last_kept_line = li + 1
+                non_empty_lines.append(_format_line_excerpt(raw_line, compiled, is_hit=is_hit))
 
-            # Report filename/path matches even before scanning contents
-            if compiled.search(rel_posix):
-                total_hits += 1
-                if cap is None or len(matches) < cap:
-                    fname_snippet = f"[Filename match: {rel_posix}]"
-                    matches.append({
-                        "path": rel_posix,
-                        "line": 0,
-                        "snippet": fname_snippet,
-                    })
-                    formatted_blocks.append(f"--- {rel_posix} ---\n{fname_snippet}")
+            if ctx > 0 and first_kept_line is not None and last_kept_line is not None:
+                span_label = f"{first_kept_line}-{last_kept_line}" if last_kept_line > first_kept_line else str(first_kept_line)
+                header = f"--- {rel_posix}:{hit_label} (L{span_label}) ---"
+            else:
+                header = f"--- {rel_posix}:{hit_label} ---"
+            formatted_blocks.append(header + "\n" + "\n".join(non_empty_lines))
 
-            # Skip binary files (NUL byte in header), decode text permissively (UTF-8 / Latin-1 fallback)
-            if b"\x00" in raw_bytes[:4096]:
-                continue
-            raw = raw_bytes.decode("utf-8", errors="replace")
-
-            file_lines = raw.splitlines()
-            matched_indices = [idx for idx, line in enumerate(file_lines) if compiled.search(line)]
-            if not matched_indices:
-                continue
-
-            included_indices: List[int] = []
-            for idx in matched_indices:
-                total_hits += 1
-                if cap is None or len(matches) < cap:
-                    included_indices.append(idx)
-                    matches.append({
-                        "path": rel_posix,
-                        "line": idx + 1,
-                        "snippet": _format_line_excerpt(file_lines[idx], compiled, is_hit=True),
-                    })
-
-            if not included_indices:
-                continue
-
-            # Merge overlapping or adjacent context windows inside this file into compact hunks
-            hunks: List[Dict[str, Any]] = []
-            for idx in included_indices:
-                w_start = max(0, idx - ctx)
-                w_end = min(len(file_lines) - 1, idx + ctx)
-                if hunks and w_start <= hunks[-1]["end"] + 1:
-                    hunks[-1]["end"] = max(hunks[-1]["end"], w_end)
-                    hunks[-1]["hits"].append(idx)
-                else:
-                    hunks.append({"start": w_start, "end": w_end, "hits": [idx]})
-
-            for h in hunks:
-                hit_set = set(h["hits"])
-                hit_label = _compact_line_ranges([i + 1 for i in h["hits"]])
-                non_empty_lines: List[str] = []
-                first_kept_line: Optional[int] = None
-                last_kept_line: Optional[int] = None
-                for li in range(h["start"], h["end"] + 1):
-                    raw_line = file_lines[li]
-                    is_hit = li in hit_set
-                    if not raw_line.strip() and not is_hit:
-                        continue
-                    if first_kept_line is None:
-                        first_kept_line = li + 1
-                    last_kept_line = li + 1
-                    non_empty_lines.append(_format_line_excerpt(raw_line, compiled, is_hit=is_hit))
-
-                if ctx > 0 and first_kept_line is not None and last_kept_line is not None:
-                    span_label = f"{first_kept_line}-{last_kept_line}" if last_kept_line > first_kept_line else str(first_kept_line)
-                    header = f"--- {rel_posix}:{hit_label} (L{span_label}) ---"
-                else:
-                    header = f"--- {rel_posix}:{hit_label} ---"
-                formatted_blocks.append(header + "\n" + "\n".join(non_empty_lines))
+    if scan_root.is_file():
+        _scan_single_file(scan_root, check_ignores_and_glob=False)
+    else:
+        for dirpath, dirnames, filenames in os.walk(scan_root):
+            cur = Path(dirpath)
+            rel_dir = cur.relative_to(root).as_posix()
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if not _is_ignored(d, f"{rel_dir}/{d}".lstrip("./"), ignores, is_dir=True)
+            )
+            for fname in sorted(filenames):
+                _scan_single_file(cur / fname, check_ignores_and_glob=True)
 
     summary_text = "\n\n".join(formatted_blocks) if formatted_blocks else "No matches found."
     if cap is not None and total_hits > cap:
@@ -349,6 +380,7 @@ def search_code(
         "pattern": pattern,
         "is_regex": is_regex,
         "ignore_case": ignore_case,
+        "subpath": sub_clean or ".",
         "total_hits": total_hits,
         "shown_hits": len(matches),
         "matches": matches,

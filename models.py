@@ -22,6 +22,7 @@ class ProjectCreate(BaseModel):
     directives_path: Optional[str] = None
     backup_dir: str = "backup"
     post_patch_command: Optional[str] = None
+    fast_test_command: Optional[str] = None
     cdp_port: int = 9222
     ignore_patterns: List[str] = Field(default_factory=list)
     preset_commands: List[PresetCommand] = Field(default_factory=list)
@@ -34,6 +35,7 @@ class ProjectUpdate(BaseModel):
     directives_path: Optional[str] = None
     backup_dir: Optional[str] = None
     post_patch_command: Optional[str] = None
+    fast_test_command: Optional[str] = None
     cdp_port: Optional[int] = None
     ignore_patterns: Optional[List[str]] = None
     preset_commands: Optional[List[PresetCommand]] = None
@@ -47,6 +49,7 @@ class ProjectProfile(BaseModel):
     directives_path: Optional[str] = None
     backup_dir: str = "backup"
     post_patch_command: Optional[str] = None
+    fast_test_command: Optional[str] = None
     cdp_port: int = 9222
     ignore_patterns: List[str] = Field(default_factory=list)
     preset_commands: List[PresetCommand] = Field(default_factory=list)
@@ -153,6 +156,8 @@ class BatchGateDecisionRequest(BaseModel):
 class RunCommandRequest(BaseModel):
     project_id: str
     command: str
+    session_id: Optional[str] = None
+    is_test_run: bool = False
 
 
 class GitCommitRequest(BaseModel):
@@ -185,6 +190,22 @@ class PatchRecord(BaseModel):
     created_at: str
     reverted: bool = False
     backup_exists: bool = True
+
+
+class CheckpointRecord(BaseModel):
+    id: str
+    project_id: str
+    session_id: str
+    status: Literal["active", "committed", "restored"] = "active"
+    snapshot_dir: str
+    files_count: int = 0
+    modified_files: List[str] = Field(default_factory=list)
+    created_files: List[str] = Field(default_factory=list)
+    after_msg_index: int = 0
+    summary: str = "Current state of the project is saved."
+    resolution_note: Optional[str] = None
+    created_at: str
+    resolved_at: Optional[str] = None
 
 
 class MessageRecord(BaseModel):

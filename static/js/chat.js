@@ -79,7 +79,14 @@ function renderMessages({ preserveScroll = false } = {}) {
 
   chatStream.innerHTML = "";
   const activities = (state.activeSessionId && state.sessionActivities[state.activeSessionId]) || [];
-  const hasAnything = state.messages.length > 0 || activities.length > 0 || Boolean(state.pendingStatusText);
+  const checkpoints = (state.checkpoints || []).filter(
+    (cp) => !state.activeSessionId || cp.session_id === state.activeSessionId
+  );
+  const hasAnything =
+    state.messages.length > 0 ||
+    activities.length > 0 ||
+    checkpoints.length > 0 ||
+    Boolean(state.pendingStatusText);
 
   if (!hasAnything) {
     chatStream.innerHTML = `
@@ -110,11 +117,24 @@ function renderMessages({ preserveScroll = false } = {}) {
     }
   }
 
+  const sortedCheckpoints = [...checkpoints].sort(
+    (a, b) => Number(a.after_msg_index ?? 0) - Number(b.after_msg_index ?? 0)
+  );
   const sortedActivities = [...activities].sort(
     (a, b) => Number(a.afterMsgIndex ?? Infinity) - Number(b.afterMsgIndex ?? Infinity)
   );
+  let cpCursor = 0;
   let actCursor = 0;
-  const flushActivitiesUpTo = (count) => {
+  const flushInterleavedUpTo = (count) => {
+    while (cpCursor < sortedCheckpoints.length) {
+      const target = Number(sortedCheckpoints[cpCursor].after_msg_index ?? 0);
+      if (target <= count) {
+        renderCheckpointCard(sortedCheckpoints[cpCursor]);
+        cpCursor += 1;
+      } else {
+        break;
+      }
+    }
     while (actCursor < sortedActivities.length) {
       const target = sortedActivities[actCursor].afterMsgIndex;
       if (target !== undefined && Number(target) <= count) {
@@ -126,7 +146,7 @@ function renderMessages({ preserveScroll = false } = {}) {
     }
   };
 
-  flushActivitiesUpTo(0);
+  flushInterleavedUpTo(0);
   let renderedMsgCount = 0;
 
   for (const item of items) {
@@ -135,7 +155,7 @@ function renderMessages({ preserveScroll = false } = {}) {
       const isLatestBatch = item.batchIndex === totalBatches - 1;
       renderToolBatchCard(item.batch, keepCopyControls, isLatestBatch);
       renderedMsgCount += item.batch.length;
-      flushActivitiesUpTo(renderedMsgCount);
+      flushInterleavedUpTo(renderedMsgCount);
       continue;
     }
 
@@ -194,9 +214,13 @@ function renderMessages({ preserveScroll = false } = {}) {
     appendTimestampFooter(card, msg.created_at);
     chatStream.appendChild(card);
     renderedMsgCount += 1;
-    flushActivitiesUpTo(renderedMsgCount);
+    flushInterleavedUpTo(renderedMsgCount);
   }
 
+  while (cpCursor < sortedCheckpoints.length) {
+    renderCheckpointCard(sortedCheckpoints[cpCursor]);
+    cpCursor += 1;
+  }
   while (actCursor < sortedActivities.length) {
     renderActivityCard(sortedActivities[actCursor], actCursor === sortedActivities.length - 1);
     actCursor += 1;
@@ -243,6 +267,7 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
   const toolCounts = new Map();
   const detailLines = [];
   const executedScripts = [];
+  const testRuns = [];
   const generatedMdFiles = [];
   const errorEvents = [];
   let hasAppliedPatch = false;
@@ -271,6 +296,9 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
         }
       }
     }
+    if (name === "run_tests" && !resp.denied_by_user && !resp.error) {
+      testRuns.push(resp);
+    }
     detailLines.push(formatSingleToolDetail(name, resp, payloadBytes));
   }
 
@@ -295,6 +323,18 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
       ok ? "Executed cleanly (exit 0)" : `Possible errors detected (exit ${lastExec.exit_code})`
     }</span>`;
     headline = `Proposed script executed: ${lastExec.path} (${lastExec.duration_ms ?? 0}ms) · View full output in Console`;
+  } else if (testRuns.length > 0 && !hasErrors) {
+    const lastTest = testRuns[testRuns.length - 1];
+    const ok = Boolean(lastTest.passed) && lastTest.exit_code === 0 && !lastTest.has_traceback;
+    card.classList.add("msg-exec", ok ? "is-ok" : "is-err");
+    badgeHtml = `<span class="exec-badge ${ok ? "is-ok" : "is-err"}">${
+      ok ? "Tests passed (exit 0)" : `Tests failed (exit ${lastTest.exit_code ?? "?"})`
+    }</span>`;
+    const commitNote = lastTest.checkpoint_committed ? " · Savepoint committed ✓" : "";
+    headline =
+      events.length === testRuns.length
+        ? `Executed tests: ${lastTest.command || "tests"} (${lastTest.duration_ms ?? 0}ms)${commitNote}`
+        : `Executed ${events.length} actions (${countStr})${commitNote}`;
   } else if (hasErrors) {
     card.classList.add("msg-exec", "is-err");
     badgeHtml = `<span class="exec-badge is-err">${
@@ -340,12 +380,20 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
       card.appendChild(pre);
     }
   }
+  for (const testResp of testRuns) {
+    if (testResp.output_preview) {
+      const pre = document.createElement("pre");
+      pre.className = "exec-preview";
+      pre.textContent = testResp.output_preview;
+      card.appendChild(pre);
+    }
+  }
 
   const proj = getActiveProject();
-  if (executedScripts.length > 0 || (hasAppliedPatch && proj && proj.post_patch_command)) {
+  if (executedScripts.length > 0 || testRuns.length > 0 || (hasAppliedPatch && proj && proj.post_patch_command)) {
     const actRow = document.createElement("div");
     actRow.className = "exec-actions";
-    if (executedScripts.length > 0) {
+    if (executedScripts.length > 0 || testRuns.length > 0) {
       const openBtn = document.createElement("button");
       openBtn.type = "button";
       openBtn.className = "btn btn-secondary btn-xs";
@@ -356,7 +404,7 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
       });
       actRow.appendChild(openBtn);
     }
-    if (hasAppliedPatch && proj && proj.post_patch_command) {
+    if (hasAppliedPatch && testRuns.length === 0 && proj && proj.post_patch_command) {
       const testBtn = document.createElement("button");
       testBtn.type = "button";
       testBtn.className = "btn btn-primary btn-xs";
@@ -562,6 +610,7 @@ function renderActivityCard(act, isLatestActivity = false) {
     </div>
     <div class="companion-summary-line">${escapeHtml(act.title)}</div>
     ${act.detail ? `<div class="meta-line mono mt-2">${escapeHtml(act.detail)}</div>` : ""}
+    ${act.hint ? `<div class="meta-line mt-2">${escapeHtml(act.hint)}</div>` : ""}
   `;
   if (act.preview) {
     const pre = document.createElement("pre");
@@ -571,8 +620,13 @@ function renderActivityCard(act, isLatestActivity = false) {
   }
 
   const timeStr = formatTimeHHMMSS(act.timestamp);
-  const copyableErr = act.status === "err" ? act.preview || act.detail || act.title || "" : "";
-  if (act.showConsoleBtn || copyableErr || timeStr) {
+  const copyableErr =
+    act.status === "err" ? act.copyErrorText || act.preview || act.detail || act.title || "" : "";
+  const copyFullText = act.status === "err" ? act.copyFullText || "" : "";
+  const actKey = act.batchKey || act.id || null;
+  const isActiveClip = Boolean(actKey && state.lastClipboardInfo && state.lastClipboardInfo.key === actKey);
+
+  if (act.showConsoleBtn || copyableErr || copyFullText || isActiveClip || timeStr) {
     const row = document.createElement("div");
     row.className = "exec-actions";
     if (act.showConsoleBtn) {
@@ -587,22 +641,59 @@ function renderActivityCard(act, isLatestActivity = false) {
       row.appendChild(btn);
     }
     if (copyableErr) {
+      const errLabel = `Copy Error${copyFullText ? "s" : ""} (~${estimateTokensLocal(copyableErr).toLocaleString()} tok)`;
       const errBtn = document.createElement("button");
       errBtn.type = "button";
       errBtn.className = "btn btn-danger btn-xs";
-      errBtn.textContent = `Copy Error (~${estimateTokensLocal(copyableErr).toLocaleString()} tok)`;
+      errBtn.textContent = errLabel;
       errBtn.addEventListener("click", async () => {
         try {
           await copyTextToClipboard(copyableErr);
-          errBtn.textContent = "Copied Error ✓";
-          setTimeout(() => {
-            errBtn.textContent = `Copy Error (~${estimateTokensLocal(copyableErr).toLocaleString()} tok)`;
-          }, 1600);
+          if (actKey) {
+            state.lastClipboardInfo = { key: actKey, status: "copied" };
+            emit("chat:refresh-badges");
+          } else {
+            errBtn.textContent = "Copied Error ✓";
+            setTimeout(() => {
+              errBtn.textContent = errLabel;
+            }, 1600);
+          }
         } catch {
           errBtn.textContent = "Clipboard blocked";
         }
       });
       row.appendChild(errBtn);
+    }
+    if (copyFullText) {
+      const fullLabel = `Copy Full Output (~${estimateTokensLocal(copyFullText).toLocaleString()} tok)`;
+      const fullBtn = document.createElement("button");
+      fullBtn.type = "button";
+      fullBtn.className = "btn btn-secondary btn-xs";
+      fullBtn.textContent = fullLabel;
+      fullBtn.addEventListener("click", async () => {
+        try {
+          await copyTextToClipboard(copyFullText);
+          if (actKey) {
+            state.lastClipboardInfo = { key: actKey, status: "copied" };
+            emit("chat:refresh-badges");
+          } else {
+            fullBtn.textContent = "Copied Full Output ✓";
+            setTimeout(() => {
+              fullBtn.textContent = fullLabel;
+            }, 1600);
+          }
+        } catch {
+          fullBtn.textContent = "Clipboard blocked";
+        }
+      });
+      row.appendChild(fullBtn);
+    }
+    if (isActiveClip) {
+      const clipBadge = document.createElement("span");
+      clipBadge.className = `exec-badge ${state.lastClipboardInfo.status === "copied" ? "is-ok" : "is-err"}`;
+      clipBadge.textContent =
+        state.lastClipboardInfo.status === "copied" ? "On Clipboard ✓" : "Click Copy Error for Clipboard";
+      row.appendChild(clipBadge);
     }
     if (timeStr) {
       const tsEl = document.createElement("span");
@@ -612,6 +703,112 @@ function renderActivityCard(act, isLatestActivity = false) {
     }
     card.appendChild(row);
   }
+  chatStream.appendChild(card);
+}
+
+function renderCheckpointCard(cp) {
+  const status = cp.status || "active";
+  const statusCls = status === "active" ? "is-active" : status === "committed" ? "is-committed" : "is-restored";
+  const badgeCls = status === "active" ? "is-ok" : status === "committed" ? "is-committed" : "is-restored";
+  const badgeText =
+    status === "active"
+      ? `Saved (${Number(cp.files_count || 0)} files)`
+      : status === "committed"
+        ? "Committed"
+        : "Restored";
+  const headline =
+    status === "active"
+      ? cp.summary || "Current state of the project is saved."
+      : cp.resolution_note || cp.summary || "Savepoint resolved.";
+
+  const modFiles = Array.isArray(cp.modified_files) ? cp.modified_files : [];
+  const createdFiles = Array.isArray(cp.created_files) ? cp.created_files : [];
+  const detailBits = [];
+  if (modFiles.length > 0) {
+    detailBits.push(`Modified (${modFiles.length}): ${modFiles.slice(0, 4).join(", ")}${modFiles.length > 4 ? ", …" : ""}`);
+  }
+  if (createdFiles.length > 0) {
+    detailBits.push(`Created (${createdFiles.length}): ${createdFiles.slice(0, 3).join(", ")}${createdFiles.length > 3 ? ", …" : ""}`);
+  }
+  const detailText = detailBits.join(" · ");
+  const fullTip = [...modFiles.map((f) => `M ${f}`), ...createdFiles.map((f) => `A ${f}`)].join("\n");
+
+  const card = document.createElement("article");
+  card.className = `msg-card msg-checkpoint ${statusCls}`;
+  card.innerHTML = `
+    <div class="msg-header">
+      <span class="msg-role">Companion · Savepoint</span>
+      <span class="exec-badge ${badgeCls}">${escapeHtml(badgeText)}</span>
+    </div>
+    <div class="companion-summary-line">${escapeHtml(headline)}</div>
+    ${detailText ? `<div class="meta-line mono mt-2" title="${escapeHtml(fullTip)}">${escapeHtml(detailText)}</div>` : ""}
+  `;
+
+  const footer = document.createElement("div");
+  footer.className = status === "active" ? "companion-footer" : "msg-footer";
+
+  if (status === "active") {
+    const restoreBtn = document.createElement("button");
+    restoreBtn.type = "button";
+    restoreBtn.className = "btn btn-danger btn-xs";
+    restoreBtn.textContent = "Restore";
+    restoreBtn.title = "Revert all files edited/created since this savepoint back to their pre-batch state";
+
+    const commitBtn = document.createElement("button");
+    commitBtn.type = "button";
+    commitBtn.className = "btn btn-secondary btn-xs";
+    commitBtn.textContent = "Commit Anyway";
+    commitBtn.title = "Keep current project edits and replace this saved checkpoint";
+
+    restoreBtn.addEventListener("click", async () => {
+      restoreBtn.disabled = true;
+      commitBtn.disabled = true;
+      restoreBtn.textContent = "Restoring...";
+      try {
+        const res = await api.restoreCheckpoint(cp.id);
+        if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
+        if (Array.isArray(res.pending_gates)) state.pendingGates = res.pending_gates;
+        state.gatesHiddenDueToError = false;
+        emit("backups:refresh");
+        emit("git:refresh");
+        emit("tree:refresh");
+        emit("session:updated");
+        emit("chat:loaded");
+      } catch (err) {
+        restoreBtn.disabled = false;
+        commitBtn.disabled = false;
+        restoreBtn.textContent = "Restore";
+        emit("chat:error", err.message);
+      }
+    });
+
+    commitBtn.addEventListener("click", async () => {
+      restoreBtn.disabled = true;
+      commitBtn.disabled = true;
+      commitBtn.textContent = "Committing...";
+      try {
+        const res = await api.commitCheckpoint(cp.id);
+        if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
+        emit("chat:loaded");
+      } catch (err) {
+        restoreBtn.disabled = false;
+        commitBtn.disabled = false;
+        commitBtn.textContent = "Commit Anyway";
+        emit("chat:error", err.message);
+      }
+    });
+
+    footer.append(restoreBtn, commitBtn);
+  }
+
+  const timeStr = formatTimeHHMMSS(cp.resolved_at || cp.created_at);
+  if (timeStr) {
+    const tsEl = document.createElement("span");
+    tsEl.className = "msg-timestamp mono tabular";
+    tsEl.textContent = timeStr;
+    footer.appendChild(tsEl);
+  }
+  card.appendChild(footer);
   chatStream.appendChild(card);
 }
 
@@ -684,6 +881,9 @@ function formatSingleToolDetail(name, resp, bytes) {
   if (resp.written) {
     return `${name}: Wrote ${resp.path}${resp.executed ? ` (exit ${resp.exit_code})` : ""}`;
   }
+  if (name === "run_tests" && !resp.error) {
+    return `${name}(${resp.command || "tests"}) — ${resp.passed ? "PASSED" : "FAILED"} (exit ${resp.exit_code ?? "?"})`;
+  }
   if (resp.path) return `${name}(${resp.path})${sz}`;
   if (resp.pattern !== undefined) return `${name}("${resp.pattern}") — ${resp.total_hits ?? 0} hits${sz}`;
   if (resp.subpath !== undefined) return `${name}(${resp.subpath})${sz}`;
@@ -703,8 +903,10 @@ function formatToolCallSummary(tc) {
   const a = tc.args || {};
   if (name === "list_tree") return `list_tree(${a.subpath || "."}, depth=${a.max_depth ?? 3})`;
   if (name === "search_code") {
-    const scope = a.path_glob ? `, ${a.path_glob}` : "";
-    return `search_code("${a.pattern || ""}"${scope})`;
+    const scope = [a.subpath, a.path_glob, a.start_line || a.end_line ? `L${a.start_line || 1}-${a.end_line || ""}` : ""]
+      .filter(Boolean)
+      .join(", ");
+    return `search_code("${a.pattern || ""}"${scope ? `, ${scope}` : ""})`;
   }
   if (name === "read_lines") return `read_lines(${a.path || ""}:${a.start_line ?? 1}-${a.end_line ?? "?"})`;
   if (name === "read_file") return `read_file(${a.path || ""})`;
@@ -712,6 +914,7 @@ function formatToolCallSummary(tc) {
   if (name === "patch_lines") return `patch_lines(${a.path || ""}:${a.start_line ?? "?"}-${a.end_line ?? "?"})`;
   if (name === "write_file") return `write_file(${a.path || ""})`;
   if (name === "propose_script") return `propose_script(${a.path || ""})`;
+  if (name === "run_tests") return a.summary ? `run_tests(${a.summary})` : "run_tests";
   return name;
 }
 

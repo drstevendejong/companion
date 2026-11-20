@@ -117,7 +117,12 @@ def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict
             warnings.append(err_msg)
             error_count += 1
             target_label = str(
-                args.get("path") or args.get("pattern") or args.get("subpath") or ""
+                args.get("path")
+                or args.get("old_path")
+                or args.get("target")
+                or args.get("pattern")
+                or args.get("subpath")
+                or ""
             )
             db.add_message(
                 session.id,
@@ -177,6 +182,7 @@ def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict
         "session": db.get_session(session.id),
         "messages": messages,
         "pending_gates": pending_gates,
+        "checkpoints": db.list_checkpoints(session.id) if hasattr(db, "list_checkpoints") else [],
         "parsed_count": len(actions),
         "staged_count": staged,
         "auto_executed_count": auto_executed,

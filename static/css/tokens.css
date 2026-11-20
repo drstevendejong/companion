@@ -1,5 +1,7 @@
-/* Design tokens and dark scrollbars for Gemini Vibe Companion */
+/* Design tokens, themes, and scrollbars for Gemini Vibe Companion */
 :root {
+  --color-scheme: dark;
+
   --bg-canvas: #0b1120;
   --bg-surface: #0f172a;
   --bg-elevated: #172033;
@@ -8,16 +10,49 @@
   --border-strong: #334155;
 
   --text-primary: #f1f5f9;
+  --text-strong: #ffffff;
   --text-secondary: #94a3b8;
   --text-muted: #64748b;
 
   --accent: #3b82f6;
   --accent-hover: #2563eb;
   --accent-soft: rgba(59, 130, 246, 0.14);
+  --accent-border: rgba(59, 130, 246, 0.45);
+  --accent-text: #93c5fd;
+  --on-accent: #ffffff;
 
   --success: #16a34a;
+  --success-soft: rgba(16, 185, 129, 0.14);
+  --success-border: rgba(16, 185, 129, 0.42);
+  --success-text: #6ee7b7;
+
   --warning: #d97706;
+  --warning-soft: rgba(245, 158, 11, 0.14);
+  --warning-border: rgba(245, 158, 11, 0.45);
+  --warning-text: #fcd34d;
+
   --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.16);
+  --danger-soft-hover: rgba(220, 38, 38, 0.28);
+  --danger-border: rgba(220, 38, 38, 0.48);
+  --danger-text: #fca5a5;
+
+  --card-companion-bg: rgba(15, 23, 42, 0.72);
+  --card-exec-bg: rgba(15, 23, 42, 0.78);
+  --card-checkpoint-bg: rgba(6, 78, 59, 0.24);
+  --card-checkpoint-border: rgba(16, 185, 129, 0.55);
+  --card-checkpoint-committed-bg: rgba(15, 23, 42, 0.65);
+  --card-checkpoint-restored-bg: rgba(120, 53, 15, 0.2);
+  --card-error-bg: rgba(127, 29, 29, 0.22);
+  --card-error-text: #fecaca;
+
+  --code-inline-text: #bfdbfe;
+  --diff-add-text: #86efac;
+  --diff-del-text: #fca5a5;
+  --diff-hunk-text: #93c5fd;
+
+  --backdrop-scrim: rgba(2, 6, 23, 0.76);
+  --shadow-soft: rgba(0, 0, 0, 0.32);
 
   --sidebar-width: 290px;
   --drawer-width: 360px;
@@ -27,6 +62,348 @@
 
   --radius-sm: 6px;
   --radius-md: 8px;
+}
+
+/* JetBrains / PyCharm Darcula */
+:root[data-theme="darcula"] {
+  --color-scheme: dark;
+
+  --bg-canvas: #2b2b2b;
+  --bg-surface: #3c3f41;
+  --bg-elevated: #313335;
+  --bg-hover: #4b5052;
+  --border-subtle: #4e5254;
+  --border-strong: #616669;
+
+  --text-primary: #d4dce4;
+  --text-strong: #f0f4f8;
+  --text-secondary: #a9b7c6;
+  --text-muted: #7c858e;
+
+  --accent: #4a88c7;
+  --accent-hover: #3c78b5;
+  --accent-soft: rgba(74, 136, 199, 0.20);
+  --accent-border: rgba(74, 136, 199, 0.55);
+  --accent-text: #88beff;
+  --on-accent: #ffffff;
+
+  --success: #629755;
+  --success-soft: rgba(98, 151, 85, 0.18);
+  --success-border: rgba(98, 151, 85, 0.50);
+  --success-text: #8cc27e;
+
+  --warning: #bbb529;
+  --warning-soft: rgba(204, 150, 50, 0.16);
+  --warning-border: rgba(204, 150, 50, 0.48);
+  --warning-text: #ffc66d;
+
+  --danger: #c75450;
+  --danger-soft: rgba(199, 84, 80, 0.18);
+  --danger-soft-hover: rgba(199, 84, 80, 0.30);
+  --danger-border: rgba(199, 84, 80, 0.52);
+  --danger-text: #f08e8a;
+
+  --card-companion-bg: rgba(49, 51, 53, 0.90);
+  --card-exec-bg: rgba(60, 63, 65, 0.90);
+  --card-checkpoint-bg: rgba(52, 82, 48, 0.28);
+  --card-checkpoint-border: rgba(98, 151, 85, 0.55);
+  --card-checkpoint-committed-bg: rgba(49, 51, 53, 0.72);
+  --card-checkpoint-restored-bg: rgba(120, 88, 30, 0.24);
+  --card-error-bg: rgba(115, 42, 40, 0.28);
+  --card-error-text: #f7b8b5;
+
+  --code-inline-text: #ffc66d;
+  --diff-add-text: #8cc27e;
+  --diff-del-text: #f08e8a;
+  --diff-hunk-text: #88beff;
+
+  --backdrop-scrim: rgba(24, 24, 24, 0.76);
+  --shadow-soft: rgba(0, 0, 0, 0.36);
+}
+
+/* Washed Grey-Blue / Nordic Slate */
+:root[data-theme="nordic-slate"] {
+  --color-scheme: dark;
+
+  --bg-canvas: #28303b;
+  --bg-surface: #303946;
+  --bg-elevated: #394454;
+  --bg-hover: #435063;
+  --border-subtle: #49566a;
+  --border-strong: #5b6a82;
+
+  --text-primary: #e2e8f0;
+  --text-strong: #f8fafc;
+  --text-secondary: #adb9ca;
+  --text-muted: #7d8b9e;
+
+  --accent: #6b93bc;
+  --accent-hover: #5a82ac;
+  --accent-soft: rgba(107, 147, 188, 0.20);
+  --accent-border: rgba(107, 147, 188, 0.50);
+  --accent-text: #a8c7e8;
+  --on-accent: #ffffff;
+
+  --success: #4a9d7c;
+  --success-soft: rgba(74, 157, 124, 0.16);
+  --success-border: rgba(74, 157, 124, 0.45);
+  --success-text: #8ad3b5;
+
+  --warning: #c88d42;
+  --warning-soft: rgba(200, 141, 66, 0.16);
+  --warning-border: rgba(200, 141, 66, 0.45);
+  --warning-text: #f3c485;
+
+  --danger: #cf5c5c;
+  --danger-soft: rgba(207, 92, 92, 0.18);
+  --danger-soft-hover: rgba(207, 92, 92, 0.28);
+  --danger-border: rgba(207, 92, 92, 0.48);
+  --danger-text: #f4a4a4;
+
+  --card-companion-bg: rgba(48, 57, 70, 0.88);
+  --card-exec-bg: rgba(57, 68, 84, 0.86);
+  --card-checkpoint-bg: rgba(45, 92, 74, 0.26);
+  --card-checkpoint-border: rgba(74, 157, 124, 0.50);
+  --card-checkpoint-committed-bg: rgba(48, 57, 70, 0.68);
+  --card-checkpoint-restored-bg: rgba(120, 82, 34, 0.22);
+  --card-error-bg: rgba(125, 44, 44, 0.26);
+  --card-error-text: #f8c2c2;
+
+  --code-inline-text: #b8d2ed;
+  --diff-add-text: #8ad3b5;
+  --diff-del-text: #f4a4a4;
+  --diff-hunk-text: #a8c7e8;
+
+  --backdrop-scrim: rgba(22, 27, 34, 0.72);
+  --shadow-soft: rgba(10, 15, 22, 0.30);
+}
+
+/* Crisp Daylight (Light) */
+:root[data-theme="light"] {
+  --color-scheme: light;
+
+  --bg-canvas: #f3f6fa;
+  --bg-surface: #ffffff;
+  --bg-elevated: #eef2f7;
+  --bg-hover: #e2e8f0;
+  --border-subtle: #d8e0ea;
+  --border-strong: #bcc7d6;
+
+  --text-primary: #0f172a;
+  --text-strong: #020617;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-soft: rgba(37, 99, 235, 0.10);
+  --accent-border: rgba(37, 99, 235, 0.36);
+  --accent-text: #1d4ed8;
+  --on-accent: #ffffff;
+
+  --success: #16a34a;
+  --success-soft: rgba(22, 163, 74, 0.11);
+  --success-border: rgba(22, 163, 74, 0.36);
+  --success-text: #15803d;
+
+  --warning: #d97706;
+  --warning-soft: rgba(217, 119, 6, 0.12);
+  --warning-border: rgba(217, 119, 6, 0.38);
+  --warning-text: #b45309;
+
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.10);
+  --danger-soft-hover: rgba(220, 38, 38, 0.18);
+  --danger-border: rgba(220, 38, 38, 0.36);
+  --danger-text: #b91c1c;
+
+  --card-companion-bg: #f8fafc;
+  --card-exec-bg: #ffffff;
+  --card-checkpoint-bg: rgba(22, 163, 74, 0.08);
+  --card-checkpoint-border: rgba(22, 163, 74, 0.38);
+  --card-checkpoint-committed-bg: rgba(22, 163, 74, 0.04);
+  --card-checkpoint-restored-bg: rgba(217, 119, 6, 0.09);
+  --card-error-bg: rgba(220, 38, 38, 0.07);
+  --card-error-text: #991b1b;
+
+  --code-inline-text: #1e40af;
+  --diff-add-text: #15803d;
+  --diff-del-text: #b91c1c;
+  --diff-hunk-text: #1d4ed8;
+
+  --backdrop-scrim: rgba(15, 23, 42, 0.42);
+  --shadow-soft: rgba(15, 23, 42, 0.10);
+}
+
+/* Warm Paper (Soft Light) */
+:root[data-theme="warm-paper"] {
+  --color-scheme: light;
+
+  --bg-canvas: #f4efe6;
+  --bg-surface: #faf7f1;
+  --bg-elevated: #ebe4d8;
+  --bg-hover: #e1d8c8;
+  --border-subtle: #dcd3c3;
+  --border-strong: #c5b9a5;
+
+  --text-primary: #27221c;
+  --text-strong: #14110e;
+  --text-secondary: #5c5347;
+  --text-muted: #7d7365;
+
+  --accent: #0f766e;
+  --accent-hover: #115e59;
+  --accent-soft: rgba(15, 118, 110, 0.11);
+  --accent-border: rgba(15, 118, 110, 0.36);
+  --accent-text: #0f766e;
+  --on-accent: #ffffff;
+
+  --success: #15803d;
+  --success-soft: rgba(21, 128, 61, 0.11);
+  --success-border: rgba(21, 128, 61, 0.36);
+  --success-text: #166534;
+
+  --warning: #b45309;
+  --warning-soft: rgba(180, 83, 9, 0.11);
+  --warning-border: rgba(180, 83, 9, 0.38);
+  --warning-text: #92400e;
+
+  --danger: #b91c1c;
+  --danger-soft: rgba(185, 28, 28, 0.10);
+  --danger-soft-hover: rgba(185, 28, 28, 0.18);
+  --danger-border: rgba(185, 28, 28, 0.36);
+  --danger-text: #991b1b;
+
+  --card-companion-bg: #f7f3eb;
+  --card-exec-bg: #faf7f1;
+  --card-checkpoint-bg: rgba(21, 128, 61, 0.08);
+  --card-checkpoint-border: rgba(21, 128, 61, 0.36);
+  --card-checkpoint-committed-bg: rgba(21, 128, 61, 0.04);
+  --card-checkpoint-restored-bg: rgba(180, 83, 9, 0.09);
+  --card-error-bg: rgba(185, 28, 28, 0.07);
+  --card-error-text: #7f1d1d;
+
+  --code-inline-text: #0f766e;
+  --diff-add-text: #166534;
+  --diff-del-text: #991b1b;
+  --diff-hunk-text: #0f766e;
+
+  --backdrop-scrim: rgba(28, 23, 18, 0.45);
+  --shadow-soft: rgba(28, 23, 18, 0.10);
+}
+
+/* Espresso & Amber (Warm Dark) */
+:root[data-theme="espresso"] {
+  --color-scheme: dark;
+
+  --bg-canvas: #151210;
+  --bg-surface: #1e1916;
+  --bg-elevated: #28211d;
+  --bg-hover: #332a25;
+  --border-subtle: #3b302a;
+  --border-strong: #4f4038;
+
+  --text-primary: #ede4db;
+  --text-strong: #faf5ef;
+  --text-secondary: #b6a89c;
+  --text-muted: #82756a;
+
+  --accent: #d97706;
+  --accent-hover: #b45309;
+  --accent-soft: rgba(217, 119, 6, 0.17);
+  --accent-border: rgba(217, 119, 6, 0.46);
+  --accent-text: #fbbf24;
+  --on-accent: #ffffff;
+
+  --success: #16a34a;
+  --success-soft: rgba(22, 163, 74, 0.16);
+  --success-border: rgba(22, 163, 74, 0.44);
+  --success-text: #86efac;
+
+  --warning: #f59e0b;
+  --warning-soft: rgba(245, 158, 11, 0.16);
+  --warning-border: rgba(245, 158, 11, 0.46);
+  --warning-text: #fde68a;
+
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.18);
+  --danger-soft-hover: rgba(220, 38, 38, 0.28);
+  --danger-border: rgba(220, 38, 38, 0.48);
+  --danger-text: #fca5a5;
+
+  --card-companion-bg: rgba(30, 25, 22, 0.88);
+  --card-exec-bg: rgba(40, 33, 29, 0.88);
+  --card-checkpoint-bg: rgba(22, 101, 52, 0.24);
+  --card-checkpoint-border: rgba(34, 197, 94, 0.48);
+  --card-checkpoint-committed-bg: rgba(30, 25, 22, 0.68);
+  --card-checkpoint-restored-bg: rgba(146, 64, 14, 0.24);
+  --card-error-bg: rgba(127, 29, 29, 0.24);
+  --card-error-text: #fecaca;
+
+  --code-inline-text: #fcd34d;
+  --diff-add-text: #86efac;
+  --diff-del-text: #fca5a5;
+  --diff-hunk-text: #fbbf24;
+
+  --backdrop-scrim: rgba(12, 9, 7, 0.78);
+  --shadow-soft: rgba(0, 0, 0, 0.38);
+}
+
+/* Deep Pine / Emerald Night */
+:root[data-theme="forest-night"] {
+  --color-scheme: dark;
+
+  --bg-canvas: #0c1312;
+  --bg-surface: #111b19;
+  --bg-elevated: #182623;
+  --bg-hover: #20322e;
+  --border-subtle: #243833;
+  --border-strong: #324d46;
+
+  --text-primary: #e4f0ed;
+  --text-strong: #ffffff;
+  --text-secondary: #9bb5ae;
+  --text-muted: #68827b;
+
+  --accent: #059669;
+  --accent-hover: #047857;
+  --accent-soft: rgba(16, 185, 129, 0.16);
+  --accent-border: rgba(16, 185, 129, 0.45);
+  --accent-text: #6ee7b7;
+  --on-accent: #ffffff;
+
+  --success: #10b981;
+  --success-soft: rgba(16, 185, 129, 0.15);
+  --success-border: rgba(16, 185, 129, 0.44);
+  --success-text: #6ee7b7;
+
+  --warning: #d97706;
+  --warning-soft: rgba(245, 158, 11, 0.15);
+  --warning-border: rgba(245, 158, 11, 0.45);
+  --warning-text: #fcd34d;
+
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.16);
+  --danger-soft-hover: rgba(220, 38, 38, 0.28);
+  --danger-border: rgba(220, 38, 38, 0.48);
+  --danger-text: #fca5a5;
+
+  --card-companion-bg: rgba(17, 27, 25, 0.86);
+  --card-exec-bg: rgba(24, 38, 35, 0.86);
+  --card-checkpoint-bg: rgba(6, 78, 59, 0.28);
+  --card-checkpoint-border: rgba(16, 185, 129, 0.52);
+  --card-checkpoint-committed-bg: rgba(17, 27, 25, 0.68);
+  --card-checkpoint-restored-bg: rgba(120, 53, 15, 0.22);
+  --card-error-bg: rgba(127, 29, 29, 0.24);
+  --card-error-text: #fecaca;
+
+  --code-inline-text: #a7f3d0;
+  --diff-add-text: #86efac;
+  --diff-del-text: #fca5a5;
+  --diff-hunk-text: #6ee7b7;
+
+  --backdrop-scrim: rgba(4, 12, 10, 0.78);
+  --shadow-soft: rgba(0, 0, 0, 0.36);
 }
 
 * {
@@ -64,7 +441,7 @@ body {
   font-family: var(--font-sans);
   font-size: 14px;
   line-height: 1.5;
-  color-scheme: dark;
+  color-scheme: var(--color-scheme);
 }
 
 .mono {

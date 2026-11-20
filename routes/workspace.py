@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from models import PatchRecord, RunCommandRequest
 from services import bridge as bridge_svc
+from services import checkpoints as cp_svc
 from services import fs_tools, patch_tools, runner
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
@@ -57,7 +58,8 @@ def preview_file_for_attach(
 
 @router.post("/run")
 async def run_workspace_command(payload: RunCommandRequest, request: Request) -> Dict[str, Any]:
-    project = request.app.state.db.get_project(payload.project_id)
+    db = request.app.state.db
+    project = db.get_project(payload.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
     try:
@@ -70,6 +72,24 @@ async def run_workspace_command(payload: RunCommandRequest, request: Request) ->
             project.root_path,
             res.get("output", ""),
         )
+        if payload.is_test_run and payload.session_id:
+            raw_out = res.get("output") or ""
+            has_traceback = (
+                "Traceback (most recent call last):" in raw_out
+                or "\nSyntaxError:" in raw_out
+                or "\nAssertionError:" in raw_out
+                or "\nImportError:" in raw_out
+                or "\nModuleNotFoundError:" in raw_out
+            )
+            passed = (res.get("exit_code") == 0) and (not has_traceback)
+            committed = None
+            if passed and hasattr(db, "get_active_checkpoint"):
+                committed = cp_svc.auto_commit_active_checkpoint_on_tests_pass(
+                    db, project, payload.session_id, payload.command
+                )
+            res["checkpoint_committed"] = bool(committed)
+            if hasattr(db, "list_checkpoints"):
+                res["checkpoints"] = db.list_checkpoints(payload.session_id)
         return res
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -118,3 +138,70 @@ def undo_project_patch(patch_id: str, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.mark_patch_reverted(patch_id)
     return result
+
+
+@router.post("/checkpoints/{checkpoint_id}/restore")
+def restore_project_checkpoint(checkpoint_id: str, request: Request) -> Dict[str, Any]:
+    db = request.app.state.db
+    cp = db.get_checkpoint(checkpoint_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail="Checkpoint not found.")
+    if cp.status == "restored":
+        raise HTTPException(status_code=400, detail="Checkpoint has already been restored.")
+    project = db.get_project(cp.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    try:
+        res = cp_svc.restore_checkpoint_snapshot(
+            project.root_path,
+            cp.snapshot_dir,
+            extra_created_files=cp.created_files,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    note = (
+        f"Restored {res['restored_count']} modified file(s)"
+        + (f" & removed {res['removed_count']} created file(s)." if res["removed_count"] else ".")
+    )
+    updated = db.resolve_checkpoint(cp.id, "restored", note)
+    cancelled = db.cancel_pending_gates(cp.session_id, reason="Project state restored from savepoint")
+    cp_svc.prune_checkpoints_directory(
+        project.root_path,
+        project.backup_dir,
+        active_snapshot_dirs=set(db.list_active_checkpoint_dirs(project.id)),
+    )
+    return {
+        "checkpoint": updated,
+        "checkpoints": db.list_checkpoints(cp.session_id),
+        "pending_gates": db.list_pending_gates(cp.session_id),
+        "cancelled_gates": cancelled,
+        **res,
+    }
+
+
+@router.post("/checkpoints/{checkpoint_id}/commit")
+def commit_project_checkpoint(checkpoint_id: str, request: Request) -> Dict[str, Any]:
+    db = request.app.state.db
+    cp = db.get_checkpoint(checkpoint_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail="Checkpoint not found.")
+    if cp.status != "active":
+        raise HTTPException(status_code=400, detail=f"Checkpoint is already {cp.status}.")
+    project = db.get_project(cp.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    updated = db.resolve_checkpoint(
+        cp.id,
+        "committed",
+        "Committed manually by operator.",
+    )
+    cp_svc.prune_checkpoints_directory(
+        project.root_path,
+        project.backup_dir,
+        active_snapshot_dirs=set(db.list_active_checkpoint_dirs(project.id)),
+    )
+    return {
+        "checkpoint": updated,
+        "checkpoints": db.list_checkpoints(cp.session_id),
+    }

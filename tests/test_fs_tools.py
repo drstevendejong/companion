@@ -199,6 +199,35 @@ class TestFsTools(unittest.TestCase):
         self.assertEqual(res["char_count"], len(big_text))
         self.assertEqual(res["content"], big_text)
 
+    def test_search_code_subpath_and_line_bounds(self) -> None:
+        (self.root / "other").mkdir()
+        (self.root / "other" / "beta.py").write_text(
+            "def greet():\n    return 'other'\n", encoding="utf-8"
+        )
+        (self.root / "src" / "multi.py").write_text(
+            "marker = 'top'\n"
+            "x = 1\n"
+            "y = 2\n"
+            "marker = 'mid'\n"
+            "z = 3\n"
+            "marker = 'bot'\n",
+            encoding="utf-8",
+        )
+
+        # Subpath directory scopes results only inside src/
+        dir_hits = fs_tools.search_code(self.root, "greet", subpath="src")
+        self.assertEqual({m["path"] for m in dir_hits["matches"]}, {"src/alpha.py"})
+
+        # Subpath single file + line bounds
+        bounded = fs_tools.search_code(
+            self.root, "marker", subpath="src/multi.py", start_line=3, end_line=5, context_lines=0
+        )
+        self.assertEqual(bounded["total_hits"], 1)
+        self.assertEqual(bounded["matches"][0]["line"], 4)
+
+        with self.assertRaises(FileNotFoundError):
+            fs_tools.search_code(self.root, "greet", subpath="nonexistent_dir")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -75,6 +75,22 @@ async function draftMessage() {
   }
 }
 
+const FALLBACK_GIT_COMMIT_PROMPT =
+  "Write a concise git commit message (1-line subject <= 72 chars) for this diff:\n\n```diff\n{diff}\n```";
+
+async function loadGitCommitPromptTemplate() {
+  try {
+    const res = await fetch("/static/prompts/git_commit_prompt.txt", { cache: "no-store" });
+    if (res.ok) {
+      const txt = (await res.text()).trim();
+      if (txt) return txt;
+    }
+  } catch {
+    // Fallback below if static fetch is unavailable
+  }
+  return FALLBACK_GIT_COMMIT_PROMPT;
+}
+
 async function copyDiffForPlayground() {
   const proj = getActiveProject();
   if (!proj) return;
@@ -87,7 +103,10 @@ async function copyDiffForPlayground() {
     const diffBody =
       status.diff ||
       status.changed_files.map((f) => `${f.status} ${f.path}`).join("\n");
-    const promptText = `Write a concise git commit message (1-line subject <= 72 chars) for this diff:\n\n\`\`\`diff\n${diffBody}\n\`\`\``;
+    const template = await loadGitCommitPromptTemplate();
+    const promptText = template.includes("{diff}")
+      ? template.replace("{diff}", diffBody)
+      : `${template}\n\n\`\`\`diff\n${diffBody}\n\`\`\``;
     await copyTextToClipboard(promptText);
     resultLabel.textContent = `Copied git diff (~${Number(status.diff_tokens || 0).toLocaleString()} tok) to clipboard.`;
   } catch (err) {

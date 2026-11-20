@@ -93,8 +93,20 @@ export const api = {
     ),
   previewFile: (projectId, path) =>
     requestJson(`/api/workspace/file-preview?project_id=${encodeURIComponent(projectId)}&path=${encodeURIComponent(path)}`),
-  runCommand: (projectId, command) =>
-    requestJson("/api/workspace/run", { method: "POST", body: JSON.stringify({ project_id: projectId, command }) }),
+  runCommand: (projectId, command, opts = {}) =>
+    requestJson("/api/workspace/run", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: projectId,
+        command,
+        session_id: opts.sessionId || null,
+        is_test_run: Boolean(opts.isTestRun),
+      }),
+    }),
+  restoreCheckpoint: (checkpointId) =>
+    requestJson(`/api/workspace/checkpoints/${checkpointId}/restore`, { method: "POST" }),
+  commitCheckpoint: (checkpointId) =>
+    requestJson(`/api/workspace/checkpoints/${checkpointId}/commit`, { method: "POST" }),
   listBackups: (projectId) => requestJson(`/api/workspace/backups?project_id=${encodeURIComponent(projectId)}`),
   undoPatch: (patchId) => requestJson(`/api/workspace/undo/${patchId}`, { method: "POST" }),
 

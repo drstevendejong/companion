@@ -69,6 +69,10 @@ export function initDrawer() {
   });
 
   on("backups:refresh", refreshBackups);
+  on("tree:refresh", () => {
+    dirCache.clear();
+    refreshTree();
+  });
   on("drawer:switch-tab", (tabName) => {
     if (tabName && panes[tabName]) switchTab(tabName);
   });
@@ -89,7 +93,7 @@ function triggerPostPatchTests() {
     emit("chat:error", "No Post-Patch Test Command configured. Click Edit next to Active Project to set one.");
     return;
   }
-  runTerminalCommand(proj.post_patch_command, { reportInChat: true, label: "tests" });
+  runTerminalCommand(proj.post_patch_command, { reportInChat: true, label: "tests", isTestRun: true });
 }
 
 export function switchTab(tabName) {
@@ -193,6 +197,120 @@ function renderFolderChildren(projId, folderPath, depth, filter) {
   }
 }
 
+const FAILURE_LINE_RE =
+  /(?:^\s*\[?\s*(?:ERROR|FAIL|FAILED|FATAL|CRITICAL|PANIC)\s*\]?(?:[:\s-]|$)|^\s*(?:={12,}|--- FAIL:|E\s{2,}\S|[✖✗✘×❌]\s)|\b(?:Traceback \(most recent call last\):|(?:Assertion|Syntax|Type|Reference|Value|Key|Attribute|Import|ModuleNotFound|Runtime|Name|Index|Indentation|ZeroDivision|OSError|FileNotFound|Permission)Error\b|UnhandledPromiseRejection)|(?::\d+(?::\d+)?|\(\d+(?:,\s*\d+)?\)):\s*(?:error|fatal)\b|\berror(?:\[E\d+\]|\s+TS\d+):|\b[1-9]\d*\s+(?:failed|errors?|failures?)\b)/i;
+
+function extractFailureExcerpt(rawOutput, maxChars = 4500) {
+  const normalized = String(rawOutput || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  if (!normalized) {
+    return { excerpt: "", matchedErrors: false, isFull: true };
+  }
+  if (normalized.length <= maxChars) {
+    const hasMatch = normalized.split("\n").some((l) => FAILURE_LINE_RE.test(l));
+    return { excerpt: normalized, matchedErrors: hasMatch, isFull: true };
+  }
+
+  const lines = normalized.split("\n");
+  const n = lines.length;
+  const ranges = [];
+  for (let idx = 0; idx < n; idx += 1) {
+    if (FAILURE_LINE_RE.test(lines[idx])) {
+      const start = Math.max(0, idx - 1);
+      const end = Math.min(n, idx + 11);
+      if (ranges.length > 0 && start <= ranges[ranges.length - 1][1] + 1) {
+        ranges[ranges.length - 1][1] = Math.max(ranges[ranges.length - 1][1], end);
+      } else {
+        ranges.push([start, end]);
+      }
+    }
+  }
+
+  if (ranges.length > 0) {
+    const tailStart = Math.max(0, n - 8);
+    if (tailStart > ranges[ranges.length - 1][1] + 1) {
+      ranges.push([tailStart, n]);
+    } else {
+      ranges[ranges.length - 1][1] = n;
+    }
+
+    const chunks = [];
+    let totalLen = 0;
+    for (const [sIdx, eIdx] of ranges) {
+      const block = lines.slice(sIdx, eIdx).join("\n");
+      const sep = chunks.length > 0 ? "\n...\n" : "";
+      if (totalLen + sep.length + block.length > maxChars) {
+        const remaining = maxChars - totalLen - sep.length;
+        if (remaining > 120) {
+          chunks.push(`${sep}${block.slice(0, remaining)}\n...[truncated]`);
+        }
+        break;
+      }
+      chunks.push(`${sep}${block}`);
+      totalLen += sep.length + block.length;
+    }
+    const combined = chunks.join("").trim();
+    if (combined) {
+      return { excerpt: combined, matchedErrors: true, isFull: false };
+    }
+  }
+
+  let tail = lines.slice(-50).join("\n");
+  if (tail.length > maxChars) {
+    tail = `...[truncated]\n${tail.slice(-maxChars)}`;
+  }
+  return { excerpt: tail, matchedErrors: false, isFull: false };
+}
+
+function buildCommandFailureReport(command, exitCode, rawOutput) {
+  const normalized = String(rawOutput || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  const header = `## Local Test / Command Failure (\`${command}\` · exit code ${exitCode})`;
+
+  if (!normalized) {
+    return {
+      preview: "(No output produced)",
+      copyErrorText: `${header}\n\nCommand exited with code ${exitCode} and produced no stdout/stderr output.`,
+      copyFullText: "",
+      matchedErrors: false,
+      hint: "Command produced no output.",
+    };
+  }
+
+  const uiSlice = extractFailureExcerpt(normalized, 1800);
+  const fullCopyFormatted = `## Local Test / Command Output (\`${command}\` · exit code ${exitCode})\n\n\`\`\`text\n${normalized}\n\`\`\``;
+
+  if (normalized.length <= 4000) {
+    return {
+      preview: uiSlice.excerpt,
+      copyErrorText: `${header}\n\n\`\`\`text\n${normalized}\n\`\`\``,
+      copyFullText: "",
+      matchedErrors: uiSlice.matchedErrors,
+      hint: "",
+    };
+  }
+
+  const copySlice = extractFailureExcerpt(normalized, 5000);
+  if (copySlice.matchedErrors) {
+    return {
+      preview: uiSlice.excerpt,
+      copyErrorText: `${header}\n\n### Extracted Error Output\n\`\`\`text\n${copySlice.excerpt}\n\`\`\``,
+      copyFullText: fullCopyFormatted,
+      matchedErrors: true,
+      hint: "",
+    };
+  }
+
+  return {
+    preview: uiSlice.excerpt,
+    copyErrorText:
+      `${header}\n\n` +
+      `> Note: Output is ${normalized.length.toLocaleString()} chars and did not match standard ERROR/FAIL markers; showing the final lines. Check Console Output if earlier lines are needed.\n\n` +
+      `\`\`\`text\n${copySlice.excerpt}\n\`\`\``,
+    copyFullText: fullCopyFormatted,
+    matchedErrors: false,
+    hint: "No standard ERROR/FAIL markers matched automatically; showing tail lines — use Copy Full Output or Console if needed.",
+  };
+}
+
 async function runTerminalCommand(command, opts = {}) {
   const proj = getActiveProject();
   if (!proj) return;
@@ -207,6 +325,7 @@ async function runTerminalCommand(command, opts = {}) {
   if (reportInChat) {
     upsertActivity(sid, {
       id: actId,
+      batchKey: actId,
       status: "running",
       title: `Running tests: ${command}`,
       detail: "Waiting for process exit code...",
@@ -217,37 +336,92 @@ async function runTerminalCommand(command, opts = {}) {
   }
 
   try {
-    const res = await api.runCommand(proj.id, command);
+    const res = await api.runCommand(proj.id, command, {
+      sessionId: sid,
+      isTestRun: Boolean(opts.isTestRun),
+    });
+    if (Array.isArray(res.checkpoints)) {
+      state.checkpoints = res.checkpoints;
+    }
     showTerminalResult(res);
     if (reportInChat) {
       const rawOut = res.output || "";
-      const hasTraceback = /Traceback \(most recent call last\):|\nSyntaxError:/i.test(rawOut);
+      const hasTraceback =
+        /Traceback \(most recent call last\):|\n(?:SyntaxError|AssertionError|ImportError|ModuleNotFoundError):/i.test(
+          rawOut
+        );
       const ok = res.exit_code === 0 && !hasTraceback;
-      const tailLines = rawOut.split("\n").filter((l) => l.trim()).slice(-6).join("\n").slice(0, 500);
-      upsertActivity(sid, {
-        id: actId,
-        status: ok ? "ok" : "err",
-        title: ok ? `Validated & tested cleanly (exit 0)` : `Possible errors detected (exit ${res.exit_code})`,
-        detail: `${command} · ${res.duration_ms}ms · View full output in Console`,
-        preview: tailLines,
-        showConsoleBtn: true,
-        timestamp: new Date().toISOString(),
-      });
-      emit("chat:loaded");
+      if (ok) {
+        const tailLines = rawOut.split("\n").filter((l) => l.trim()).slice(-6).join("\n").slice(0, 500);
+        const commitNote = res.checkpoint_committed ? " · Savepoint committed ✓" : "";
+        upsertActivity(sid, {
+          id: actId,
+          batchKey: actId,
+          status: "ok",
+          title: "Validated & tested cleanly (exit 0)",
+          detail: `${command} · ${res.duration_ms}ms${commitNote} · View full output in Console`,
+          preview: tailLines,
+          showConsoleBtn: true,
+          timestamp: new Date().toISOString(),
+        });
+        emit("chat:loaded");
+      } else {
+        const report = buildCommandFailureReport(command, res.exit_code, rawOut);
+        upsertActivity(sid, {
+          id: actId,
+          batchKey: actId,
+          status: "err",
+          title: `Possible errors detected (exit ${res.exit_code})`,
+          detail: `${command} · ${res.duration_ms}ms · View full output in Console`,
+          hint: report.hint,
+          preview: report.preview,
+          copyErrorText: report.copyErrorText,
+          copyFullText: report.copyFullText,
+          showConsoleBtn: true,
+          timestamp: new Date().toISOString(),
+        });
+        state.lastErrorContext = {
+          sessionId: sid,
+          reasonText: `Test failure (${command}, exit ${res.exit_code}):\n${report.preview}`,
+        };
+        if (!state.apiEnabled && report.copyErrorText) {
+          let clipStatus = "copied";
+          try {
+            await copyTextToClipboard(report.copyErrorText);
+          } catch {
+            clipStatus = "blocked";
+          }
+          state.lastClipboardInfo = { key: actId, status: clipStatus };
+        }
+        emit("chat:loaded");
+      }
     }
   } catch (err) {
     terminalMeta.textContent = "Command failed";
     terminalOutput.textContent = err.message;
     if (reportInChat) {
+      const errMsg = `## Local Test Execution Error (\`${command}\`)\n\n${err.message}`;
       upsertActivity(sid, {
         id: actId,
+        batchKey: actId,
         status: "err",
         title: "Test execution failed",
         detail: err.message,
-        preview: "",
+        preview: err.message,
+        copyErrorText: errMsg,
+        copyFullText: "",
         showConsoleBtn: true,
         timestamp: new Date().toISOString(),
       });
+      if (!state.apiEnabled) {
+        let clipStatus = "copied";
+        try {
+          await copyTextToClipboard(errMsg);
+        } catch {
+          clipStatus = "blocked";
+        }
+        state.lastClipboardInfo = { key: actId, status: clipStatus };
+      }
       emit("chat:loaded");
     }
   }

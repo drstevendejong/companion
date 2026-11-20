@@ -8,6 +8,7 @@ export const state = {
   activeSession: null,
   messages: [],
   pendingGates: [],
+  checkpoints: [],
   attachments: [],
   catalog: { models: [], thinking_levels: [] },
   lastTerminalOutput: "",

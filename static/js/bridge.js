@@ -165,14 +165,35 @@ export function formatBridgeToolResults(toolEvents) {
       );
     } else if (resp.applied) {
       blocks.push(`- **${name}**: Patch applied to \`${resp.path}\` (backup: \`${resp.backup_path}\`)`);
+    } else if (resp.deleted) {
+      blocks.push(`- **${name}**: Deleted \`${resp.path}\` (backup: \`${resp.backup_path}\`)`);
+    } else if (resp.renamed) {
+      blocks.push(
+        `- **${name}**: Renamed \`${resp.old_path}\` → \`${resp.new_path}\` (backup: \`${resp.backup_path}\`)`
+      );
     } else if (resp.written) {
       if (resp.executed) {
-        blocks.push(
-          `- **${name}**: Wrote \`${resp.path}\` and executed (exit code \`${resp.exit_code}\`).`
-        );
+        let line = `- **${name}**: Wrote \`${resp.path}\` and executed (exit code \`${resp.exit_code}\`).`;
+        const preview = String(resp.output_preview || "").trim();
+        if (((resp.exit_code ?? 0) !== 0 || resp.has_traceback) && preview) {
+          line += `\n\`\`\`text\n${preview}\n\`\`\``;
+        }
+        blocks.push(line);
       } else {
         blocks.push(`- **${name}**: Wrote \`${resp.path}\` to disk.`);
       }
+    } else if (name === "run_tests") {
+      const cmd = resp.command || "tests";
+      const code = resp.exit_code ?? "?";
+      const passed = Boolean(resp.passed) && code === 0 && !resp.has_traceback;
+      const statusLbl = passed ? "PASSED" : "FAILED";
+      const scopeNote = resp.is_full_suite === false ? " (quick/targeted check — savepoint stays active)" : "";
+      let line = `- **run_tests** (\`${cmd}\`): **${statusLbl}** (exit code \`${code}\`)${scopeNote}.`;
+      const preview = String(resp.output_preview || "").trim();
+      if (preview) {
+        line += `\n\`\`\`text\n${preview}\n\`\`\``;
+      }
+      blocks.push(line);
     } else {
       blocks.push(`### \`${name}\`\n\`\`\`json\n${JSON.stringify(resp, null, 2)}\n\`\`\``);
     }
@@ -353,7 +374,8 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true) {
 
   if (
     raw.startsWith("## Local Workspace Tool Results") ||
-    raw.startsWith("# Session Context — Project:")
+    raw.startsWith("# Session Context — Project:") ||
+    raw.startsWith("## Local Test / Command")
   ) {
     emit(
       "chat:error",
@@ -382,6 +404,7 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true) {
     state.activeSession = res.session;
     state.messages = res.messages;
     state.pendingGates = res.pending_gates || [];
+    if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
 
     const errorCount = Number(res.error_count || 0);
     const warnings = Array.isArray(res.warnings) ? res.warnings : [];
@@ -556,7 +579,7 @@ function extractToolTargetsFromMessages(messages) {
     if (m.role === "model" && Array.isArray(m.tool_calls)) {
       m.tool_calls.forEach((tc, idx) => {
         const a = tc.args || {};
-        const target = a.path || a.pattern || a.subpath || "";
+        const target = a.path || a.old_path || a.target || a.pattern || a.subpath || "";
         if (target) {
           map.set(`bridge-${idx}`, String(target));
         }

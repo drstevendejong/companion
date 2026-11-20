@@ -79,12 +79,36 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn("top: 0", comp_css)
 
         chat_js = (COMPANION_ROOT / "static" / "js" / "chat.js").read_text(encoding="utf-8")
+        drawer_js = (COMPANION_ROOT / "static" / "js" / "drawer.js").read_text(encoding="utf-8")
         gates_js = (COMPANION_ROOT / "static" / "js" / "tool_gates.js").read_text(encoding="utf-8")
         bridge_js = (COMPANION_ROOT / "static" / "js" / "bridge.js").read_text(encoding="utf-8")
         self.assertIn("Copy Error", chat_js)
+        self.assertIn("Copy Full Output", chat_js)
         self.assertIn("createGateVisibilityButton", chat_js)
+        self.assertIn("buildCommandFailureReport", drawer_js)
+        self.assertIn("extractFailureExcerpt", drawer_js)
         self.assertIn("gatesHiddenDueToError", gates_js)
         self.assertIn("buildErrorReasonForDeniedAction", bridge_js)
+
+        api_js = (COMPANION_ROOT / "static" / "js" / "api.js").read_text(encoding="utf-8")
+        self.assertIn(".msg-checkpoint", comp_css)
+        self.assertIn("renderCheckpointCard", chat_js)
+        self.assertIn("Commit Anyway", chat_js)
+        self.assertIn("Restore", chat_js)
+        self.assertIn("restoreCheckpoint", api_js)
+        self.assertIn("commitCheckpoint", api_js)
+
+    def test_theme_selector_and_css_tokens(self) -> None:
+        html = (COMPANION_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        tokens_css = (COMPANION_ROOT / "static" / "css" / "tokens.css").read_text(encoding="utf-8")
+        theme_js = (COMPANION_ROOT / "static" / "js" / "theme.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="theme-select"', html)
+        self.assertIn('class="sidebar-footer"', html)
+        for theme_id in ("midnight", "darcula", "nordic-slate", "light", "warm-paper", "espresso", "forest-night"):
+            self.assertIn(theme_id, theme_js)
+            if theme_id != "midnight":
+                self.assertIn(f'[data-theme="{theme_id}"]', tokens_css)
 
 
 if __name__ == "__main__":

@@ -177,6 +177,7 @@ async function retryLastTurn() {
     state.activeSession = res.session;
     state.messages = res.messages;
     state.pendingGates = res.pending_gates;
+    if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
     if (res.telemetry) emit("telemetry:updated", res.telemetry);
     emit("session:updated");
     emit("chat:loaded");
@@ -188,6 +189,7 @@ async function retryLastTurn() {
       state.activeSession = detail.session;
       state.messages = detail.messages || [];
       state.pendingGates = detail.pending_gates || [];
+      if (Array.isArray(detail.checkpoints)) state.checkpoints = detail.checkpoints;
     } catch {
       // keep existing view if refresh fails
     }
@@ -250,6 +252,7 @@ async function sendCurrentPrompt() {
     state.activeSession = res.session;
     state.messages = res.messages;
     state.pendingGates = res.pending_gates;
+    if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
     if (res.telemetry) emit("telemetry:updated", res.telemetry);
     emit("session:updated");
     emit("chat:loaded");
@@ -261,6 +264,7 @@ async function sendCurrentPrompt() {
       state.activeSession = detail.session;
       state.messages = detail.messages || [];
       state.pendingGates = detail.pending_gates || [];
+      if (Array.isArray(detail.checkpoints)) state.checkpoints = detail.checkpoints;
     } catch {
       // keep optimistic user prompt visible if session refresh fails
     }

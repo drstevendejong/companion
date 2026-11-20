@@ -1,7 +1,7 @@
 // tool_gates.js - Interactive approval gates for reads, diffs, and executable scripts
 
 import { api } from "./api.js";
-import { getTrailingToolBatchKey } from "./bridge.js";
+import { formatBridgeToolResults, getTrailingToolBatchKey } from "./bridge.js";
 import { emit, getActiveProject, on, state } from "./state.js";
 
 const gatesContainer = document.getElementById("pending-gates");
@@ -169,8 +169,14 @@ function renderPendingGates() {
         }
       }
     } else if (preview.category === "patch") {
+      const patchBtnLabel =
+        gate.tool_name === "delete_file"
+          ? "Delete File (Backup First)"
+          : gate.tool_name === "rename_file"
+            ? "Rename File (Backup First)"
+            : "Apply Patch (Backup First)";
       actions.appendChild(
-        makeBtn("Apply Patch (Backup First)", "btn btn-primary btn-sm", () =>
+        makeBtn(patchBtnLabel, "btn btn-primary btn-sm", () =>
           decideGate(gate.id, { action: "approve" })
         )
       );
@@ -183,6 +189,13 @@ function renderPendingGates() {
       actions.appendChild(
         makeBtn("Write & Run in Venv", "btn btn-primary btn-sm", () =>
           decideGate(gate.id, { action: "write_and_run" })
+        )
+      );
+    } else if (preview.category === "command") {
+      const runBtnLabel = preview.is_full_suite === false ? "Run Quick Check" : "Run Tests";
+      actions.appendChild(
+        makeBtn(runBtnLabel, "btn btn-primary btn-sm", () =>
+          decideGate(gate.id, { action: "approve" })
         )
       );
     }
@@ -217,13 +230,21 @@ async function decideGate(gateId, body) {
   if (state.busy) return;
   const remainingCount = Math.max(0, (state.pendingGates || []).length - 1);
   const gateObj = (state.pendingGates || []).find((g) => g.id === gateId);
-  const gatePath = (gateObj && gateObj.args && gateObj.args.path) || "";
+  const gatePath =
+    (gateObj && gateObj.args && (gateObj.args.path || gateObj.args.old_path || gateObj.args.target)) || "";
   const controller = new AbortController();
   state.activeAbortController = controller;
   state.busy = true;
   state.resolvingGateId = gateId;
   if (gateObj && gateObj.tool_name === "propose_script" && body.action === "write_and_run") {
     state.pendingStatusText = `Running proposed script${gatePath ? `: ${gatePath}` : ""}...`;
+  } else if (gateObj && gateObj.tool_name === "run_tests" && body.action === "approve") {
+    const cmd = (gateObj.preview && gateObj.preview.command) || "tests";
+    state.pendingStatusText = `Running ${gateObj.preview && gateObj.preview.is_full_suite === false ? "quick check" : "tests"}: ${cmd}...`;
+  } else if (gateObj && gateObj.tool_name === "delete_file" && body.action === "approve") {
+    state.pendingStatusText = `Deleting${gatePath ? ` ${gatePath}` : " file"} (backing up first)...`;
+  } else if (gateObj && gateObj.tool_name === "rename_file" && body.action === "approve") {
+    state.pendingStatusText = `Renaming${gatePath ? ` ${gatePath}` : " file"} (backing up first)...`;
   } else if (gateObj && ["patch_literal", "patch_lines", "write_file"].includes(gateObj.tool_name) && body.action === "approve") {
     state.pendingStatusText = `Applying patch${gatePath ? ` to ${gatePath}` : ""}...`;
   } else if (!state.apiEnabled) {
@@ -290,23 +311,29 @@ function applyGateResponse(res, actionHint) {
   state.activeSession = res.session;
   state.messages = res.messages;
   state.pendingGates = res.pending_gates || [];
+  if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
 
   if (res.patch_record) {
     emit("backups:refresh");
     emit("git:refresh");
+    emit("tree:refresh");
     const proj = getActiveProject();
-    if (proj && proj.post_patch_command && actionHint === "approve") {
+    if (proj && proj.post_patch_command && actionHint === "approve" && !res.command_result) {
       emit("terminal:suggest-post-tests", proj.post_patch_command);
     }
   }
   if (res.command_result) {
     emit("terminal:show-result", res.command_result);
   }
+  if (res.checkpoint_committed) {
+    emit("git:refresh");
+  }
 
   if (state.pendingGates.length === 0) {
     state.gatesHiddenDueToError = false;
   }
 
+  const gateErrors = Array.isArray(res.gate_errors) ? res.gate_errors : [];
   if (!state.apiEnabled && state.pendingGates.length === 0) {
     const trailing = extractTrailingToolEvents(res.messages || []);
     const batchKey = getTrailingToolBatchKey(res.messages || []);
@@ -339,6 +366,22 @@ function applyGateResponse(res, actionHint) {
           text: res.bridge_reply_text,
         });
       }
+    }
+  } else if (!state.apiEnabled && gateErrors.length > 0 && state.pendingGates.length > 0) {
+    const trailing = extractTrailingToolEvents(res.messages || []);
+    const batchKey = getTrailingToolBatchKey(res.messages || []);
+    const errorEvents = trailing.filter((ev) => ev.response && ev.response.error);
+    state.gatesHiddenDueToError = true;
+    state.lastErrorContext = {
+      sessionId: state.activeSessionId,
+      reasonText: gateErrors.join("; "),
+    };
+    const errPayload = res.error_reply_text || formatBridgeToolResults(errorEvents) || gateErrors.join("\n");
+    if (errPayload && batchKey) {
+      emit("bridge:auto-copy-result", {
+        key: batchKey,
+        text: errPayload,
+      });
     }
   } else {
     if (state.pendingGates.length === 0) {
@@ -380,6 +423,10 @@ async function recoverAfterGateError(err) {
       state.activeSession = detail.session;
       state.messages = detail.messages || [];
       state.pendingGates = detail.pending_gates || [];
+      if (Array.isArray(detail.checkpoints)) state.checkpoints = detail.checkpoints;
+      emit("backups:refresh");
+      emit("git:refresh");
+      emit("tree:refresh");
     } catch {
       // fallback if session reload also fails
     }

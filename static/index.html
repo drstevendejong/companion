@@ -4,6 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Gemini Vibe Companion</title>
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("companion.theme");
+        if (t) document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    })();
+  </script>
   <link rel="stylesheet" href="/static/css/tokens.css" />
   <link rel="stylesheet" href="/static/css/layout.css" />
   <link rel="stylesheet" href="/static/css/components.css" />
@@ -85,6 +93,11 @@
       <div id="bridge-sidebar-block" class="sidebar-block">
         <div class="field-label">Playground Bridge Active</div>
         <div class="meta-line" style="white-space:normal;">0 Gemini API calls or tokens can be spent. Copy bundles to AI Studio Playground and paste responses back for AST-checked diff gates.</div>
+      </div>
+
+      <div class="sidebar-footer">
+        <label class="field-label" for="theme-select">Theme</label>
+        <select id="theme-select" class="select-input theme-select" title="Switch UI color theme"></select>
       </div>
     </aside>
 
@@ -290,8 +303,11 @@
         </div>
       </div>
 
-      <label class="field-label mt-2">Post-Patch Test Command (Optional)</label>
+      <label class="field-label mt-2">Post-Patch Test Command (Optional — Full Suite)</label>
       <input id="proj-post-cmd" class="text-input mono" placeholder="python developer/tools/run_tests.py --silent" />
+
+      <label class="field-label mt-2">Quick Check Command (Optional — Used for fast/targeted checks; supports {target})</label>
+      <input id="proj-fast-cmd" class="text-input mono" placeholder="pytest -q {target}  (blank = auto py_compile / node --check / CSS/HTML check)" />
 
       <label class="field-label mt-2">Extra Ignore Globs (comma-separated)</label>
       <input id="proj-ignores" class="text-input mono" placeholder="*.log, tmp/" />

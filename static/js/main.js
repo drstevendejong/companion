@@ -10,9 +10,11 @@ import { initLayoutResizers } from "./layout.js";
 import { initLifecycle } from "./lifecycle.js";
 import { initSessions } from "./sessions.js";
 import { initSettings } from "./settings.js";
+import { initTheme } from "./theme.js";
 import { initToolGates } from "./tool_gates.js";
 
 async function bootstrap() {
+  initTheme();
   initLifecycle();
   initLayoutResizers();
   initChat();

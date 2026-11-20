@@ -240,10 +240,10 @@ class TestSearchGatePreviewAndPrompt(unittest.TestCase):
         )
         stubs["pydantic"] = pydantic_mod
 
-        saved = {k: sys.modules.get(k) for k in ("models", "services.gemini_client")}
+        saved = {k: sys.modules.get(k) for k in ("models", "services.gemini_client", "services.bridge")}
         try:
             with patch.dict(sys.modules, stubs, clear=False), tempfile.TemporaryDirectory() as tmp:
-                for k in ("models", "services.gemini_client"):
+                for k in ("models", "services.gemini_client", "services.bridge"):
                     sys.modules.pop(k, None)
                 (Path(tmp) / "core").mkdir()
                 (Path(tmp) / "core" / "a.py").write_text("Surveillance = 1\n", encoding="utf-8")
@@ -263,6 +263,25 @@ class TestSearchGatePreviewAndPrompt(unittest.TestCase):
                 self.assertIn("Directives", prompt_txt)
                 self.assertIn("propose_script", prompt_txt)
                 self.assertIn("PATCH the existing script", prompt_txt)
+
+                prompts_dir = COMPANION_ROOT / "static" / "prompts"
+                for fname in ("system_prompt.txt", "bridge_tool_contract.txt", "git_commit_prompt.txt"):
+                    self.assertTrue((prompts_dir / fname).is_file(), f"Missing external prompt: {fname}")
+
+                # Verify editing external prompt files takes effect dynamically without module reload
+                bridge = importlib.import_module("services.bridge")
+                custom_prompts = Path(tmp) / "prompts"
+                custom_prompts.mkdir()
+                (custom_prompts / "system_prompt.txt").write_text("CUSTOM SYSTEM PROMPT", encoding="utf-8")
+                (custom_prompts / "bridge_tool_contract.txt").write_text("CUSTOM BRIDGE CONTRACT", encoding="utf-8")
+                (custom_prompts / "git_commit_prompt.txt").write_text("DRAFT:\n{diff}", encoding="utf-8")
+                with patch.object(gemini_client, "PROMPTS_DIR", custom_prompts):
+                    proj_obj = SimpleNamespace(name="Demo", root_path=tmp, directives_path=None)
+                    self.assertIn("CUSTOM SYSTEM PROMPT", gemini_client.load_system_instruction(proj_obj))
+                    self.assertEqual(gemini_client.get_git_commit_prompt("diff --git a b"), "DRAFT:\ndiff --git a b")
+                    bundle = bridge.build_prompt_bundle(proj_obj, "Hello", [], include_directives=True)
+                    self.assertIn("CUSTOM SYSTEM PROMPT", bundle["bundle_text"])
+                    self.assertIn("CUSTOM BRIDGE CONTRACT", bundle["bundle_text"])
         finally:
             for k, orig in saved.items():
                 if orig is None:

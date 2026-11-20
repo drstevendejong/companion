@@ -115,7 +115,7 @@ async function loadDirectory(path) {
       listEl.appendChild(btn);
     }
   } catch (err) {
-    listEl.innerHTML = `<div class="meta-line" style="padding:8px;color:#fca5a5;">${escapeHtml(err.message)}</div>`;
+    listEl.innerHTML = `<div class="meta-line" style="padding:8px;color:var(--danger-text);">${escapeHtml(err.message)}</div>`;
   }
 }
 

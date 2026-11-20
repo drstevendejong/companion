@@ -21,17 +21,36 @@ from models import AttachmentItem, ProjectProfile
 from services import fs_tools
 from services.token_utils import estimate_tokens
 
-PLAYGROUND_TOOL_CONTRACT = """--- COMPANION BRIDGE TOOL CONTRACT ---
-To inspect files or propose edits for human-gated diff review and auto-backup, emit one or more ```json blocks containing tool action object(s) (or a JSON array of objects). All inspect/patch tools work generically on any UTF-8 text/code file type (Python, JS/TS, HTML/CSS, SQL, Go, Rust, config, etc.):
-- {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block", "new_text": "replacement", "summary": "1-line reason"}
+_FALLBACK_BRIDGE_TOOL_CONTRACT = """--- COMPANION BRIDGE TOOL CONTRACT ---
+STRICT OUTPUT RULES:
+1) Add a plain-English one-liner BEFORE every JSON command, preferably with an indication of progress (e.g., "Step 2/4: Patching IMAP client...").
+2) Generate AT MOST ONE ```json command block per message (if batching multiple actions, put them inside ONE JSON array `[...]` in that single ```json block).
+3) Generate all output ONCE ONLY—never repeat, duplicate, or echo prose or JSON blocks in the same reply.
+
+To inspect files or propose edits for human-gated diff review and auto-backup, emit a single ```json block containing a tool action object (or a JSON array of objects). All inspect/patch tools work generically on any UTF-8 text/code file type (Python, JS/TS, HTML/CSS, SQL, Go, Rust, config, etc.):
+- {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block", "new_text": "replacement", "summary": "1-line reason"} (returns nearest line-number + diff diagnostics if old_text mismatches)
 - {"tool": "patch_lines", "path": "path/to/file", "start_line": 10, "end_line": 20, "new_text": "replacement", "summary": "1-line reason"}
 - {"tool": "write_file", "path": "path/to/file", "content": "full file text", "summary": "1-line reason"}
 - {"tool": "propose_script", "path": "packer.py", "content": "python helper script text", "summary": "e.g. Pack target files into packed_context.md"}
-- {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (returns all matches across all text files & filenames; `ignore_case` defaults to `true`; optional `"path_glob": "*.{py,js,html}"` or `"src/**"`)
+- {"tool": "run_tests", "summary": "1-line reason"} (human-gated run of configured test suite; do NOT call on broken intermediate steps—only at the end of a complete edit batch)
+- {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
 - {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120}
 - {"tool": "read_file", "path": "path/to/file"}
 - {"tool": "list_tree", "subpath": ".", "max_depth": 3}
-Tip: When you need multiple files/fragments from disk, emit a `propose_script` (e.g. `packer.py`) that writes a clean `.md` bundle file so the user can run it locally in 1 click and paste the `.md` back."""
+
+Notes:
+- When you need multiple files/fragments from disk, emit a `propose_script` (e.g. `packer.py`) that writes a clean `.md` bundle file so the user can run it locally in 1 click and paste the `.md` back.
+- Git status, diff viewing, commit message drafting, Commit, and Commit & Push are triggered by the user in Companion's right-drawer Git tab (not via JSON tool calls)."""
+
+
+def get_playground_tool_contract() -> str:
+    """Returns the latest Playground Bridge tool contract from static/prompts/bridge_tool_contract.txt."""
+    from services.gemini_client import load_prompt_file
+
+    return load_prompt_file("bridge_tool_contract.txt", _FALLBACK_BRIDGE_TOOL_CONTRACT)
+
+
+PLAYGROUND_TOOL_CONTRACT = get_playground_tool_contract()
 
 KNOWN_TOOLS = {
     "list_tree",
@@ -41,7 +60,10 @@ KNOWN_TOOLS = {
     "patch_literal",
     "patch_lines",
     "write_file",
+    "delete_file",
+    "rename_file",
     "propose_script",
+    "run_tests",
 }
 
 KNOWN_TOOL_JSON_KEYS = {
@@ -51,6 +73,11 @@ KNOWN_TOOL_JSON_KEYS = {
     "action",
     "args",
     "path",
+    "old_path",
+    "new_path",
+    "from_path",
+    "to_path",
+    "overwrite",
     "subpath",
     "max_depth",
     "pattern",
@@ -71,6 +98,8 @@ KNOWN_TOOL_JSON_KEYS = {
     "replace",
     "encoding",
     "reason",
+    "fast",
+    "target",
 }
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -101,10 +130,10 @@ def build_prompt_bundle(
         ]
         sections.append("\n".join(header_lines))
 
-        from services.gemini_client import BASE_SYSTEM_PROMPT
+        from services.gemini_client import get_base_system_prompt
 
-        sections.append(BASE_SYSTEM_PROMPT.strip())
-        sections.append(PLAYGROUND_TOOL_CONTRACT.strip())
+        sections.append(get_base_system_prompt().strip())
+        sections.append(get_playground_tool_contract().strip())
 
         if project.directives_path:
             try:
@@ -148,12 +177,22 @@ def build_prompt_bundle(
     }
 
 
-def _extract_fenced_blocks(text: str) -> List[Dict[str, Any]]:
+def _extract_fenced_blocks(text: str, base_offset: int = 0) -> List[Dict[str, Any]]:
     """
     Stack-aware Markdown fenced-block extractor.
-    Handles nested fences such as ```` ```markdown ... ```` ```` containing inner ```json / ```python blocks.
+    Handles nested fences such as ```` ```markdown ... ```` ```` containing inner ```json / ```python blocks,
+    and records exact end_char offsets in the outer text for hard-stop truncation.
     """
-    lines = text.splitlines()
+    lines_keep = text.splitlines(keepends=True)
+    lines = [ln.rstrip("\r\n") for ln in lines_keep]
+    line_starts: List[int] = []
+    line_ends: List[int] = []
+    pos = 0
+    for ln_raw in lines_keep:
+        line_starts.append(pos)
+        pos += len(ln_raw)
+        line_ends.append(pos)
+
     blocks: List[Dict[str, Any]] = []
     i = 0
     n = len(lines)
@@ -188,16 +227,20 @@ def _extract_fenced_blocks(text: str) -> List[Dict[str, Any]]:
         content = "\n".join(body_lines)
         lang = info.split()[0] if info else ""
         if lang in ("markdown", "md") and ("```" in content or "~~~" in content):
-            # Recurse into markdown wrapper code blocks
-            inner = _extract_fenced_blocks(content)
+            body_start_char = line_ends[start_line]
+            inner_raw = "".join(lines_keep[start_line + 1 : j])
+            inner = _extract_fenced_blocks(inner_raw, base_offset=base_offset + body_start_char)
             blocks.extend(inner)
         else:
+            end_line_idx = j if closed else n - 1
             blocks.append(
                 {
                     "lang": lang,
                     "content": content,
                     "start_line": start_line,
-                    "end_line": j if closed else n - 1,
+                    "end_line": end_line_idx,
+                    "start_char": base_offset + line_starts[start_line],
+                    "end_char": base_offset + (line_ends[end_line_idx] if n > 0 else 0),
                     "heading_hint": "\n".join(lines[max(0, start_line - 3) : start_line]),
                 }
             )
@@ -536,10 +579,22 @@ def _extract_actions_from_json_text(raw_text: str) -> List[Dict[str, Any]]:
     return _extract_sloppy_json_actions(stripped)
 
 
-def _extract_inline_json_actions(text: str) -> List[Dict[str, Any]]:
-    """Fallback extractor for unfenced inline JSON tool calls (strict or sloppy) mixed with prose."""
+_HALLUCINATED_STOP_RE = re.compile(
+    r"(?m)^\s*(?:#{1,4}\s*Local Workspace Tool Results\b|Wait for output\b.*$)",
+    re.IGNORECASE,
+)
+
+
+def _strip_hallucinated_continuation(text: str) -> str:
+    m = _HALLUCINATED_STOP_RE.search(text)
+    if m:
+        return text[: m.start()].rstrip()
+    return text
+
+
+def _extract_inline_json_actions_with_end(text: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Fallback extractor for the FIRST unfenced inline JSON tool call block (strict or sloppy) mixed with prose."""
     decoder = json.JSONDecoder()
-    out: List[Dict[str, Any]] = []
     pos = 0
     n = len(text)
     while pos < n:
@@ -549,9 +604,7 @@ def _extract_inline_json_actions(text: str) -> List[Dict[str, Any]]:
                 obj, next_pos = decoder.raw_decode(text, pos)
                 found = _collect_actions_from_parsed_json(obj)
                 if found:
-                    out.extend(found)
-                    pos = next_pos
-                    continue
+                    return found, next_pos
             except json.JSONDecodeError:
                 window = text[pos : pos + 350]
                 if _INLINE_TOOL_HINT_RE.search(window):
@@ -561,13 +614,16 @@ def _extract_inline_json_actions(text: str) -> List[Dict[str, Any]]:
                             obj, _ = decoder.raw_decode(repaired, 0)
                             found = _collect_actions_from_parsed_json(obj)
                             if found:
-                                out.extend(found)
-                                pos = max(pos + 1, consumed_end)
-                                continue
+                                return found, max(pos + 1, consumed_end)
                         except json.JSONDecodeError:
                             pass
         pos += 1
-    return out
+    return [], None
+
+
+def _extract_inline_json_actions(text: str) -> List[Dict[str, Any]]:
+    actions, _ = _extract_inline_json_actions_with_end(text)
+    return actions
 
 
 def _infer_python_script_path(code: str, heading_hint: str, index: int) -> Tuple[str, bool]:
@@ -625,6 +681,9 @@ def parse_playground_markdown(raw_markdown: str) -> Dict[str, Any]:
     """
     Parses Playground output ("Copy as markdown", `.md` inside code block, or bare `json` / JSON copies)
     into prose_text + normalized Companion tool action requests.
+    Enforces a hard stop immediately after the first valid JSON command block so runaway model
+    hallucinations (e.g. "Wait for output", fake "## Local Workspace Tool Results", or extra blocks)
+    are truncated and ignored.
     """
     cleaned = (raw_markdown or "").strip()
     if not cleaned:
@@ -635,26 +694,31 @@ def parse_playground_markdown(raw_markdown: str) -> Dict[str, Any]:
     if outer_md:
         cleaned = outer_md.group(2).strip()
 
-    actions: List[Dict[str, Any]] = []
     # 1. Whole-payload raw JSON fallback (with or without standalone 'json' UI header line)
     deheadered = _strip_leading_json_header(cleaned)
     if deheadered.startswith("{") or deheadered.startswith("["):
-        direct_actions = _extract_actions_from_json_text(deheadered)
+        trimmed_raw = _strip_hallucinated_continuation(deheadered)
+        direct_actions = _extract_actions_from_json_text(trimmed_raw)
         if direct_actions:
             return {"prose_text": "", "actions": direct_actions}
 
-    # 2. Extract fenced blocks (including nested blocks inside ```markdown wrappers)
+    # 2. Extract fenced blocks and HARD-STOP at the end of the FIRST valid JSON command block
     blocks = _extract_fenced_blocks(cleaned)
     python_candidates: List[Dict[str, Any]] = []
 
-    for idx, blk in enumerate(blocks):
+    for blk in blocks:
         lang = blk["lang"]
         content = blk["content"]
         if lang in ("json", "jsonc", ""):
             found = _extract_actions_from_json_text(content)
             if found:
-                actions.extend(found)
-                continue
+                truncated_prose = _strip_hallucinated_continuation(
+                    cleaned[: blk["end_char"]].rstrip()
+                )
+                return {
+                    "prose_text": truncated_prose,
+                    "actions": found,
+                }
         if lang in ("python", "py"):
             inferred_path, explicit = _infer_python_script_path(
                 content, blk.get("heading_hint", ""), len(python_candidates)
@@ -667,47 +731,49 @@ def parse_playground_markdown(raw_markdown: str) -> Dict[str, Any]:
                         "content": content,
                         "summary": f"Python script parsed from Playground block ({inferred_path})",
                     },
+                    "end_char": blk["end_char"],
                     "explicit": explicit,
                 }
             )
 
-    if not actions:
-        if python_candidates:
-            actions.extend({"tool": c["tool"], "args": c["args"]} for c in python_candidates)
-        else:
-            inline_actions = _extract_inline_json_actions(cleaned)
-            if inline_actions:
-                actions.extend(inline_actions)
-            else:
-                m_py = _LEADING_PY_HEADER_RE.match(cleaned)
-                if m_py:
-                    py_body = m_py.group(1).strip()
-                    if _looks_like_python_script(py_body):
-                        inferred_path, _ = _infer_python_script_path(py_body, "", 0)
-                        actions.append(
-                            {
-                                "tool": "propose_script",
-                                "args": {
-                                    "path": inferred_path,
-                                    "content": py_body,
-                                    "summary": f"Python script parsed from Playground paste ({inferred_path})",
-                                },
-                            }
-                        )
-    else:
-        already_paths = {
-            str(a["args"].get("path", "")).lstrip("/")
-            for a in actions
-            if a["tool"] in ("propose_script", "write_file")
+    # 3. Fallback: inline unfenced JSON (stopping after first JSON block), else standalone python block
+    cleaned_pre_hallucination = _strip_hallucinated_continuation(cleaned)
+    inline_actions, inline_end = _extract_inline_json_actions_with_end(cleaned_pre_hallucination)
+    if inline_actions and inline_end is not None:
+        return {
+            "prose_text": cleaned_pre_hallucination[:inline_end].rstrip(),
+            "actions": inline_actions,
         }
-        for c in python_candidates:
-            p = str(c["args"].get("path", "")).lstrip("/")
-            if c["explicit"] and p not in already_paths:
-                actions.append({"tool": c["tool"], "args": c["args"]})
+
+    if python_candidates:
+        first_py = python_candidates[0]
+        return {
+            "prose_text": _strip_hallucinated_continuation(cleaned[: first_py["end_char"]].rstrip()),
+            "actions": [{"tool": c["tool"], "args": c["args"]} for c in python_candidates],
+        }
+
+    m_py = _LEADING_PY_HEADER_RE.match(cleaned_pre_hallucination)
+    if m_py:
+        py_body = m_py.group(1).strip()
+        if _looks_like_python_script(py_body):
+            inferred_path, _ = _infer_python_script_path(py_body, "", 0)
+            return {
+                "prose_text": cleaned_pre_hallucination,
+                "actions": [
+                    {
+                        "tool": "propose_script",
+                        "args": {
+                            "path": inferred_path,
+                            "content": py_body,
+                            "summary": f"Python script parsed from Playground paste ({inferred_path})",
+                        },
+                    }
+                ],
+            }
 
     return {
-        "prose_text": cleaned,
-        "actions": actions,
+        "prose_text": cleaned_pre_hallucination,
+        "actions": [],
     }
 
 
@@ -751,6 +817,67 @@ def format_trailing_tool_events(messages: List[Any], *, errors_only: bool = Fals
     return format_bridge_tool_results(trailing_events)
 
 
+_FAILURE_LINE_RE = re.compile(
+    r"(?:^\s*\[?\s*(?:ERROR|FAIL|FAILED|FATAL|CRITICAL|PANIC)\s*\]?(?:[:\s-]|$)"
+    r"|^\s*(?:={12,}|--- FAIL:|E\s{2,}\S|[✖✗✘×❌]\s)"
+    r"|\b(?:Traceback \(most recent call last\):|(?:Assertion|Syntax|Type|Reference|Value|Key|Attribute|Import|ModuleNotFound|Runtime|Name|Index|Indentation|ZeroDivision|OSError|FileNotFound|Permission)Error\b)"
+    r"|(?::\d+(?::\d+)?|\(\d+(?:,\s*\d+)?\)):\s*(?:error|fatal)\b"
+    r"|\berror(?:\[E\d+\]|\s+TS\d+):"
+    r"|\b[1-9]\d*\s+(?:failed|errors?|failures?)\b)",
+    re.IGNORECASE,
+)
+
+
+def extract_failure_excerpt(raw_output: str, max_chars: int = 3500) -> str:
+    """Extracts high-signal error/traceback windows (or tail fallback) from arbitrary command output."""
+    text = (raw_output or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+
+    lines = text.splitlines()
+    ranges: List[Tuple[int, int]] = []
+    n = len(lines)
+    for idx, line in enumerate(lines):
+        if _FAILURE_LINE_RE.search(line):
+            start = max(0, idx - 1)
+            end = min(n, idx + 11)
+            if ranges and start <= ranges[-1][1] + 1:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+            else:
+                ranges.append((start, end))
+
+    if ranges:
+        # Include tail summary too if not covered by last window
+        tail_start = max(0, n - 8)
+        if tail_start > ranges[-1][1] + 1:
+            ranges.append((tail_start, n))
+        elif tail_start <= ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], n)
+
+        chunks: List[str] = []
+        total_len = 0
+        for s_idx, e_idx in ranges:
+            block = "\n".join(lines[s_idx:e_idx])
+            sep = "\n...\n" if chunks else ""
+            if total_len + len(sep) + len(block) > max_chars:
+                remaining = max_chars - total_len - len(sep)
+                if remaining > 120:
+                    chunks.append(sep + block[:remaining] + "\n...[truncated]")
+                break
+            chunks.append(sep + block)
+            total_len += len(sep) + len(block)
+        out = "".join(chunks).strip()
+        if out:
+            return out
+
+    tail = "\n".join(lines[-50:])
+    if len(tail) > max_chars:
+        tail = "...[truncated]\n" + tail[-max_chars:]
+    return tail
+
+
 def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
     """Formats executed local gate results and errors cleanly as Markdown to paste back to Playground."""
     if not tool_events:
@@ -780,13 +907,34 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
             )
         elif resp.get("applied"):
             blocks.append(f"- **{name}**: Patch applied to `{resp.get('path')}` (backup: `{resp.get('backup_path')}`)")
+        elif resp.get("deleted"):
+            blocks.append(f"- **{name}**: Deleted `{resp.get('path')}` (backup: `{resp.get('backup_path')}`)")
+        elif resp.get("renamed"):
+            blocks.append(
+                f"- **{name}**: Renamed `{resp.get('old_path')}` → `{resp.get('new_path')}` (backup: `{resp.get('backup_path')}`)"
+            )
         elif resp.get("written"):
             if resp.get("executed"):
-                blocks.append(
-                    f"- **{name}**: Wrote `{resp.get('path')}` and executed (exit code `{resp.get('exit_code')}`)."
-                )
+                line = f"- **{name}**: Wrote `{resp.get('path')}` and executed (exit code `{resp.get('exit_code')}`)."
+                preview = (resp.get("output_preview") or "").strip()
+                if (resp.get("exit_code", 0) != 0 or resp.get("has_traceback")) and preview:
+                    line += f"\n```text\n{preview}\n```"
+                blocks.append(line)
             else:
                 blocks.append(f"- **{name}**: Wrote `{resp.get('path')}` to disk.")
+        elif name == "run_tests":
+            cmd = resp.get("command", "tests")
+            code = resp.get("exit_code", "?")
+            passed = bool(resp.get("passed")) and code == 0 and not resp.get("has_traceback")
+            status_lbl = "PASSED" if passed else "FAILED"
+            scope_note = ""
+            if resp.get("is_full_suite") is False:
+                scope_note = " (quick/targeted check — savepoint stays active)"
+            line = f"- **run_tests** (`{cmd}`): **{status_lbl}** (exit code `{code}`){scope_note}."
+            preview = (resp.get("output_preview") or "").strip()
+            if preview:
+                line += f"\n```text\n{preview}\n```"
+            blocks.append(line)
         else:
             blocks.append(f"### `{name}`\n```json\n{json.dumps(resp, indent=2)}\n```")
     return "\n\n".join(blocks).strip()

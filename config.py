@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import FrozenSet, List, Tuple
 
 APP_ROOT: Path = Path(__file__).resolve().parent
+PROMPTS_DIR: Path = APP_ROOT / "static" / "prompts"
 DATA_DIR: Path = Path(os.environ.get("COMPANION_DATA_DIR", str(APP_ROOT / "data")))
 DB_PATH: Path = DATA_DIR / "companion.db"
 GEMINI_KEY_PATH: Path = DATA_DIR / "gemini_key.json"
@@ -60,3 +61,8 @@ BACKUP_MAX_AGE_DAYS: int = 7
 BACKUP_MAX_BYTES: int = 20 * 1024 * 1024
 BACKUP_MIN_KEEP: int = 3
 
+CHECKPOINT_MAX_KEEP: int = 5
+CHECKPOINT_MAX_AGE_DAYS: int = 7
+CHECKPOINT_MAX_BYTES: int = 80 * 1024 * 1024
+CHECKPOINT_MAX_FILE_BYTES: int = 10 * 1024 * 1024
+CHECKPOINT_MAX_SNAPSHOT_BYTES: int = 100 * 1024 * 1024

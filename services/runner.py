@@ -10,7 +10,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import COMMAND_TIMEOUT_SECONDS, MAX_COMMAND_OUTPUT_CHARS
 from services.token_utils import estimate_tokens
@@ -88,4 +88,161 @@ async def run_project_command(
         "output": output,
         "truncated": truncated,
         "estimated_tokens": estimate_tokens(output),
+    }
+
+
+def _quick_check_command_for_target(
+    rel_posix: str,
+    suffix: str,
+    post_cmd: str,
+    fast_cmd: str,
+    *,
+    fast: bool,
+) -> Optional[Tuple[str, str]]:
+    """Builds a safe quick-check or targeted-test command for a verified relative path."""
+    import shlex as _shlex
+
+    q = _shlex.quote(rel_posix)
+    fname = Path(rel_posix).name.lower()
+    is_py_test = suffix == ".py" and (fname.startswith("test_") or fname.endswith("_test.py"))
+
+    if fast_cmd and "{target}" in fast_cmd:
+        return fast_cmd.replace("{target}", q), f"Quick check template for {rel_posix}"
+
+    if suffix == ".py":
+        if is_py_test and not fast:
+            lower_post = post_cmd.lower()
+            if "pytest" in lower_post:
+                prefix = "python -m pytest" if "-m pytest" in lower_post else "pytest"
+                return f"{prefix} {q}", f"Targeted pytest run for {rel_posix}"
+            if "unittest" in lower_post:
+                return f"python -m unittest {q} -v", f"Targeted unittest run for {rel_posix}"
+        return f"python -m py_compile {q}", f"Python syntax/compile check for {rel_posix}"
+
+    if suffix in (".js", ".mjs", ".cjs"):
+        return f"node --check {q}", f"JavaScript syntax check for {rel_posix}"
+
+    if suffix == ".json":
+        code = (
+            "import json, sys; "
+            "json.load(open(sys.argv[1], encoding='utf-8')); "
+            "print('JSON OK:', sys.argv[1])"
+        )
+        return f"python -c {_shlex.quote(code)} {q}", f"JSON syntax check for {rel_posix}"
+
+    if suffix in (".html", ".htm"):
+        code = (
+            "import sys; from html.parser import HTMLParser; "
+            "p = HTMLParser(); "
+            "p.feed(open(sys.argv[1], encoding='utf-8').read()); p.close(); "
+            "print('HTML OK:', sys.argv[1])"
+        )
+        return f"python -c {_shlex.quote(code)} {q}", f"HTML parse check for {rel_posix}"
+
+    if suffix == ".css":
+        code = (
+            "import sys; txt = open(sys.argv[1], encoding='utf-8').read(); "
+            "d = 0\n"
+            "for ch in txt:\n"
+            "  d += (ch == '{') - (ch == '}')\n"
+            "  if d < 0: raise SystemExit('Unmatched } in ' + sys.argv[1])\n"
+            "if d != 0: raise SystemExit('Unclosed { in ' + sys.argv[1])\n"
+            "print('CSS OK:', sys.argv[1])"
+        )
+        return f"python -c {_shlex.quote(code)} {q}", f"CSS brace/UTF-8 check for {rel_posix}"
+
+    return None
+
+
+def resolve_test_command(
+    project: Any,
+    *,
+    fast: bool = False,
+    target: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Resolves the exact human-gated command for run_tests.
+    - Default (fast=False, target=None): runs full project.post_patch_command (auto-commits checkpoint on pass).
+    - Targeted or fast: runs project.fast_test_command or safe per-file check (keeps checkpoint active).
+    """
+    from services.fs_tools import resolve_safe_path
+
+    post_cmd = (getattr(project, "post_patch_command", None) or "").strip()
+    fast_cmd = (getattr(project, "fast_test_command", None) or "").strip()
+    raw_target = (target or "").strip()
+
+    if raw_target:
+        if raw_target.startswith("-"):
+            raise ValueError(f"Invalid test target path: {raw_target}")
+        root = Path(project.root_path).resolve()
+        target_abs = resolve_safe_path(root, raw_target)
+        if not target_abs.exists():
+            raise FileNotFoundError(f"Test target not found: {raw_target}")
+        rel_posix = target_abs.relative_to(root).as_posix()
+
+        resolved = None
+        if target_abs.is_file():
+            resolved = _quick_check_command_for_target(
+                rel_posix,
+                target_abs.suffix.lower(),
+                post_cmd,
+                fast_cmd,
+                fast=bool(fast),
+            )
+        if resolved is not None:
+            cmd, note = resolved
+            return {
+                "command": cmd,
+                "is_full_suite": False,
+                "mode": "targeted",
+                "target": rel_posix,
+                "note": note,
+            }
+
+        if fast_cmd:
+            return {
+                "command": fast_cmd.replace("{target}", rel_posix),
+                "is_full_suite": False,
+                "mode": "fast",
+                "target": rel_posix,
+                "note": f"Quick check command for {rel_posix}",
+            }
+        if post_cmd:
+            return {
+                "command": post_cmd,
+                "is_full_suite": False,
+                "mode": "targeted",
+                "target": rel_posix,
+                "note": f"Fallback to Post-Patch command (savepoint stays active for targeted check of {rel_posix})",
+            }
+        raise ValueError("No Quick Check Command or Post-Patch Test Command configured for this target.")
+
+    if fast:
+        if fast_cmd:
+            return {
+                "command": fast_cmd.replace("{target}", ".").strip(),
+                "is_full_suite": False,
+                "mode": "fast",
+                "target": None,
+                "note": "Configured Quick Check Command (savepoint stays active until full run_tests passes)",
+            }
+        if post_cmd:
+            return {
+                "command": post_cmd,
+                "is_full_suite": False,
+                "mode": "fast",
+                "target": None,
+                "note": "No Quick Check Command configured; running Post-Patch command (savepoint stays active because fast=true)",
+            }
+        raise ValueError("No Quick Check Command or Post-Patch Test Command is configured for this project.")
+
+    if not post_cmd:
+        raise ValueError("No Post-Patch Test Command is configured for this project.")
+
+    return {
+        "command": post_cmd,
+        "is_full_suite": True,
+        "mode": "full",
+        "target": None,
+        "note": "Full test suite (auto-commits active savepoint if all tests pass)",
     }
