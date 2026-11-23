@@ -7,9 +7,22 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 from config import GEMINI_KEY_PATH
+
+
+def has_configured_api_key(gemini: Any) -> bool:
+    """Returns True if a GeminiGateway has a client factory (tests) or a saved/env API key."""
+    if gemini is None:
+        return False
+    if getattr(gemini, "_client_factory", None) is not None:
+        return True
+    try:
+        api_key, _ = load_api_key(gemini.key_path)
+        return bool(api_key)
+    except RuntimeError:
+        return False
 
 
 def load_api_key(key_path: Path = GEMINI_KEY_PATH) -> Tuple[str, str]:

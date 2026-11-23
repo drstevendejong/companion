@@ -14,12 +14,19 @@ To inspect files or propose edits for human-gated diff review and auto-backup, e
 - {"tool": "propose_script", "path": "packer.py", "content": "python helper script text", "summary": "e.g. Pack target files into packed_context.md"} (optional `"delete_on_success": true` for one-shot inspection scripts)
 - {"tool": "run_script", "path": "packer.py", "summary": "1-line reason"} (human-gated run of an existing/patched .py script in project Python; optional `"args": "--flag"`)
 - {"tool": "run_and_delete_script", "path": "probe.py", "summary": "1-line reason"} (human-gated run of an inspection/temporary .py script; automatically deletes the script if exit code is 0 with no traceback, or keeps it on error so you can patch & re-run; optional `"args": "--flag"`)
-- {"tool": "run_tests", "summary": "1-line reason"} (human-gated full suite — auto-commits savepoint on pass; optional `"fast": true` and/or `"target": "path/to/file"` runs a quick single-file/targeted check without committing the savepoint; never call on broken intermediate steps)
+- {"tool": "run_tests", "summary": "1-line reason"} (human-gated full suite — auto-commits savepoint on pass; optional `"fast": true`, `"target": "path/to/file"`, and `"focus": "question"` when Scout is enabled; never call on broken intermediate steps)
+- {"tool": "extract_headers", "pattern": ".", "include_symbols": true, "max_files": 60} (0-token structural index of file header comments & top-level classes/functions)
 - {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
 - {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120}
 - {"tool": "read_file", "path": "path/to/file"}
+- {"tool": "read_command_output", "exec_id": "cmd_...", "start_line": 1, "end_line": 120} (inspect raw stdout/stderr from a buffered command; optional `"pattern"` or `"tail_lines"`, omit `exec_id` for latest)
 - {"tool": "list_tree", "subpath": ".", "max_depth": 3}
 
+Scout-Only Tools (call ONLY when Companion announces `Local AI Scout is NOW ENABLED`):
+- {"tool": "scout_workspace", "goal": "Trace how X reaches Y", "subpath": ".", "max_steps": 8} (human-gated multi-step read-only investigation via lightweight local AI)
+- {"tool": "update_header", "paths": ["path/to/file1", "path/to/file2"]} (uses Scout to draft updated top-of-file header comments as human-gated diff patches)
+
 Notes:
-- When you need multiple files/fragments from disk, emit a `propose_script` (e.g. `packer.py`) that writes a clean `.md` bundle file or prints stdout directly (Companion captures stdout on exit 0 as well as errors). For temporary inspection scripts, set `"delete_on_success": true` or—if you patch a failing script—call `run_and_delete_script` to run and automatically delete it once it succeeds.
+- When you need multiple files/fragments from disk, emit `extract_headers`, `scout_workspace` (if enabled), or a `propose_script` (e.g. `packer.py`) that prints stdout directly (Companion captures stdout on exit 0 as well as errors). For temporary inspection scripts, set `"delete_on_success": true` or—if you patch a failing script—call `run_and_delete_script` to run and automatically delete it once it succeeds.
+- Command results include an `exec_id`; if output was summarized, call `read_command_output` to inspect exact raw lines.
 - Git status, diff viewing, commit message drafting, Commit, and Commit & Push are triggered by the user in Companion's right-drawer Git tab (not via JSON tool calls).

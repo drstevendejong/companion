@@ -9,6 +9,7 @@ const filesList = document.getElementById("git-files-list");
 const msgInput = document.getElementById("git-message-input");
 const resultLabel = document.getElementById("git-result");
 const draftBtn = document.getElementById("btn-git-draft");
+const updateHeadersBtn = document.getElementById("btn-git-update-headers");
 const copyDiffBtn = document.getElementById("btn-git-copy-diff");
 const commitBtn = document.getElementById("btn-git-commit");
 const pushBtn = document.getElementById("btn-git-commit-push");
@@ -16,12 +17,41 @@ const pushBtn = document.getElementById("btn-git-commit-push");
 export function initGit() {
   document.getElementById("btn-git-refresh").addEventListener("click", refreshGitStatus);
   draftBtn.addEventListener("click", draftMessage);
+  if (updateHeadersBtn) {
+    updateHeadersBtn.addEventListener("click", updateChangedHeaders);
+  }
   copyDiffBtn.addEventListener("click", copyDiffForPlayground);
   commitBtn.addEventListener("click", () => commitChanges(false));
   pushBtn.addEventListener("click", () => commitChanges(true));
 
-  on("project:changed", refreshGitStatus);
+  on("project:changed", () => {
+    syncGitActionButtons();
+    refreshGitStatus();
+  });
   on("git:refresh", refreshGitStatus);
+  on("scout:changed", syncGitActionButtons);
+  on("app:mode-changed", syncGitActionButtons);
+  on("settings:key-changed", syncGitActionButtons);
+
+  syncGitActionButtons();
+}
+
+function getDraftButtonIdleLabel() {
+  return state.scout && state.scout.enabled ? "Draft with Scout" : "Draft with Gemini";
+}
+
+function syncGitActionButtons() {
+  const canDraft = Boolean(state.apiEnabled || state.hasApiKey);
+  const scoutOn = Boolean(state.scout && state.scout.enabled);
+  if (draftBtn) {
+    draftBtn.classList.toggle("hidden", !canDraft);
+    if (!draftBtn.disabled) {
+      draftBtn.textContent = getDraftButtonIdleLabel();
+    }
+  }
+  if (updateHeadersBtn) {
+    updateHeadersBtn.classList.toggle("hidden", !scoutOn);
+  }
 }
 
 export async function refreshGitStatus() {
@@ -58,20 +88,52 @@ export async function refreshGitStatus() {
 async function draftMessage() {
   const proj = getActiveProject();
   if (!proj) return;
+  const useScout = Boolean((state.scout && state.scout.enabled) || !state.apiEnabled);
   draftBtn.disabled = true;
   draftBtn.textContent = "Drafting...";
   resultLabel.textContent = "";
   try {
     const model = (state.activeSession && state.activeSession.model) || "gemini-4-hydrogen";
-    const res = await api.gitDraftMessage(proj.id, model);
+    const res = await api.gitDraftMessage(proj.id, model, useScout);
     msgInput.value = res.message;
-    resultLabel.textContent = `Drafted from ~${res.diff_tokens} diff tokens`;
+    const modelNote = res.model_used ? ` via ${res.model_used}` : "";
+    resultLabel.textContent = `Drafted${modelNote} from ~${res.diff_tokens} diff tokens`;
     if (res.telemetry) emit("telemetry:updated", res.telemetry);
   } catch (err) {
     resultLabel.textContent = err.message;
   } finally {
     draftBtn.disabled = false;
-    draftBtn.textContent = "Draft with Gemini";
+    draftBtn.textContent = getDraftButtonIdleLabel();
+  }
+}
+
+async function updateChangedHeaders() {
+  const proj = getActiveProject();
+  if (!proj || !updateHeadersBtn) return;
+  updateHeadersBtn.disabled = true;
+  updateHeadersBtn.textContent = "Scanning...";
+  resultLabel.textContent = "";
+  try {
+    const res = await api.gitUpdateHeaders({
+      project_id: proj.id,
+      session_id: state.activeSessionId || null,
+    });
+    if (Array.isArray(res.pending_gates) && res.pending_gates.length > 0) {
+      state.pendingGates = res.pending_gates;
+      state.gatesHiddenDueToError = false;
+      emit("gates:changed");
+      resultLabel.textContent = `Staged ${res.staged_count} header diff gate(s) for review.`;
+    } else if (res.staged_count === 0) {
+      resultLabel.textContent = "All modified headers already match.";
+    } else {
+      resultLabel.textContent = `Drafted ${res.staged_count} header update(s). Select a session to stage review gates.`;
+    }
+    if (res.telemetry) emit("telemetry:updated", res.telemetry);
+  } catch (err) {
+    resultLabel.textContent = err.message;
+  } finally {
+    updateHeadersBtn.disabled = false;
+    updateHeadersBtn.textContent = "Update Headers";
   }
 }
 

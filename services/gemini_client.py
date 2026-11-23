@@ -16,11 +16,19 @@ from google.genai import types
 
 from config import GEMINI_KEY_PATH, PROMPTS_DIR
 from models import AttachmentItem, ProjectProfile, SessionInfo, TokenStats
-from services import fs_tools, key_store, model_catalog, patch_tools
+from services import fs_tools, key_store, model_catalog, output_buffer, patch_tools
 from services.token_utils import estimate_tokens
 
 
-READ_ONLY_TOOLS = {"list_tree", "search_code", "read_lines", "read_file"}
+READ_ONLY_TOOLS = {
+    "list_tree",
+    "extract_headers",
+    "search_code",
+    "read_lines",
+    "read_file",
+    "read_command_output",
+}
+SCOUT_TOOLS = {"scout_workspace", "update_header"}
 PATCH_TOOLS = {"patch_literal", "patch_lines", "write_file", "delete_file", "rename_file"}
 SCRIPT_TOOLS = {"propose_script"}
 COMMAND_TOOLS = {"run_tests", "run_script", "run_and_delete_script"}
@@ -85,8 +93,18 @@ def get_git_commit_prompt(diff_text: str) -> str:
 BASE_SYSTEM_PROMPT = get_base_system_prompt()
 
 
-def build_tool_declarations() -> types.Tool:
+def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
     """Declares workspace tools for Gemini function calling."""
+    focus_schema = (
+        {
+            "focus": types.Schema(
+                type=types.Type.STRING,
+                description="Optional question/focus for the Local AI Scout to extract from command stdout/stderr when summarizing large or diagnostic output.",
+            )
+        }
+        if scout_enabled
+        else {}
+    )
     decls = [
         types.FunctionDeclaration(
             name="list_tree",
@@ -96,6 +114,18 @@ def build_tool_declarations() -> types.Tool:
                 properties={
                     "subpath": types.Schema(type=types.Type.STRING, description="Relative directory path, default '.'"),
                     "max_depth": types.Schema(type=types.Type.INTEGER, description="Recursion depth (1-5), default 3"),
+                },
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="extract_headers",
+            description="Extract top-of-file header docstrings/comments and top-level symbols across files matching a path/glob (0 AI tokens; fast structural index).",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "pattern": types.Schema(type=types.Type.STRING, description="Glob or directory/file pattern, e.g. 'src/**/*.py', '*.js', or '.'"),
+                    "include_symbols": types.Schema(type=types.Type.BOOLEAN, description="Include top-level class/function names (default true)"),
+                    "max_files": types.Schema(type=types.Type.INTEGER, description="Max files to inspect (default 60)"),
                 },
             ),
         ),
@@ -139,6 +169,20 @@ def build_tool_declarations() -> types.Tool:
                     "path": types.Schema(type=types.Type.STRING, description="Relative path inside project"),
                 },
                 required=["path"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="read_command_output",
+            description="Read raw lines or grep-search inside a previously recorded command output buffer (`exec_id`) when a summarized test/script output needs full details.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "exec_id": types.Schema(type=types.Type.STRING, description="Optional command execution ID (defaults to most recent command output)"),
+                    "start_line": types.Schema(type=types.Type.INTEGER, description="1-based start line"),
+                    "end_line": types.Schema(type=types.Type.INTEGER, description="1-based end line"),
+                    "pattern": types.Schema(type=types.Type.STRING, description="Optional case-insensitive filter pattern inside output"),
+                    "tail_lines": types.Schema(type=types.Type.INTEGER, description="Optional number of trailing lines to return when start/end omitted"),
+                },
             ),
         ),
         types.FunctionDeclaration(
@@ -220,6 +264,7 @@ def build_tool_declarations() -> types.Tool:
                     "content": types.Schema(type=types.Type.STRING, description="Executable Python script content"),
                     "delete_on_success": types.Schema(type=types.Type.BOOLEAN, description="Optional: auto-delete script once it exits cleanly (0 with no traceback); keeps on error for patching"),
                     "summary": types.Schema(type=types.Type.STRING, description="What this script checks or modifies"),
+                    **focus_schema,
                 },
                 required=["path", "content"],
             ),
@@ -233,6 +278,7 @@ def build_tool_declarations() -> types.Tool:
                     "path": types.Schema(type=types.Type.STRING, description="Relative path to Python script inside project"),
                     "args": types.Schema(type=types.Type.STRING, description="Optional CLI arguments string to pass to the script"),
                     "summary": types.Schema(type=types.Type.STRING, description="Brief note on what running this script checks or performs"),
+                    **focus_schema,
                 },
                 required=["path"],
             ),
@@ -246,6 +292,7 @@ def build_tool_declarations() -> types.Tool:
                     "path": types.Schema(type=types.Type.STRING, description="Relative path to temporary/inspection Python script inside project"),
                     "args": types.Schema(type=types.Type.STRING, description="Optional CLI arguments string to pass to the script"),
                     "summary": types.Schema(type=types.Type.STRING, description="Brief note on what this inspection script checks before cleanup"),
+                    **focus_schema,
                 },
                 required=["path"],
             ),
@@ -259,16 +306,58 @@ def build_tool_declarations() -> types.Tool:
                     "fast": types.Schema(type=types.Type.BOOLEAN, description="Optional fast/quick-check mode (keeps active savepoint open until full run_tests passes)"),
                     "target": types.Schema(type=types.Type.STRING, description="Optional relative file path for quick syntax/targeted test check"),
                     "summary": types.Schema(type=types.Type.STRING, description="Brief note on what this check verifies"),
+                    **focus_schema,
                 },
             ),
         ),
     ]
+    if scout_enabled:
+        decls.extend(
+            [
+                types.FunctionDeclaration(
+                    name="scout_workspace",
+                    description="Delegate an iterative read-only codebase search/trace to the Local AI Scout (uses lightweight -lite model with stateless ephemeral history). Ideal for tracing call paths, finding references across files, or answering investigative questions in one turn.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "goal": types.Schema(type=types.Type.STRING, description="Clear question or investigation goal for the Scout"),
+                            "subpath": types.Schema(type=types.Type.STRING, description="Optional relative folder to prioritize (default '.')"),
+                            "max_steps": types.Schema(type=types.Type.INTEGER, description="Optional max read iterations (1-8, default 8)"),
+                        },
+                        required=["goal"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name="update_header",
+                    description="Use Local AI Scout to draft updated top-of-file header comments/docstrings matching current implementation for the specified file(s), staged as human-gated diff patches.",
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "paths": types.Schema(
+                                type=types.Type.ARRAY,
+                                items=types.Schema(type=types.Type.STRING),
+                                description="List of relative file paths to inspect and draft header updates for",
+                            ),
+                        },
+                        required=["paths"],
+                    ),
+                ),
+            ]
+        )
     return types.Tool(function_declarations=decls)
 
 
-def load_system_instruction(project: ProjectProfile) -> str:
+def load_system_instruction(project: ProjectProfile, scout_enabled: bool = False) -> str:
     """Builds system instruction combining externalized system_prompt.txt + optional project Directives .md."""
     parts = [get_base_system_prompt()]
+    if scout_enabled:
+        parts.append(
+            "\n[LOCAL AI SCOUT: ENABLED] You have `scout_workspace` (delegated multi-step read-only investigation), `update_header` (human-gated header comment updates), and optional `\"focus\"` on `run_tests`/`run_script`/`run_and_delete_script`/`propose_script`. Always use `extract_headers` for fast 0-token structural overviews first."
+        )
+    else:
+        parts.append(
+            "\n[LOCAL AI SCOUT: OFF] Do NOT call `scout_workspace` or `update_header`. Use `extract_headers` (0-token) + batched `search_code`/`read_lines`, or `read_command_output` for command output."
+        )
     if project.directives_path:
         try:
             dpath = fs_tools.resolve_safe_path(project.root_path, project.directives_path)
@@ -328,6 +417,25 @@ def prepare_tool_gate_preview(
             "title": f"List Tree: {sub}",
             "estimated_tokens": res["estimated_tokens"],
             "detail": f"Depth {depth} · {len(res['entries'])} entries",
+            "prepared_result": res,
+        }
+
+    if tool_name == "extract_headers":
+        pattern = str(args.get("pattern") or args.get("subpath") or ".")
+        include_symbols = bool(args.get("include_symbols", True))
+        max_files = int(args.get("max_files", 60) or 60)
+        res = fs_tools.extract_headers(
+            root,
+            pattern=pattern,
+            include_symbols=include_symbols,
+            max_files=max_files,
+            extra_ignores=ignores,
+        )
+        return {
+            "category": "read",
+            "title": f"Extract Headers: {pattern}",
+            "estimated_tokens": res["estimated_tokens"],
+            "detail": f"{res['file_count']} files · {res['header_count']} headers",
             "prepared_result": res,
         }
 
@@ -403,6 +511,65 @@ def prepare_tool_gate_preview(
             "end_line": res["total_lines"],
             "total_lines": res["total_lines"],
             "prepared_result": res,
+        }
+
+    if tool_name == "read_command_output":
+        exec_id = str(args.get("exec_id") or "").strip() or None
+        s_line = int(args["start_line"]) if args.get("start_line") is not None else None
+        e_line = int(args["end_line"]) if args.get("end_line") is not None else None
+        pat = str(args.get("pattern") or "").strip() or None
+        t_lines = int(args["tail_lines"]) if args.get("tail_lines") is not None else None
+        res = output_buffer.read_command_output(
+            exec_id=exec_id,
+            start_line=s_line,
+            end_line=e_line,
+            pattern=pat,
+            tail_lines=t_lines,
+        )
+        return {
+            "category": "read",
+            "title": f"Read Command Output: {res.get('exec_id') or exec_id or 'latest'}",
+            "estimated_tokens": int(res.get("estimated_tokens") or 0),
+            "detail": (
+                f"{res.get('total_lines', 0)} total lines · mode {res.get('mode', 'range')}"
+                if res.get("found")
+                else str(res.get("error") or "Output buffer empty")
+            ),
+            "prepared_result": res,
+        }
+
+    if tool_name == "scout_workspace":
+        goal = str(args.get("goal") or args.get("prompt") or "").strip()
+        if not goal:
+            raise ValueError("scout_workspace requires 'goal'.")
+        subpath = str(args.get("subpath") or ".").strip() or "."
+        max_steps = max(1, min(8, int(args.get("max_steps") or 8)))
+        return {
+            "category": "scout",
+            "title": f"AI Scout: {goal[:72]}",
+            "summary": goal,
+            "detail": f"Scope: {subpath} · Up to {max_steps} ephemeral read steps (stateless -lite model; never writes disk)",
+            "goal": goal,
+            "subpath": subpath,
+            "max_steps": max_steps,
+            "estimated_tokens": 600,
+        }
+
+    if tool_name == "update_header":
+        raw_paths = args.get("paths") or args.get("path") or []
+        if isinstance(raw_paths, str):
+            paths_list = [p.strip() for p in raw_paths.split(",") if p.strip()]
+        else:
+            paths_list = [str(p).strip() for p in raw_paths if str(p).strip()]
+        if not paths_list:
+            raise ValueError("update_header requires non-empty 'paths'.")
+        return {
+            "category": "scout_headers",
+            "title": f"Draft Header Updates ({len(paths_list)} file{'s' if len(paths_list) != 1 else ''})",
+            "summary": f"Use Local AI Scout to inspect and draft header comment diffs for: {', '.join(paths_list[:4])}",
+            "detail": f"Stages human-gated diff patches for: {', '.join(paths_list)}",
+            "paths": paths_list,
+            "estimated_tokens": 400 * max(1, len(paths_list)),
         }
 
     if tool_name == "patch_literal":
@@ -681,10 +848,11 @@ class GeminiGateway:
         session: SessionInfo,
         project: ProjectProfile,
         history_contents: List[types.Content],
+        scout_enabled: bool = False,
     ) -> Dict[str, Any]:
         """Executes one Gemini model turn with project directives and tool declarations."""
         client = self._get_client()
-        sys_instruction = load_system_instruction(project)
+        sys_instruction = load_system_instruction(project, scout_enabled=scout_enabled)
 
         thinking_val = session.thinking_level.upper()
         if thinking_val == "XHIGH" and session.model != "gemini-4-hydrogen":
@@ -692,7 +860,7 @@ class GeminiGateway:
 
         config_kwargs: Dict[str, Any] = {
             "system_instruction": sys_instruction,
-            "tools": [build_tool_declarations()],
+            "tools": [build_tool_declarations(scout_enabled=scout_enabled)],
         }
         if not session.model.startswith(("gemini-1.", "gemini-2.")):
             try:

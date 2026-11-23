@@ -72,6 +72,7 @@ class SessionUpdate(BaseModel):
     thinking_level: Optional[str] = None
     auto_approve_read_tokens: Optional[int] = None
     directives_sent: Optional[bool] = None
+    scout_announced_state: Optional[int] = None
 
 
 class TokenStats(BaseModel):
@@ -91,6 +92,7 @@ class SessionInfo(BaseModel):
     thinking_level: str
     auto_approve_read_tokens: int = 0
     directives_sent: bool = False
+    scout_announced_state: int = -1
     token_stats: TokenStats = Field(default_factory=TokenStats)
     created_at: str
     updated_at: str
@@ -144,6 +146,7 @@ class ToolGateDecision(BaseModel):
         "write_only",
         "write_and_run",
         "write_run_and_delete",
+        "approve_and_auto",
     ]
     start_line: Optional[int] = None
     end_line: Optional[int] = None
@@ -177,6 +180,20 @@ class GitCommitRequest(BaseModel):
 class GitDraftMessageRequest(BaseModel):
     project_id: str
     model: str = "gemini-4-hydrogen"
+    use_scout: bool = False
+
+
+class GitUpdateHeadersRequest(BaseModel):
+    project_id: str
+    session_id: Optional[str] = None
+    paths: List[str] = Field(default_factory=list)
+
+
+class ScoutSettingsUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    auto_approve: Optional[bool] = None
+    max_tokens: Optional[int] = None
+    summarize_threshold_chars: Optional[int] = None
 
 
 class CdpTargetRequest(BaseModel):

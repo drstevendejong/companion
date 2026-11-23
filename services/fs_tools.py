@@ -443,3 +443,239 @@ def read_file(
         "raw_content": raw,
         "estimated_tokens": estimate_tokens(content),
     }
+
+
+def _extract_python_header_and_symbols(text: str, *, include_symbols: bool, max_header_lines: int) -> tuple[str, List[str]]:
+    import ast as _ast
+
+    header = ""
+    symbols: List[str] = []
+    try:
+        tree = _ast.parse(text)
+        doc = _ast.get_docstring(tree, clean=True) or ""
+        if doc:
+            lines = [ln.rstrip() for ln in doc.splitlines()[:max_header_lines]]
+            header = "\n".join(lines).strip()
+        if include_symbols:
+            for node in tree.body:
+                if isinstance(node, _ast.ClassDef):
+                    methods = [
+                        n.name
+                        for n in node.body
+                        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and not n.name.startswith("_")
+                    ][:8]
+                    suffix = f"({', '.join(methods)})" if methods else ""
+                    symbols.append(f"class {node.name}{suffix}")
+                elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    args = [a.arg for a in node.args.args if a.arg != "self"][:6]
+                    prefix = "async def" if isinstance(node, _ast.AsyncFunctionDef) else "def"
+                    symbols.append(f"{prefix} {node.name}({', '.join(args)})")
+    except SyntaxError:
+        pass
+
+    if not header:
+        comment_lines: List[str] = []
+        for ln in text.splitlines()[: max_header_lines + 4]:
+            s = ln.strip()
+            if not s and not comment_lines:
+                continue
+            if s.startswith("#!"):
+                continue
+            if s.startswith("#"):
+                comment_lines.append(s.lstrip("#").strip())
+                if len(comment_lines) >= max_header_lines:
+                    break
+            else:
+                break
+        header = "\n".join(ln for ln in comment_lines if ln).strip()
+
+    return header, symbols[:25]
+
+
+def _extract_c_style_header_and_symbols(
+    text: str, suffix: str, *, include_symbols: bool, max_header_lines: int
+) -> tuple[str, List[str]]:
+    lines = text.splitlines()
+    header_lines: List[str] = []
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and lines[i].lstrip().startswith("/*"):
+        while i < len(lines) and len(header_lines) < max_header_lines:
+            raw = lines[i].strip()
+            end_idx = raw.find("*/")
+            chunk = raw[:end_idx] if end_idx != -1 else raw
+            chunk = re.sub(r"^/\*+\s?", "", chunk)
+            chunk = re.sub(r"^\*\s?", "", chunk).strip()
+            if chunk:
+                header_lines.append(chunk)
+            if end_idx != -1:
+                break
+            i += 1
+    elif i < len(lines) and lines[i].lstrip().startswith("//"):
+        while i < len(lines) and len(header_lines) < max_header_lines:
+            s = lines[i].lstrip()
+            if not s.startswith("//"):
+                break
+            cleaned = s[2:].strip()
+            if cleaned:
+                header_lines.append(cleaned)
+            i += 1
+    elif suffix in (".html", ".htm", ".xml") and i < len(lines) and lines[i].lstrip().startswith("<!--"):
+        while i < len(lines) and len(header_lines) < max_header_lines:
+            raw = lines[i].strip()
+            end_idx = raw.find("-->")
+            chunk = raw[:end_idx] if end_idx != -1 else raw
+            chunk = re.sub(r"^<!--\s?", "", chunk).strip()
+            if chunk:
+                header_lines.append(chunk)
+            if end_idx != -1:
+                break
+            i += 1
+    elif suffix in (".md", ".markdown", ".txt"):
+        for ln in lines[:max_header_lines]:
+            s = ln.strip()
+            if s:
+                header_lines.append(s)
+            if len(header_lines) >= min(6, max_header_lines):
+                break
+
+    symbols: List[str] = []
+    if include_symbols and suffix in (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java"):
+        sym_re = re.compile(
+            r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?"
+            r"(function|class|interface|type|struct|enum|fn)\s+([A-Za-z_][A-Za-z0-9_]*)"
+        )
+        for ln in lines:
+            m = sym_re.match(ln)
+            if m:
+                entry = f"{m.group(1)} {m.group(2)}"
+                if entry not in symbols:
+                    symbols.append(entry)
+                if len(symbols) >= 25:
+                    break
+
+    return "\n".join(header_lines).strip(), symbols
+
+
+def extract_headers(
+    project_root: str | Path,
+    subpath: str = ".",
+    path_glob: Optional[str] = None,
+    *,
+    pattern: Optional[str] = None,
+    include_symbols: bool = True,
+    max_files: int = 80,
+    max_header_lines: int = 12,
+    extra_ignores: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Deterministically extracts file header docstrings/comments and top-level symbols
+    from matching UTF-8 source files (0 LLM tokens).
+    """
+    pat_clean = (pattern or "").strip()
+    if pat_clean and pat_clean != ".":
+        if any(ch in pat_clean for ch in ("*", "?", "[", "{", ",")):
+            if not path_glob:
+                path_glob = pat_clean
+        elif subpath == ".":
+            subpath = pat_clean
+
+    root = Path(project_root).resolve()
+    scan_root = resolve_safe_path(root, subpath or ".")
+    if not scan_root.exists():
+        raise FileNotFoundError(f"Path not found: {subpath}")
+
+    ignores = _merge_ignores(extra_ignores)
+    glob_patterns = _expand_globs(path_glob) if path_glob else []
+    cap = max(1, min(200, int(max_files or 80)))
+    line_cap = max(2, min(40, int(max_header_lines or 12)))
+
+    items: List[Dict[str, Any]] = []
+    truncated = False
+
+    def _inspect_file(fpath: Path, check_ignores: bool) -> None:
+        nonlocal truncated
+        if len(items) >= cap:
+            truncated = True
+            return
+        if not fpath.is_file():
+            return
+        rel_posix = fpath.relative_to(root).as_posix()
+        if check_ignores and _is_ignored(fpath.name, rel_posix, ignores, is_dir=False):
+            return
+        if glob_patterns and not _matches_path_glob(rel_posix, fpath.name, glob_patterns):
+            return
+        try:
+            size = fpath.stat().st_size
+            if size > 512_000:
+                return
+            raw = fpath.read_bytes()
+        except OSError:
+            return
+        if b"\x00" in raw[:4096]:
+            return
+
+        text = raw.decode("utf-8", errors="replace")
+        suffix = fpath.suffix.lower()
+        if suffix == ".py":
+            header, symbols = _extract_python_header_and_symbols(
+                text, include_symbols=include_symbols, max_header_lines=line_cap
+            )
+        else:
+            header, symbols = _extract_c_style_header_and_symbols(
+                text, suffix, include_symbols=include_symbols, max_header_lines=line_cap
+            )
+
+        items.append(
+            {
+                "path": rel_posix,
+                "lines": len(text.splitlines()),
+                "header": header,
+                "symbols": symbols,
+            }
+        )
+
+    if scan_root.is_file():
+        _inspect_file(scan_root, check_ignores=False)
+    else:
+        for dirpath, dirnames, filenames in os.walk(scan_root):
+            cur = Path(dirpath)
+            rel_dir = cur.relative_to(root).as_posix()
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if not _is_ignored(d, f"{rel_dir}/{d}".lstrip("./"), ignores, is_dir=True)
+            )
+            for fname in sorted(filenames):
+                _inspect_file(cur / fname, check_ignores=True)
+                if len(items) >= cap:
+                    break
+            if len(items) >= cap:
+                break
+
+    formatted_lines: List[str] = []
+    for it in items:
+        sym_str = f" · symbols: {', '.join(it['symbols'])}" if it["symbols"] else ""
+        formatted_lines.append(f"## {it['path']} ({it['lines']}L){sym_str}")
+        if it["header"]:
+            formatted_lines.append(it["header"])
+        elif not it["symbols"]:
+            formatted_lines.append("(no header comment)")
+
+    formatted = "\n".join(formatted_lines) if formatted_lines else "No matching source files found."
+    if truncated:
+        formatted += f"\n\n... [Stopped at {cap} files; pass subpath or path_glob to scope]"
+
+    header_count = sum(1 for it in items if it["header"])
+    return {
+        "pattern": pat_clean or path_glob or subpath or ".",
+        "subpath": subpath or ".",
+        "path_glob": path_glob,
+        "file_count": len(items),
+        "header_count": header_count,
+        "truncated": truncated,
+        "items": items,
+        "formatted": formatted,
+        "estimated_tokens": estimate_tokens(formatted),
+    }
+

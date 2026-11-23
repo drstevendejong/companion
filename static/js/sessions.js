@@ -13,13 +13,17 @@ const thinkingSelect = document.getElementById("thinking-select");
 const autoReadInput = document.getElementById("auto-read-input");
 const tokenTotalLabel = document.getElementById("token-total-label");
 const tokenMeterFill = document.getElementById("token-meter-fill");
-const tokenBreakdown = document.getElementById("token-breakdown");
-const rpmValEl = document.getElementById("telemetry-rpm");
-const tpmValEl = document.getElementById("telemetry-tpm");
-const rpdValEl = document.getElementById("telemetry-rpd");
+const mainAiToggle = document.getElementById("btn-main-ai-toggle");
+const mainStatsLine = document.getElementById("main-stats-line");
+const mainDetailsBtn = document.getElementById("btn-main-details");
+const scoutStatsLine = document.getElementById("scout-stats-line");
+const scoutDetailsBtn = document.getElementById("btn-scout-details");
+const aiDetailsPopover = document.getElementById("ai-details-popover");
+const aiDetailsTitle = document.getElementById("ai-details-title");
+const aiDetailsBody = document.getElementById("ai-details-body");
+const closeAiDetailsBtn = document.getElementById("btn-close-ai-details");
 const sessionTitleInput = document.getElementById("session-title-input");
 const activeModeBadge = document.getElementById("active-session-mode-badge");
-const directivesMeta = document.getElementById("directives-meta");
 const refreshModelsBtn = document.getElementById("btn-refresh-models");
 
 const projectModal = document.getElementById("project-modal");
@@ -27,6 +31,8 @@ const projectForm = document.getElementById("project-form");
 
 const setupModal = document.getElementById("session-setup-modal");
 const setupForm = document.getElementById("session-setup-form");
+const setupTitleEl = document.getElementById("session-setup-title");
+const setupSubtitleEl = document.getElementById("session-setup-subtitle");
 const setupNameInput = document.getElementById("new-session-name");
 const setupApiToggle = document.getElementById("new-session-api-toggle");
 const setupModeHint = document.getElementById("new-session-mode-hint");
@@ -36,6 +42,7 @@ const setupConfirmBtn = document.getElementById("btn-confirm-session-setup");
 
 let editingProjectId = null;
 let telemetryDecayTimer = null;
+let openDetailsTarget = null; // "main" | "scout" | null
 
 function ensureThinkingOptions(levels = ["LOW", "MEDIUM", "HIGH", "XHIGH"]) {
   const prev = thinkingSelect.value;
@@ -130,6 +137,14 @@ function applySessionModeUI(session) {
   document.body.classList.toggle("mode-api", apiEnabled);
   document.body.classList.toggle("mode-bridge", !apiEnabled);
 
+  if (mainAiToggle) {
+    mainAiToggle.checked = apiEnabled;
+    mainAiToggle.disabled = !state.activeProjectId;
+    mainAiToggle.title = apiEnabled
+      ? "Main AI ON (Direct Gemini API) · Click to start a new Bridge session without Main AI"
+      : "Main AI OFF (Playground Bridge) · Click to start a new API session with Main AI";
+  }
+
   if (activeModeBadge) {
     activeModeBadge.classList.toggle("hidden", !hasSession);
     activeModeBadge.classList.toggle("is-api", apiEnabled);
@@ -137,7 +152,7 @@ function applySessionModeUI(session) {
     activeModeBadge.textContent = apiEnabled ? "API" : "BRIDGE";
     activeModeBadge.title = apiEnabled
       ? "Direct Gemini API session"
-      : "Playground Bridge session (0 API tokens)";
+      : "Playground Bridge session (0 Main AI tokens)";
   }
 }
 
@@ -149,20 +164,66 @@ export async function initSessions() {
     // Explicit manual probe only — 0 RPD burned automatically on startup
     refreshModelsBtn.addEventListener("click", () => void refreshModelCatalog(true, true));
   }
+  if (mainAiToggle) {
+    mainAiToggle.addEventListener("change", () => {
+      const targetApi = Boolean(mainAiToggle.checked);
+      // Revert visual switch until the user confirms creating the new session
+      mainAiToggle.checked = Boolean(state.apiEnabled);
+      openSessionSetupModal({
+        apiEnabled: targetApi,
+        modeSwitchConfirm: true,
+      });
+    });
+  }
+  if (mainDetailsBtn) {
+    mainDetailsBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      toggleDetailsPopover("main", mainDetailsBtn);
+    });
+  }
+  if (scoutDetailsBtn) {
+    scoutDetailsBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      toggleDetailsPopover("scout", scoutDetailsBtn);
+    });
+  }
+  if (closeAiDetailsBtn) {
+    closeAiDetailsBtn.addEventListener("click", closeDetailsPopover);
+  }
+  document.addEventListener("click", (ev) => {
+    if (!openDetailsTarget || !aiDetailsPopover || aiDetailsPopover.classList.contains("hidden")) {
+      return;
+    }
+    const target = ev.target;
+    if (
+      aiDetailsPopover.contains(target) ||
+      (mainDetailsBtn && mainDetailsBtn.contains(target)) ||
+      (scoutDetailsBtn && scoutDetailsBtn.contains(target))
+    ) {
+      return;
+    }
+    closeDetailsPopover();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && openDetailsTarget) {
+      closeDetailsPopover();
+    }
+  });
+
   on("models:refresh", (opts) => {
     const probe = Boolean(opts && opts.probe);
     void refreshModelCatalog(probe, probe);
   });
 
   on("app:mode-changed", ({ apiEnabled }) => {
-    if (apiEnabled) {
+    if (openDetailsTarget === "main" && !apiEnabled) {
+      closeDetailsPopover();
+    }
+    if (apiEnabled || (state.scout && state.scout.enabled)) {
       void refreshRateTelemetry();
-      if (!state.catalog.models || state.catalog.models.length === 0) {
-        void refreshModelCatalog(false, false);
-      }
-    } else if (telemetryDecayTimer) {
-      clearTimeout(telemetryDecayTimer);
-      telemetryDecayTimer = null;
+    }
+    if (apiEnabled && (!state.catalog.models || state.catalog.models.length === 0)) {
+      void refreshModelCatalog(false, false);
     }
   });
 
@@ -213,7 +274,9 @@ export async function initSessions() {
   setupCancelBtn.addEventListener("click", () => setupModal.close());
   setupForm.addEventListener("submit", handleSessionSetupSubmit);
 
+  sessionTitleInput.addEventListener("input", syncSessionTitleWidth);
   sessionTitleInput.addEventListener("change", async () => {
+    syncSessionTitleWidth();
     if (!state.activeSessionId) return;
     const title = sessionTitleInput.value.trim();
     if (!title) return;
@@ -233,6 +296,13 @@ export async function initSessions() {
 
   on("session:updated", renderTokenMeter);
   on("telemetry:updated", (tel) => renderRateTelemetry(tel));
+  on("telemetry:refresh", () => void refreshRateTelemetry());
+  on("scout:changed", (cfg) => {
+    if (openDetailsTarget === "scout" && !(cfg && cfg.enabled)) {
+      closeDetailsPopover();
+    }
+    renderRateTelemetry();
+  });
 
   await loadProjects();
 }
@@ -241,7 +311,7 @@ function updateSetupModeHint() {
   const onApi = Boolean(setupApiToggle.checked);
   setupModeHint.textContent = onApi
     ? "ON · Direct Gemini API (model calls & rate telemetry)"
-    : "OFF · Playground Bridge (0 API tokens, copy/paste)";
+    : "OFF · Playground Bridge (0 Main AI tokens, copy/paste)";
 }
 
 function openSessionSetupModal(options = {}) {
@@ -249,11 +319,32 @@ function openSessionSetupModal(options = {}) {
     openProjectModal(null);
     return;
   }
+  const wantApi = Boolean(options.apiEnabled);
+  if (setupTitleEl) {
+    if (options.modeSwitchConfirm) {
+      setupTitleEl.textContent = wantApi
+        ? "New Session with Main AI?"
+        : "New Session without Main AI?";
+    } else {
+      setupTitleEl.textContent = "Session Setup";
+    }
+  }
+  if (setupSubtitleEl) {
+    if (options.modeSwitchConfirm) {
+      setupSubtitleEl.textContent = wantApi
+        ? "Start a new Direct Gemini API session so session history stays clean."
+        : "Start a new Playground Bridge session (copy/paste with Playground).";
+      setupSubtitleEl.classList.remove("hidden");
+    } else {
+      setupSubtitleEl.textContent = "";
+      setupSubtitleEl.classList.add("hidden");
+    }
+  }
   const defaultName = options.name !== undefined
     ? options.name
     : `Session ${state.sessions.length + 1}`;
   setupNameInput.value = defaultName;
-  setupApiToggle.checked = Boolean(options.apiEnabled);
+  setupApiToggle.checked = wantApi;
   setupErrorEl.textContent = options.error || "";
   updateSetupModeHint();
 
@@ -348,6 +439,7 @@ function clearActiveSession() {
   state.lastErrorContext = null;
   sessionTitleInput.disabled = true;
   sessionTitleInput.value = "Create a session (+ New)";
+  syncSessionTitleWidth();
   applySessionModeUI(null);
   emit("app:mode-changed", { apiEnabled: false });
   emit("bridge:session-synced");
@@ -378,18 +470,19 @@ async function refreshDirectivesBanner(projectId) {
     const info = await api.getDirectives(projectId);
     if (info.configured && info.exists) {
       state.directivesTokensEst = Number(info.estimated_tokens || 0);
-      directivesMeta.textContent = `Directives: ${info.path} (~${info.estimated_tokens} tok)`;
+      state.directivesInfoText = `${info.path} (~${info.estimated_tokens} tok)`;
     } else if (info.configured) {
       state.directivesTokensEst = 0;
-      directivesMeta.textContent = `Directives missing: ${info.path}`;
+      state.directivesInfoText = `Directives missing: ${info.path}`;
     } else {
       state.directivesTokensEst = 0;
-      directivesMeta.textContent = "No Directives file linked";
+      state.directivesInfoText = "No Directives file linked";
     }
   } catch {
     state.directivesTokensEst = 0;
-    directivesMeta.textContent = "";
+    state.directivesInfoText = "";
   }
+  emit("bridge:session-synced");
   emit("composer:updated");
 }
 
@@ -403,7 +496,7 @@ async function refreshSessions() {
     const badgeLabel = isApi ? "API" : "BRIDGE";
     const badgeTitle = isApi
       ? "Direct Gemini API session"
-      : "Playground Bridge session (0 API tokens)";
+      : "Playground Bridge session (0 Main AI tokens)";
 
     const row = document.createElement("div");
     row.className = `session-item ${s.id === state.activeSessionId ? "active" : ""}`;
@@ -447,6 +540,7 @@ export async function selectSession(sessionId) {
 
   sessionTitleInput.disabled = false;
   sessionTitleInput.value = detail.session.title;
+  syncSessionTitleWidth();
 
   if (detail.session.api_enabled) {
     if (!state.catalog.models || state.catalog.models.length === 0) {
@@ -499,31 +593,188 @@ function formatCompactCount(n) {
   return String(val);
 }
 
+function formatShortTelemetryModel(modelId) {
+  if (!modelId) return "";
+  return String(modelId).replace(/^gemini-/, "");
+}
+
+function renderModelTableHtml(rows) {
+  if (!rows || rows.length === 0) {
+    return `<div class="meta-line">No model usage recorded today.</div>`;
+  }
+  const head = `
+    <div class="scout-model-row is-head">
+      <span class="scout-model-name">Model</span>
+      <span class="scout-model-num">Tok</span>
+      <span class="scout-model-num">RPM</span>
+      <span class="scout-model-num">TPM</span>
+    </div>`;
+  const body = rows
+    .map((m) => {
+      const shortName = formatShortTelemetryModel(m.model) || m.model;
+      const mTok = formatCompactCount(m.total_tokens || 0);
+      const mRpm = Number(m.rpm || 0);
+      const mTpm = formatCompactCount(m.tpm || 0);
+      const mTip = `${m.model} · RPD: ${m.rpd || 0} · In: ${Number(m.input_tokens || 0).toLocaleString()} · Out: ${Number(m.output_tokens || 0).toLocaleString()} · Think: ${Number(m.thinking_tokens || 0).toLocaleString()}`;
+      return `
+        <div class="scout-model-row" title="${escapeHtml(mTip)}">
+          <span class="scout-model-name mono">${escapeHtml(shortName)}</span>
+          <span class="scout-model-num mono tabular">${escapeHtml(mTok)}</span>
+          <span class="scout-model-num mono tabular">${escapeHtml(String(mRpm))}</span>
+          <span class="scout-model-num mono tabular">${escapeHtml(mTpm)}</span>
+        </div>`;
+    })
+    .join("");
+  return `<div class="scout-model-list">${head}${body}</div>`;
+}
+
+function renderScoutTelemetry(tel) {
+  if (!scoutStatsLine) return;
+  const scoutTel = (tel && tel.scout) || {
+    rpm: 0,
+    tpm: 0,
+    total_tokens: 0,
+  };
+  const rpm = Number(scoutTel.rpm || 0);
+  const tpm = formatCompactCount(scoutTel.tpm || 0);
+  const tok = formatCompactCount(scoutTel.total_tokens || 0);
+  scoutStatsLine.textContent = `${rpm} RPM · ${tpm} TPM · ${tok} tok`;
+}
+
+function renderAiDetailsPopoverContent() {
+  if (!openDetailsTarget || !aiDetailsPopover || !aiDetailsBody || !aiDetailsTitle) return;
+  const tel = state.telemetry || { rpm: 0, tpm: 0, rpd: 0, next_minute_reset_sec: 0, rpd_reset_label: "00:00 PT", models: [] };
+
+  if (openDetailsTarget === "scout") {
+    const scoutCfg = state.scout || {};
+    const scoutTel = tel.scout || {
+      active_model: scoutCfg.active_model || null,
+      rpm: 0,
+      tpm: 0,
+      rpd: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      thinking_tokens: 0,
+      total_tokens: 0,
+      next_minute_reset_sec: 0,
+      models: [],
+    };
+    let perModel = Array.isArray(scoutTel.models) ? scoutTel.models.slice() : [];
+    if (perModel.length === 0 && scoutCfg.enabled && scoutCfg.active_model) {
+      perModel = [
+        { model: scoutCfg.active_model, rpm: 0, tpm: 0, rpd: 0, input_tokens: 0, output_tokens: 0, thinking_tokens: 0, total_tokens: 0 },
+      ];
+    }
+    aiDetailsTitle.textContent = "Scout AI Details";
+    const sDecay = Number(scoutTel.next_minute_reset_sec || 0);
+    const sMinNote = sDecay > 0 ? `60s (${sDecay}s)` : "60s idle";
+    const activeLbl = formatShortTelemetryModel(scoutTel.active_model || scoutCfg.active_model) || "-lite";
+    aiDetailsBody.innerHTML = `
+      <div class="meta-line mono">Active: ${escapeHtml(activeLbl)} · RPD: ${scoutTel.rpd || 0}</div>
+      <div class="rate-telemetry-grid">
+        <div class="rate-cell"><span class="rate-lbl">RPM</span><span class="rate-val mono tabular">${Number(scoutTel.rpm || 0)}</span></div>
+        <div class="rate-cell"><span class="rate-lbl">TPM</span><span class="rate-val mono tabular">${escapeHtml(formatCompactCount(scoutTel.tpm || 0))}</span></div>
+        <div class="rate-cell"><span class="rate-lbl">Tokens</span><span class="rate-val mono tabular">${escapeHtml(formatCompactCount(scoutTel.total_tokens || 0))}</span></div>
+      </div>
+      <div class="meta-line mono tabular">In: ${Number(scoutTel.input_tokens || 0).toLocaleString()} · Out: ${Number(scoutTel.output_tokens || 0).toLocaleString()} · Think: ${Number(scoutTel.thinking_tokens || 0).toLocaleString()}</div>
+      ${renderModelTableHtml(perModel)}
+      <div class="meta-line mono tabular">Resets: ${escapeHtml(sMinNote)} · ${escapeHtml(tel.rpd_reset_label || "00:00 PT")}</div>
+    `;
+    return;
+  }
+
+  aiDetailsTitle.textContent = "Main AI Details";
+  const activeModel = (state.activeSession && state.activeSession.model) || modelSelect.value || tel.model || "-";
+  const allModels = Array.isArray(tel.models) ? tel.models : [];
+  const activeRow = allModels.find((m) => m.model === activeModel) || {
+    input_tokens: 0,
+    output_tokens: 0,
+    thinking_tokens: 0,
+    total_tokens: 0,
+  };
+  const decaySec = Number(tel.next_minute_reset_sec || 0);
+  const minNote = decaySec > 0 ? `60s (${decaySec}s)` : "60s idle";
+  aiDetailsBody.innerHTML = `
+    <div class="meta-line mono">Model: ${escapeHtml(formatShortTelemetryModel(activeModel) || activeModel)}</div>
+    <div class="rate-telemetry-grid">
+      <div class="rate-cell"><span class="rate-lbl">RPM</span><span class="rate-val mono tabular">${Number(tel.rpm || 0)}</span></div>
+      <div class="rate-cell"><span class="rate-lbl">TPM</span><span class="rate-val mono tabular">${escapeHtml(formatCompactCount(tel.tpm || 0))}</span></div>
+      <div class="rate-cell"><span class="rate-lbl">RPD</span><span class="rate-val mono tabular">${Number(tel.rpd || 0)}</span></div>
+    </div>
+    <div class="meta-line mono tabular">Today · In: ${Number(activeRow.input_tokens || 0).toLocaleString()} · Out: ${Number(activeRow.output_tokens || 0).toLocaleString()} · Think: ${Number(activeRow.thinking_tokens || 0).toLocaleString()}</div>
+    ${renderModelTableHtml(allModels)}
+    <div class="meta-line mono tabular">Resets: ${escapeHtml(minNote)} · ${escapeHtml(tel.rpd_reset_label || "00:00 PT")}</div>
+  `;
+}
+
+function positionDetailsPopover(anchorBtn) {
+  if (!aiDetailsPopover || !anchorBtn) return;
+  const rect = anchorBtn.getBoundingClientRect();
+  aiDetailsPopover.style.left = `${Math.min(window.innerWidth - 306, Math.max(12, rect.right + 12))}px`;
+  const popH = aiDetailsPopover.offsetHeight || 240;
+  const top = Math.max(12, Math.min(window.innerHeight - popH - 12, rect.top - 48));
+  aiDetailsPopover.style.top = `${top}px`;
+}
+
+function closeDetailsPopover() {
+  openDetailsTarget = null;
+  if (aiDetailsPopover) aiDetailsPopover.classList.add("hidden");
+  if (mainDetailsBtn) mainDetailsBtn.setAttribute("aria-expanded", "false");
+  if (scoutDetailsBtn) scoutDetailsBtn.setAttribute("aria-expanded", "false");
+}
+
+function toggleDetailsPopover(target, anchorBtn) {
+  if (!aiDetailsPopover) return;
+  if (openDetailsTarget === target && !aiDetailsPopover.classList.contains("hidden")) {
+    closeDetailsPopover();
+    return;
+  }
+  openDetailsTarget = target;
+  if (mainDetailsBtn) mainDetailsBtn.setAttribute("aria-expanded", String(target === "main"));
+  if (scoutDetailsBtn) scoutDetailsBtn.setAttribute("aria-expanded", String(target === "scout"));
+  renderAiDetailsPopoverContent();
+  aiDetailsPopover.classList.remove("hidden");
+  positionDetailsPopover(anchorBtn);
+}
+
 export function renderRateTelemetry(telemetry) {
-  if (telemetry) {
+  if (telemetry && Object.keys(telemetry).length > 0) {
     state.telemetry = telemetry;
   }
   const tel = state.telemetry || { rpm: 0, tpm: 0, rpd: 0, next_minute_reset_sec: 0, rpd_reset_label: "00:00 PT" };
-  rpmValEl.textContent = String(tel.rpm || 0);
-  tpmValEl.textContent = formatCompactCount(tel.tpm || 0);
-  rpdValEl.textContent = String(tel.rpd || 0);
-
   const decaySec = Number(tel.next_minute_reset_sec || 0);
-  const minNote = decaySec > 0 ? `60s (${decaySec}s)` : "60s idle";
-  tokenBreakdown.textContent = `Resets: ${minNote} · ${tel.rpd_reset_label || "00:00 PT"}`;
+  if (mainStatsLine) {
+    mainStatsLine.textContent = `${Number(tel.rpm || 0)} RPM · ${formatCompactCount(tel.tpm || 0)} TPM · ${Number(tel.rpd || 0)} RPD`;
+  }
+
+  renderScoutTelemetry(tel);
+  if (openDetailsTarget) {
+    renderAiDetailsPopoverContent();
+  }
 
   if (telemetryDecayTimer) {
     clearTimeout(telemetryDecayTimer);
     telemetryDecayTimer = null;
   }
-  if (state.apiEnabled && ((tel.rpm || 0) > 0 || (tel.tpm || 0) > 0)) {
-    const waitMs = Math.min(62000, Math.max(1500, (decaySec + 1) * 1000));
+  const scoutTel = tel.scout || {};
+  const mainActive = state.apiEnabled && ((tel.rpm || 0) > 0 || (tel.tpm || 0) > 0);
+  const scoutActive = (scoutTel.rpm || 0) > 0 || (scoutTel.tpm || 0) > 0;
+  if (mainActive || scoutActive) {
+    const activeWaits = [];
+    if (mainActive) activeWaits.push(decaySec);
+    if (scoutActive) activeWaits.push(Number(scoutTel.next_minute_reset_sec || 0));
+    const soonest = Math.min(...activeWaits);
+    const waitMs = Math.min(62000, Math.max(1500, (soonest + 1) * 1000));
     telemetryDecayTimer = setTimeout(() => void refreshRateTelemetry(), waitMs);
   }
 }
 
 async function refreshRateTelemetry() {
-  if (!state.apiEnabled) return;
+  const scoutTel = (state.telemetry && state.telemetry.scout) || {};
+  const hasActiveScoutWindow = (scoutTel.rpm || 0) > 0 || (scoutTel.tpm || 0) > 0;
+  if (!state.apiEnabled && !(state.scout && state.scout.enabled) && !hasActiveScoutWindow) {
+    return;
+  }
   try {
     const activeModel = (state.activeSession && state.activeSession.model) || modelSelect.value || null;
     const tel = await api.getTelemetry(activeModel);
@@ -578,6 +829,12 @@ async function handleProjectSave(ev) {
   } catch (err) {
     alert(err.message);
   }
+}
+
+function syncSessionTitleWidth() {
+  if (!sessionTitleInput) return;
+  const len = (sessionTitleInput.value || "").length;
+  sessionTitleInput.size = Math.min(54, Math.max(8, len + 1));
 }
 
 function escapeHtml(str) {

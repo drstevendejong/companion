@@ -4,6 +4,7 @@ routes/chat.py - Human-gated Gemini chat loop and tool approval/denial/edit-rang
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -14,6 +15,8 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, HTTPException, Request
 from google.genai import types
 
+from config import OUTPUT_FAILURE_TRIAGE_MIN_CHARS
+
 from models import (
     BatchGateDecisionRequest,
     ChatRetryRequest,
@@ -21,19 +24,94 @@ from models import (
     MessageRecord,
     ProjectProfile,
     SessionInfo,
+    SessionUpdate,
     ToolGateDecision,
 )
+from services.key_store import has_configured_api_key
 from services import bridge as bridge_svc
 from services import checkpoints as cp_svc
-from services import fs_tools, patch_tools, runner
+from services import fs_tools, local_scout, patch_tools, runner
 from services.gemini_client import (
     READ_ONLY_TOOLS,
+    SCOUT_TOOLS,
     build_user_parts,
     prepare_tool_gate_preview,
 )
 from services.quota_parser import analyze_gemini_error, format_gemini_error
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+
+def _get_effective_scout_settings(db: Any, gemini: Any) -> Dict[str, Any]:
+    has_key = has_configured_api_key(gemini) if gemini is not None else False
+    if hasattr(db, "get_scout_settings"):
+        return db.get_scout_settings(has_key=has_key)
+    return {
+        "enabled": False,
+        "configured_enabled": False,
+        "auto_approve": False,
+        "max_tokens": 30_000,
+        "summarize_threshold_chars": 4_000,
+    }
+
+
+def _maybe_append_scout_notice(db: Any, session: SessionInfo, scout_enabled: bool, text: str) -> str:
+    """Appends an explicit Scout ON/OFF notice once whenever Scout state changes in Bridge mode."""
+    target_bit = 1 if scout_enabled else 0
+    if getattr(session, "scout_announced_state", 0) == target_bit:
+        return text
+    notice = bridge_svc.build_scout_state_notice(scout_enabled)
+    if hasattr(db, "update_session"):
+        db.update_session(session.id, SessionUpdate(scout_announced_state=target_bit))
+    return f"{text}\n\n{notice}".strip() if text else notice
+
+
+async def _maybe_summarize_or_triage_output(
+    *,
+    gemini: Any,
+    db: Any,
+    project: ProjectProfile,
+    scout_cfg: Dict[str, Any],
+    command: str,
+    raw_output: str,
+    exit_code: int,
+    passed: bool,
+    focus: str | None,
+    exec_id: str | None,
+) -> Dict[str, Any]:
+    if not scout_cfg.get("enabled") or gemini is None or not raw_output.strip():
+        return {}
+    threshold = int(scout_cfg.get("summarize_threshold_chars") or 4_000)
+    has_focus = bool((focus or "").strip())
+    if not passed:
+        if not has_focus and len(raw_output) <= OUTPUT_FAILURE_TRIAGE_MIN_CHARS:
+            return {}
+        res = await asyncio.to_thread(
+            local_scout.triage_command_failure,
+            gemini,
+            db,
+            project,
+            command=command,
+            raw_output=raw_output,
+            exit_code=exit_code,
+            focus=focus,
+            exec_id=exec_id,
+        )
+        return res or {}
+    if has_focus or len(raw_output) > threshold:
+        res = await asyncio.to_thread(
+            local_scout.summarize_command_output,
+            gemini,
+            db,
+            command=command,
+            raw_output=raw_output,
+            exit_code=exit_code,
+            focus=focus,
+            exec_id=exec_id,
+            threshold_chars=threshold,
+        )
+        return res or {}
+    return {}
 
 
 def _trailing_bridge_reply(db: Any, session_id: str) -> str:
@@ -99,12 +177,17 @@ def _advance_turn(
     session: SessionInfo,
     project: ProjectProfile,
     max_auto_loops: int = 5,
+    app: Any = None,
 ) -> Dict[str, Any]:
-    """Runs Gemini turn(s), auto-executing only approved-threshold reads, pausing at gates."""
+    """Runs Gemini turn(s), auto-executing approved-threshold reads / auto-scout, pausing at gates."""
     auto_loops = 0
     while True:
+        scout_cfg = _get_effective_scout_settings(db, gemini)
+        scout_enabled = bool(scout_cfg.get("enabled"))
+        scout_auto = bool(scout_cfg.get("auto_approve"))
+
         history = _messages_to_history(db.list_messages(session.id))
-        turn = gemini.generate_turn(session, project, history)
+        turn = gemini.generate_turn(session, project, history, scout_enabled=scout_enabled)
         usage = turn["usage"]
         db.record_api_usage(session.model, usage)
         updated_session = db.add_session_tokens(session.id, usage) or session
@@ -124,15 +207,23 @@ def _advance_turn(
         all_auto_approved = True
         prepared_items: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
         for tc in tool_calls:
-            try:
-                preview = prepare_tool_gate_preview(project, tc["name"], tc.get("args", {}))
-            except Exception as exc:
+            if tc["name"] in SCOUT_TOOLS and not scout_enabled:
                 preview = {
                     "category": "error",
-                    "title": f"Tool Preparation Error: {tc['name']}",
-                    "error": str(exc),
+                    "title": f"Local AI Scout Disabled: {tc['name']}",
+                    "error": f"{tc['name']} cannot run because Local AI Scout is currently OFF or lacks a configured API key.",
                     "estimated_tokens": 0,
                 }
+            else:
+                try:
+                    preview = prepare_tool_gate_preview(project, tc["name"], tc.get("args", {}))
+                except Exception as exc:
+                    preview = {
+                        "category": "error",
+                        "title": f"Tool Preparation Error: {tc['name']}",
+                        "error": str(exc),
+                        "estimated_tokens": 0,
+                    }
             prepared_items.append((tc, preview))
             is_auto_read = (
                 tc["name"] in READ_ONLY_TOOLS
@@ -140,13 +231,34 @@ def _advance_turn(
                 and updated_session.auto_approve_read_tokens > 0
                 and preview.get("estimated_tokens", 0) <= updated_session.auto_approve_read_tokens
             )
-            if not is_auto_read:
+            is_auto_scout = (
+                tc["name"] == "scout_workspace"
+                and scout_enabled
+                and scout_auto
+                and preview.get("category") == "scout"
+            )
+            if not (is_auto_read or is_auto_scout):
                 all_auto_approved = False
 
         if all_auto_approved and auto_loops < max_auto_loops:
             auto_loops += 1
             for tc, preview in prepared_items:
-                compact = _serialize_tool_response(tc["name"], preview["prepared_result"])
+                if tc["name"] == "scout_workspace":
+                    scout_res = local_scout.run_scout_workspace(
+                        gemini,
+                        db,
+                        project,
+                        session_id=session.id,
+                        goal=str(preview.get("goal") or ""),
+                        subpath=str(preview.get("subpath") or "."),
+                        max_steps=int(preview.get("max_steps") or 8),
+                        max_tokens=int(scout_cfg.get("max_tokens") or 30_000),
+                        app=app,
+                        event_loop=getattr(getattr(app, "state", None), "event_loop", None),
+                    )
+                    compact = _serialize_tool_response("scout_workspace", scout_res)
+                else:
+                    compact = _serialize_tool_response(tc["name"], preview["prepared_result"])
                 db.add_message(
                     session.id,
                     role="tool_event",
@@ -201,7 +313,7 @@ def _advance_turn(
         "messages": db.list_messages(session.id),
         "pending_gates": db.list_pending_gates(session.id),
         "checkpoints": db.list_checkpoints(session.id) if hasattr(db, "list_checkpoints") else [],
-        "telemetry": db.get_rate_telemetry(model=final_session.model),
+        "telemetry": local_scout.get_telemetry_snapshot(db, gemini, model=final_session.model),
     }
 
 
@@ -247,9 +359,36 @@ def send_chat_message(payload: ChatSendRequest, request: Request) -> Dict[str, A
     )
 
     try:
-        return _advance_turn(db, gemini, session, project)
+        return _advance_turn(db, gemini, session, project, app=getattr(request, "app", None))
     except Exception as exc:
         raise _build_gemini_http_exception(gemini, session.model, exc) from exc
+
+
+@router.post("/scout/{run_id}/pause")
+def pause_scout_run(run_id: str) -> Dict[str, Any]:
+    ctrl = local_scout.get_scout_run(run_id)
+    if ctrl is None:
+        raise HTTPException(status_code=404, detail="Scout run is not active.")
+    ctrl.pause()
+    return {"ok": True, "run_id": run_id, "paused": True, "stop_requested": ctrl.stop_requested}
+
+
+@router.post("/scout/{run_id}/resume")
+def resume_scout_run(run_id: str) -> Dict[str, Any]:
+    ctrl = local_scout.get_scout_run(run_id)
+    if ctrl is None:
+        raise HTTPException(status_code=404, detail="Scout run is not active.")
+    ctrl.resume()
+    return {"ok": True, "run_id": run_id, "paused": False, "stop_requested": ctrl.stop_requested}
+
+
+@router.post("/scout/{run_id}/stop")
+def stop_scout_run(run_id: str) -> Dict[str, Any]:
+    ctrl = local_scout.get_scout_run(run_id)
+    if ctrl is None:
+        raise HTTPException(status_code=404, detail="Scout run is not active.")
+    ctrl.stop()
+    return {"ok": True, "run_id": run_id, "paused": False, "stop_requested": True}
 
 
 @router.post("/retry")
@@ -283,7 +422,7 @@ def retry_last_turn(payload: ChatRetryRequest, request: Request) -> Dict[str, An
         )
 
     try:
-        return _advance_turn(db, gemini, session, project)
+        return _advance_turn(db, gemini, session, project, app=getattr(request, "app", None))
     except Exception as exc:
         raise _build_gemini_http_exception(gemini, session.model, exc) from exc
 
@@ -295,7 +434,10 @@ async def _execute_gate_decision(
     session: SessionInfo,
     project: ProjectProfile,
     app: Any = None,
+    gemini: Any = None,
 ) -> Dict[str, Any]:
+    gemini_client = gemini or (getattr(getattr(app, "state", None), "gemini", None) if app is not None else None)
+    scout_cfg = _get_effective_scout_settings(db, gemini_client)
     gate_id = gate["id"]
     tool_name = gate["tool_name"]
     args = gate["args"]
@@ -349,6 +491,113 @@ async def _execute_gate_decision(
             return _record_gate_error(exc)
 
         db.resolve_gate(gate_id, "approved", {"bytes": len(json.dumps(compact))})
+        db.add_message(
+            session.id,
+            role="tool_event",
+            text=json.dumps({"tool_name": tool_name, "call_id": call_id, "response": compact}),
+        )
+
+    elif tool_name == "scout_workspace":
+        if not scout_cfg.get("enabled") or gemini_client is None:
+            return _record_gate_error(
+                RuntimeError("Local AI Scout is disabled or missing an API key.")
+            )
+        if decision.action == "approve_and_auto" and hasattr(db, "set_scout_settings"):
+            db.set_scout_settings(auto_approve=True)
+            extra_ui["scout_auto_approve_enabled"] = True
+
+        goal = str(args.get("goal") or args.get("prompt") or "").strip()
+        subpath = str(args.get("subpath") or ".").strip() or "."
+        max_steps = max(1, min(12, int(args.get("max_steps") or 8)))
+        try:
+            loop = asyncio.get_running_loop()
+            scout_res = await asyncio.to_thread(
+                local_scout.run_scout_workspace,
+                gemini_client,
+                db,
+                project,
+                session_id=session.id,
+                goal=goal,
+                subpath=subpath,
+                max_steps=max_steps,
+                max_tokens=int(scout_cfg.get("max_tokens") or 30_000),
+                app=app,
+                event_loop=loop,
+            )
+        except Exception as exc:
+            return _record_gate_error(exc)
+
+        compact = _serialize_tool_response("scout_workspace", scout_res)
+        extra_ui["scout_result"] = scout_res
+        db.resolve_gate(
+            gate_id,
+            "approved",
+            {
+                "model_used": scout_res.get("model_used"),
+                "steps_taken": scout_res.get("steps_taken"),
+                "tokens_used": scout_res.get("tokens_used"),
+            },
+        )
+        db.add_message(
+            session.id,
+            role="tool_event",
+            text=json.dumps({"tool_name": tool_name, "call_id": call_id, "response": compact}),
+        )
+
+    elif tool_name == "update_header":
+        if not scout_cfg.get("enabled") or gemini_client is None:
+            return _record_gate_error(
+                RuntimeError("Local AI Scout is disabled or missing an API key.")
+            )
+        raw_paths = args.get("paths") or args.get("path") or []
+        if isinstance(raw_paths, str):
+            paths_list = [p.strip() for p in raw_paths.split(",") if p.strip()]
+        else:
+            paths_list = [str(p).strip() for p in raw_paths if str(p).strip()]
+        try:
+            hdr_res = await asyncio.to_thread(
+                local_scout.draft_header_updates,
+                gemini_client,
+                db,
+                project,
+                paths=paths_list,
+            )
+        except Exception as exc:
+            return _record_gate_error(exc)
+
+        staged_paths: List[str] = []
+        created_gate_ids: List[str] = []
+        for patch in hdr_res.get("proposed_patches") or []:
+            p_args = {
+                "path": patch["path"],
+                "content": patch["content"],
+                "summary": f"Update header comment ({patch['path']}) via Local AI Scout",
+            }
+            p_preview = prepare_tool_gate_preview(project, "write_file", p_args)
+            ui_preview = {
+                k: v for k, v in p_preview.items()
+                if k not in ("prepared_result", "prepared_patch")
+            }
+            g = db.create_gate(
+                session_id=session.id,
+                tool_name="write_file",
+                args=p_args,
+                preview=ui_preview,
+            )
+            staged_paths.append(patch["path"])
+            created_gate_ids.append(g["id"])
+
+        unchanged = [p for p in paths_list if p not in staged_paths]
+        tool_resp = {
+            "staged_count": len(staged_paths),
+            "staged_paths": staged_paths,
+            "unchanged_paths": unchanged,
+            "pending_gate_ids": created_gate_ids,
+            "model": (hdr_res.get("models_used") or [""])[0],
+            "tokens_used": hdr_res.get("tokens_used", 0),
+        }
+        compact = _serialize_tool_response("update_header", tool_resp)
+        db.resolve_gate(gate_id, "approved", compact)
         db.add_message(
             session.id,
             role="tool_event",
@@ -571,6 +820,8 @@ async def _execute_gate_decision(
             extra_ui["command_result"] = run_res
             extra_ui["generated_md_files"] = generated_md
             raw_out = run_res.get("output") or ""
+            exec_id = run_res.get("exec_id")
+            focus_arg = str(args.get("focus") or "").strip() or None
             has_traceback = (
                 "Traceback (most recent call last):" in raw_out
                 or "\nSyntaxError:" in raw_out
@@ -578,7 +829,21 @@ async def _execute_gate_decision(
                 or "\nModuleNotFoundError:" in raw_out
             )
             passed = (run_res["exit_code"] == 0) and (not has_traceback)
-            if not passed:
+            summary_info = await _maybe_summarize_or_triage_output(
+                gemini=gemini_client,
+                db=db,
+                project=project,
+                scout_cfg=scout_cfg,
+                command=f"python {applied['path']}",
+                raw_output=raw_out,
+                exit_code=run_res["exit_code"],
+                passed=passed,
+                focus=focus_arg,
+                exec_id=exec_id,
+            )
+            if summary_info.get("summary"):
+                output_preview = ""
+            elif not passed:
                 output_preview = bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
             else:
                 output_preview = bridge_svc.format_command_output_preview(raw_out, max_chars=12000)
@@ -610,6 +875,7 @@ async def _execute_gate_decision(
                 "written": True,
                 "executed": True,
                 "path": applied["path"],
+                "exec_id": exec_id,
                 "exit_code": run_res["exit_code"],
                 "duration_ms": run_res["duration_ms"],
                 "passed": passed,
@@ -618,15 +884,17 @@ async def _execute_gate_decision(
                 "backup_path": del_backup_path,
                 "output_bytes": len(raw_out.encode("utf-8")),
                 "output_preview": output_preview,
+                "ai_summary": summary_info.get("summary"),
+                "ai_summary_model": summary_info.get("model_used"),
                 "has_traceback": has_traceback,
                 "generated_md_files": generated_md if passed else [],
                 "note": (
-                    f"Auto-deleted '{applied['path']}' after clean run (backed up first). Full output in Console panel."
+                    f"Auto-deleted '{applied['path']}' after clean run (backed up first). Raw output exec_id={exec_id}."
                     if deleted_after_run
                     else (
                         f"Script failed; kept '{applied['path']}' on disk so you can patch and re-run with run_and_delete_script."
                         if auto_delete and not passed
-                        else "Full output captured in user's local Console panel."
+                        else f"Full output buffered as exec_id={exec_id} and shown in Console."
                     )
                 ),
             }
@@ -718,6 +986,8 @@ async def _execute_gate_decision(
         extra_ui["command_result"] = run_res
         extra_ui["generated_md_files"] = generated_md
         raw_out = run_res.get("output") or ""
+        exec_id = run_res.get("exec_id")
+        focus_arg = str(args.get("focus") or "").strip() or None
         has_traceback = (
             "Traceback (most recent call last):" in raw_out
             or "\nSyntaxError:" in raw_out
@@ -725,11 +995,24 @@ async def _execute_gate_decision(
             or "\nModuleNotFoundError:" in raw_out
         )
         passed = (run_res["exit_code"] == 0) and (not has_traceback)
-        output_preview = (
-            bridge_svc.format_command_output_preview(raw_out, max_chars=12000)
-            if passed
-            else bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
+        summary_info = await _maybe_summarize_or_triage_output(
+            gemini=gemini_client,
+            db=db,
+            project=project,
+            scout_cfg=scout_cfg,
+            command=cmd,
+            raw_output=raw_out,
+            exit_code=run_res["exit_code"],
+            passed=passed,
+            focus=focus_arg,
+            exec_id=exec_id,
         )
+        if summary_info.get("summary"):
+            output_preview = ""
+        elif not passed:
+            output_preview = bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
+        else:
+            output_preview = bridge_svc.format_command_output_preview(raw_out, max_chars=12000)
 
         deleted_after_run = False
         del_backup_path = None
@@ -760,6 +1043,7 @@ async def _execute_gate_decision(
             "executed": True,
             "path": rel_posix,
             "command": cmd,
+            "exec_id": exec_id,
             "exit_code": run_res["exit_code"],
             "duration_ms": run_res["duration_ms"],
             "passed": passed,
@@ -769,14 +1053,16 @@ async def _execute_gate_decision(
             "backup_path": del_backup_path,
             "output_bytes": len(raw_out.encode("utf-8")),
             "output_preview": output_preview,
+            "ai_summary": summary_info.get("summary"),
+            "ai_summary_model": summary_info.get("model_used"),
             "generated_md_files": generated_md if passed else [],
             "note": (
-                f"Auto-deleted '{rel_posix}' after clean run (backed up first). Full output in Console panel."
+                f"Auto-deleted '{rel_posix}' after clean run (backed up first). Raw output exec_id={exec_id}."
                 if deleted_after_run
                 else (
                     f"Script failed; kept '{rel_posix}' on disk so you can patch it and re-run run_and_delete_script."
                     if auto_delete and not passed
-                    else "Full output captured in user's local Console panel."
+                    else f"Full output buffered as exec_id={exec_id} and shown in Console."
                 )
             ),
         }
@@ -820,6 +1106,8 @@ async def _execute_gate_decision(
 
         extra_ui["command_result"] = run_res
         raw_out = run_res.get("output") or ""
+        exec_id = run_res.get("exec_id")
+        focus_arg = str(args.get("focus") or "").strip() or None
         has_traceback = (
             "Traceback (most recent call last):" in raw_out
             or "\nSyntaxError:" in raw_out
@@ -828,21 +1116,36 @@ async def _execute_gate_decision(
             or "\nModuleNotFoundError:" in raw_out
         )
         passed = (run_res["exit_code"] == 0) and (not has_traceback)
+        summary_info = await _maybe_summarize_or_triage_output(
+            gemini=gemini_client,
+            db=db,
+            project=project,
+            scout_cfg=scout_cfg,
+            command=cmd,
+            raw_output=raw_out,
+            exit_code=run_res["exit_code"],
+            passed=passed,
+            focus=focus_arg,
+            exec_id=exec_id,
+        )
         committed_cp = None
-        if passed:
+        if summary_info.get("summary"):
+            output_preview = ""
+        elif passed:
             output_preview = bridge_svc.format_command_output_preview(raw_out, max_chars=2500)
-            if is_full_suite and hasattr(db, "get_active_checkpoint"):
-                committed_cp = cp_svc.auto_commit_active_checkpoint_on_tests_pass(
-                    db, project, session.id, cmd
-                )
         else:
             output_preview = bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
+        if passed and is_full_suite and hasattr(db, "get_active_checkpoint"):
+            committed_cp = cp_svc.auto_commit_active_checkpoint_on_tests_pass(
+                db, project, session.id, cmd
+            )
 
         if committed_cp is not None:
             extra_ui["checkpoint_committed"] = True
 
         tool_resp = {
             "command": cmd,
+            "exec_id": exec_id,
             "is_full_suite": is_full_suite,
             "mode": resolved["mode"],
             "target": resolved["target"],
@@ -852,6 +1155,8 @@ async def _execute_gate_decision(
             "has_traceback": has_traceback,
             "output_bytes": len(raw_out.encode("utf-8")),
             "output_preview": output_preview,
+            "ai_summary": summary_info.get("summary"),
+            "ai_summary_model": summary_info.get("model_used"),
             "checkpoint_committed": bool(committed_cp is not None),
         }
         db.resolve_gate(gate_id, "approved", tool_resp)
@@ -888,8 +1193,11 @@ async def resolve_tool_gate(
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
 
+    app = getattr(request, "app", None)
+    if app is not None and hasattr(app, "state"):
+        app.state.event_loop = asyncio.get_running_loop()
     extra_ui = await _execute_gate_decision(
-        db, gate, decision, session, project, app=getattr(request, "app", None)
+        db, gate, decision, session, project, app=app, gemini=gemini
     )
     if extra_ui.get("gate_error"):
         extra_ui["gate_errors"] = [extra_ui["gate_error"]]
@@ -910,21 +1218,34 @@ async def resolve_tool_gate(
             "messages": messages,
             "pending_gates": remaining,
             "checkpoints": checkpoints,
+            "telemetry": local_scout.get_telemetry_snapshot(
+                db, gemini, model=getattr(session, "model", None)
+            ),
             **extra_ui,
         }
 
     if not session.api_enabled:
+        scout_cfg = _get_effective_scout_settings(db, gemini)
+        reply_text = _maybe_append_scout_notice(
+            db,
+            db.get_session(session.id) or session,
+            bool(scout_cfg.get("enabled")),
+            bridge_svc.format_trailing_tool_events(messages),
+        )
         return {
             "session": db.get_session(session.id),
             "messages": messages,
             "pending_gates": [],
             "checkpoints": checkpoints,
-            "bridge_reply_text": bridge_svc.format_trailing_tool_events(messages),
+            "bridge_reply_text": reply_text,
+            "telemetry": local_scout.get_telemetry_snapshot(
+                db, gemini, model=getattr(session, "model", None)
+            ),
             **extra_ui,
         }
 
     try:
-        result = _advance_turn(db, gemini, session, project)
+        result = _advance_turn(db, gemini, session, project, app=app)
         result.update(extra_ui)
         return result
     except Exception as exc:
@@ -947,6 +1268,8 @@ async def resolve_tool_gates_batch(
         raise HTTPException(status_code=404, detail="Project not found.")
 
     app = getattr(request, "app", None)
+    if app is not None and hasattr(app, "state"):
+        app.state.event_loop = asyncio.get_running_loop()
     last_extra: Dict[str, Any] = {}
     gate_errors: List[str] = []
     command_results: List[Dict[str, Any]] = []
@@ -955,7 +1278,7 @@ async def resolve_tool_gates_batch(
         if gate is None or gate["session_id"] != session.id or gate["status"] != "pending":
             continue
         extra_ui = await _execute_gate_decision(
-            db, gate, item.decision, session, project, app=app
+            db, gate, item.decision, session, project, app=app, gemini=gemini
         )
         if extra_ui.get("gate_error"):
             gate_errors.append(extra_ui["gate_error"])
@@ -980,21 +1303,34 @@ async def resolve_tool_gates_batch(
             "messages": messages,
             "pending_gates": remaining,
             "checkpoints": checkpoints,
+            "telemetry": local_scout.get_telemetry_snapshot(
+                db, gemini, model=getattr(session, "model", None)
+            ),
             **last_extra,
         }
 
     if not session.api_enabled:
+        scout_cfg = _get_effective_scout_settings(db, gemini)
+        reply_text = _maybe_append_scout_notice(
+            db,
+            db.get_session(session.id) or session,
+            bool(scout_cfg.get("enabled")),
+            bridge_svc.format_trailing_tool_events(messages),
+        )
         return {
             "session": db.get_session(session.id),
             "messages": messages,
             "pending_gates": [],
             "checkpoints": checkpoints,
-            "bridge_reply_text": bridge_svc.format_trailing_tool_events(messages),
+            "bridge_reply_text": reply_text,
+            "telemetry": local_scout.get_telemetry_snapshot(
+                db, gemini, model=getattr(session, "model", None)
+            ),
             **last_extra,
         }
 
     try:
-        result = _advance_turn(db, gemini, session, project)
+        result = _advance_turn(db, gemini, session, project, app=app)
         result.update(last_extra)
         return result
     except Exception as exc:

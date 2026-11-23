@@ -58,9 +58,13 @@ PLAYGROUND_TOOL_CONTRACT = get_playground_tool_contract()
 
 KNOWN_TOOLS = {
     "list_tree",
+    "extract_headers",
     "search_code",
     "read_lines",
     "read_file",
+    "read_command_output",
+    "scout_workspace",
+    "update_header",
     "patch_literal",
     "patch_lines",
     "write_file",
@@ -79,6 +83,7 @@ KNOWN_TOOL_JSON_KEYS = {
     "action",
     "args",
     "path",
+    "paths",
     "old_path",
     "new_path",
     "from_path",
@@ -107,6 +112,14 @@ KNOWN_TOOL_JSON_KEYS = {
     "fast",
     "target",
     "delete_on_success",
+    "focus",
+    "goal",
+    "prompt",
+    "max_steps",
+    "exec_id",
+    "include_symbols",
+    "max_files",
+    "tail_lines",
 }
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -119,11 +132,29 @@ _LEADING_PY_HEADER_RE = re.compile(r"^(?:python3?|py)\s*\n([\s\S]+)$", re.IGNORE
 _INLINE_TOOL_HINT_RE = re.compile(r'"(?:tool|tool_name|name|action|actions|tool_calls)"\s*:')
 
 
+def build_scout_state_notice(enabled: bool) -> str:
+    """Builds an explicit ON/OFF state notice appended when Scout status changes."""
+    if enabled:
+        return (
+            "> **[COMPANION NOTICE] Local AI Scout is NOW ENABLED.** "
+            "You may call `{\"tool\": \"scout_workspace\", \"goal\": \"...\", \"subpath\": \".\", \"max_steps\": 8}` "
+            "for multi-step read-only codebase traces, `{\"tool\": \"update_header\", \"paths\": [\"...\"]}` "
+            "for human-gated comment header updates, or add `\"focus\": \"question\"` to `run_tests`/`run_script`/`run_and_delete_script`/`propose_script`."
+        )
+    return (
+        "> **[COMPANION NOTICE] Local AI Scout is NOW OFF.** "
+        "Do NOT call `scout_workspace` or `update_header`. Use `extract_headers` (0-token), "
+        "batched `search_code`/`read_lines`, and `read_command_output` for command output."
+    )
+
+
 def build_prompt_bundle(
     project: ProjectProfile,
     prompt: str,
     attachments: List[AttachmentItem],
     include_directives: bool = True,
+    scout_enabled: Optional[bool] = None,
+    scout_state_notice: str = "",
 ) -> Dict[str, Any]:
     """Builds a clipboard-ready Markdown prompt bundle for AI Studio Playground."""
     sections: List[str] = []
@@ -152,6 +183,11 @@ def build_prompt_bundle(
                     )
             except Exception:
                 pass
+
+    if scout_state_notice:
+        sections.append(scout_state_notice.strip())
+    elif include_directives and scout_enabled is not None:
+        sections.append(build_scout_state_notice(scout_enabled))
 
     image_count = 0
     for att in attachments:
@@ -788,6 +824,13 @@ def serialize_tool_response(tool_name: str, result: Dict[str, Any]) -> Dict[str,
     """Shapes compact tool responses returned to Gemini or formatted for Playground."""
     if tool_name == "list_tree":
         return {"subpath": result["subpath"], "tree": result["tree"]}
+    if tool_name == "extract_headers":
+        return {
+            "pattern": result.get("pattern", "."),
+            "file_count": result.get("file_count", 0),
+            "header_count": result.get("header_count", 0),
+            "formatted": result.get("formatted", ""),
+        }
     if tool_name == "search_code":
         return {
             "pattern": result["pattern"],
@@ -799,6 +842,53 @@ def serialize_tool_response(tool_name: str, result: Dict[str, Any]) -> Dict[str,
             "path": result["path"],
             "total_lines": result["total_lines"],
             "content": result["content"],
+        }
+    if tool_name == "read_command_output":
+        return {
+            k: result.get(k)
+            for k in (
+                "found",
+                "exec_id",
+                "command",
+                "exit_code",
+                "passed",
+                "total_lines",
+                "shown_lines",
+                "mode",
+                "content",
+                "error",
+            )
+            if result.get(k) is not None
+        }
+    if tool_name == "scout_workspace":
+        return {
+            k: result.get(k)
+            for k in (
+                "answer",
+                "run_id",
+                "steps_taken",
+                "steps",
+                "model_used",
+                "models_hopped",
+                "tokens_used",
+                "stopped_early",
+                "error",
+            )
+            if result.get(k) is not None
+        }
+    if tool_name == "update_header":
+        return {
+            k: result.get(k)
+            for k in (
+                "staged_count",
+                "staged_paths",
+                "unchanged_paths",
+                "pending_gate_ids",
+                "model",
+                "tokens_used",
+                "error",
+            )
+            if result.get(k) is not None
         }
     return result
 
@@ -918,6 +1008,11 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
             blocks.append(f"- **{name}**{target_part} **Error**: {resp['error']}")
         elif name == "list_tree":
             blocks.append(f"### `list_tree` ({resp.get('subpath', '.')})\n```text\n{resp.get('tree', '')}\n```")
+        elif name == "extract_headers":
+            blocks.append(
+                f"### `extract_headers` (`{resp.get('pattern', '.')}` · {resp.get('file_count', 0)} files, {resp.get('header_count', 0)} headers)\n"
+                f"```text\n{resp.get('formatted', '')}\n```"
+            )
         elif name == "search_code":
             blocks.append(
                 f"### `search_code` (`{resp.get('pattern', '')}` · {resp.get('total_hits', 0)} hits)\n"
@@ -929,6 +1024,32 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
                 f"### `{name}` (`{p}` · {resp.get('total_lines', '?')} lines)\n"
                 f"```text\n{resp.get('content', '')}\n```"
             )
+        elif name == "read_command_output":
+            eid = resp.get("exec_id") or "latest"
+            if not resp.get("found"):
+                blocks.append(f"- **read_command_output** (`{eid}`): Not found ({resp.get('error', 'buffer empty')})")
+            else:
+                blocks.append(
+                    f"### `read_command_output` (`{eid}` · {resp.get('shown_lines', '?')}/{resp.get('total_lines', '?')} lines)\n"
+                    f"```text\n{resp.get('content', '')}\n```"
+                )
+        elif name == "scout_workspace":
+            steps_lbl = f"{resp.get('steps_taken', resp.get('steps_count', 0))} steps"
+            model_lbl = resp.get("model_used") or resp.get("model") or "scout"
+            stop_lbl = " · stopped early" if resp.get("stopped_early") else ""
+            blocks.append(
+                f"### `scout_workspace` ({model_lbl} · {steps_lbl}{stop_lbl})\n"
+                f"{resp.get('answer', '').strip()}"
+            )
+        elif name == "update_header":
+            staged = resp.get("staged_paths") or []
+            unchanged = resp.get("unchanged_paths") or []
+            blocks.append(
+                f"- **update_header**: Drafted **{len(staged)}** human-gated header patch(es)"
+                + (f" (`{', '.join(staged)}`)" if staged else "")
+                + (f"; {len(unchanged)} unchanged" if unchanged else "")
+                + "."
+            )
         elif resp.get("applied"):
             blocks.append(f"- **{name}**: Patch applied to `{resp.get('path')}` (backup: `{resp.get('backup_path')}`)")
         elif resp.get("renamed"):
@@ -938,10 +1059,15 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
         elif resp.get("written"):
             if resp.get("executed"):
                 del_note = " and deleted temporary script" if resp.get("deleted") else ""
+                eid = resp.get("exec_id")
+                eid_note = f" · `exec_id={eid}`" if eid else ""
                 line = (
                     f"- **{name}**: Wrote `{resp.get('path')}` and executed"
-                    f"{del_note} (exit code `{resp.get('exit_code')}`)."
+                    f"{del_note} (exit code `{resp.get('exit_code')}`{eid_note})."
                 )
+                ai_sum = (resp.get("ai_summary") or "").strip()
+                if ai_sum:
+                    line += f"\n> **Scout Summary:** {ai_sum}"
                 preview = (resp.get("output_preview") or "").strip()
                 if preview:
                     line += f"\n```text\n{preview}\n```"
@@ -960,10 +1086,18 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
                 )
             else:
                 status_lbl = "OK" if ok else "FAILED"
-            line = f"- **{name}** (`{cmd}`): **{status_lbl}** (exit code `{code}`)."
+            eid = resp.get("exec_id")
+            eid_note = f" · `exec_id={eid}`" if eid else ""
+            line = f"- **{name}** (`{cmd}`): **{status_lbl}** (exit code `{code}`{eid_note})."
+            ai_sum = (resp.get("ai_summary") or "").strip()
+            if ai_sum:
+                quoted = "\n> ".join(ai_sum.splitlines())
+                line += f"\n> **Scout Summary:** {quoted}"
             preview = (resp.get("output_preview") or "").strip()
             if preview:
                 line += f"\n```text\n{preview}\n```"
+            elif ai_sum and eid:
+                line += f"\n*(Raw output omitted to save tokens — call `read_command_output` with `exec_id={eid}` if exact lines are needed.)*"
             blocks.append(line)
         elif resp.get("deleted"):
             blocks.append(f"- **{name}**: Deleted `{resp.get('path')}` (backup: `{resp.get('backup_path')}`)")
@@ -975,10 +1109,18 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
             scope_note = ""
             if resp.get("is_full_suite") is False:
                 scope_note = " (quick/targeted check — savepoint stays active)"
-            line = f"- **run_tests** (`{cmd}`): **{status_lbl}** (exit code `{code}`){scope_note}."
+            eid = resp.get("exec_id")
+            eid_note = f" · `exec_id={eid}`" if eid else ""
+            line = f"- **run_tests** (`{cmd}`): **{status_lbl}** (exit code `{code}`{eid_note}){scope_note}."
+            ai_sum = (resp.get("ai_summary") or "").strip()
+            if ai_sum:
+                quoted = "\n> ".join(ai_sum.splitlines())
+                line += f"\n> **Scout Summary:** {quoted}"
             preview = (resp.get("output_preview") or "").strip()
             if preview:
                 line += f"\n```text\n{preview}\n```"
+            elif ai_sum and eid:
+                line += f"\n*(Raw output omitted to save tokens — call `read_command_output` with `exec_id={eid}` if exact lines are needed.)*"
             blocks.append(line)
         else:
             blocks.append(f"### `{name}`\n```json\n{json.dumps(resp, indent=2)}\n```")

@@ -224,6 +224,23 @@ function renderPendingGates() {
           decideGate(gate.id, { action: "approve" })
         )
       );
+    } else if (preview.category === "scout") {
+      actions.appendChild(
+        makeBtn("Approve Scout", "btn btn-primary btn-sm", () =>
+          decideGate(gate.id, { action: "approve" })
+        )
+      );
+      actions.appendChild(
+        makeBtn("Approve & Auto-Approve", "btn btn-secondary btn-sm", () =>
+          decideGate(gate.id, { action: "approve_and_auto" })
+        )
+      );
+    } else if (preview.category === "scout_headers") {
+      actions.appendChild(
+        makeBtn("Draft Header Diffs (Scout)", "btn btn-primary btn-sm", () =>
+          decideGate(gate.id, { action: "approve" })
+        )
+      );
     }
 
     actions.appendChild(
@@ -289,6 +306,10 @@ async function decideGate(gateId, body) {
     state.pendingStatusText = `Renaming${gatePath ? ` ${gatePath}` : " file"} (backing up first)...`;
   } else if (gateObj && ["patch_literal", "patch_lines", "write_file"].includes(gateObj.tool_name) && body.action === "approve") {
     state.pendingStatusText = `Applying patch${gatePath ? ` to ${gatePath}` : ""}...`;
+  } else if (gateObj && gateObj.tool_name === "scout_workspace" && body.action !== "deny") {
+    state.pendingStatusText = "Running Local AI Scout investigation...";
+  } else if (gateObj && gateObj.tool_name === "update_header" && body.action !== "deny") {
+    state.pendingStatusText = "Drafting header comment diffs with Local AI Scout...";
   } else if (!state.apiEnabled) {
     state.pendingStatusText = "Executing approved gate locally...";
   } else {
@@ -350,10 +371,15 @@ function applyGateResponse(res, actionHint) {
   state.busy = false;
   state.pendingStatusText = null;
   state.resolvingGateId = null;
+  state.liveScoutRun = null;
   state.activeSession = res.session;
   state.messages = res.messages;
   state.pendingGates = res.pending_gates || [];
   if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
+  if (res.scout_auto_approve_enabled) {
+    state.scout = { ...(state.scout || {}), auto_approve: true };
+    emit("scout:refresh");
+  }
 
   const cmdResults = Array.isArray(res.command_results)
     ? res.command_results

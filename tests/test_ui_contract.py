@@ -57,7 +57,11 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn(".chat-stream > *", css)
         self.assertIn("flex-shrink: 0", css)
         for req_id in (
-            "btn-bridge-directives-pill",
+            "bridge-copy-split",
+            "btn-bridge-copy-menu-toggle",
+            "bridge-copy-menu",
+            "btn-bridge-copy-with-directives",
+            "btn-bridge-skip-directives",
             "btn-bridge-close-paste",
             "btn-bridge-clipboard-parse",
             "bridge-prompt-slot",
@@ -112,12 +116,56 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn("isDetectedPromptAiPending", composer_js)
 
         api_js = (COMPANION_ROOT / "static" / "js" / "api.js").read_text(encoding="utf-8")
+        settings_js = (COMPANION_ROOT / "static" / "js" / "settings.js").read_text(encoding="utf-8")
+        git_js = (COMPANION_ROOT / "static" / "js" / "git.js").read_text(encoding="utf-8")
         self.assertIn(".msg-checkpoint", comp_css)
+        self.assertIn(".scout-live-card", comp_css)
+        self.assertIn(".scout-summary-banner", comp_css)
         self.assertIn("renderCheckpointCard", chat_js)
+        self.assertIn("renderLiveScoutCard", chat_js)
+        self.assertIn("scout:stream-event", chat_js)
+        self.assertIn("scout:stream-event", lifecycle_js)
         self.assertIn("Commit Anyway", chat_js)
         self.assertIn("Restore", chat_js)
         self.assertIn("restoreCheckpoint", api_js)
         self.assertIn("commitCheckpoint", api_js)
+        self.assertIn("getScoutSettings", api_js)
+        self.assertIn("gitUpdateHeaders", api_js)
+        self.assertIn('id="btn-scout-toggle"', html)
+        self.assertIn('id="btn-scout-auto"', html)
+        self.assertIn('id="btn-git-update-headers"', html)
+        self.assertIn("btn-scout-toggle", settings_js)
+        self.assertIn("btn-git-update-headers", git_js)
+
+        sessions_js = (COMPANION_ROOT / "static" / "js" / "sessions.js").read_text(encoding="utf-8")
+        for panel_id in (
+            "main-ai-block",
+            "btn-main-ai-toggle",
+            "main-stats-line",
+            "btn-main-details",
+            "scout-telemetry-block",
+            "scout-panel-body",
+            "scout-telemetry-model",
+            "scout-stats-line",
+            "btn-scout-details",
+            "ai-details-popover",
+            "cdp-controls-group",
+        ):
+            self.assertIn(f'id="{panel_id}"', html)
+        api_block = html.split('id="api-sidebar-block"', 1)[1].split('id="bridge-sidebar-block"', 1)[0]
+        self.assertNotIn('id="scout-telemetry-block"', api_block)
+        # Ensure Run Tests moved into Console tab and Directives + CDP controls moved out of topbar
+        topbar = html.split('class="topbar"', 1)[1].split("</header>", 1)[0]
+        self.assertNotIn('id="btn-bridge-directives-pill"', topbar)
+        self.assertNotIn('id="bridge-copy-split"', topbar)
+        self.assertNotIn('id="cdp-tab-select"', topbar)
+        self.assertNotIn('id="btn-scout-toggle"', topbar)
+        tab_terminal = html.split('id="tab-terminal"', 1)[1].split('id="tab-git"', 1)[0]
+        self.assertIn('id="btn-run-post-tests"', tab_terminal)
+        self.assertIn(".ai-details-popover", comp_css)
+        self.assertIn(".scout-model-list", comp_css)
+        self.assertIn("renderScoutTelemetry", sessions_js)
+        self.assertIn("toggleDetailsPopover", sessions_js)
 
     def test_theme_selector_and_css_tokens(self) -> None:
         html = (COMPANION_ROOT / "static" / "index.html").read_text(encoding="utf-8")

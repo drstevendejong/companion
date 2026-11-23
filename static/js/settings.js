@@ -1,9 +1,13 @@
-// settings.js - Gemini API Key modal & key verification (0 startup API calls)
+// settings.js - Gemini API Key modal, verification, & Local AI Scout settings (0 startup API calls)
 
 import { api } from "./api.js";
-import { on, state } from "./state.js";
+import { emit, on, state } from "./state.js";
 
 const keyBtn = document.getElementById("btn-api-key");
+const scoutToggleBtn = document.getElementById("btn-scout-toggle");
+const scoutAutoBtn = document.getElementById("btn-scout-auto");
+const scoutPanelBody = document.getElementById("scout-panel-body");
+const scoutModelBadge = document.getElementById("scout-telemetry-model");
 const modal = document.getElementById("api-key-modal");
 const form = document.getElementById("api-key-form");
 const keyInput = document.getElementById("api-key-input");
@@ -26,6 +30,13 @@ function resolvePendingKeyPrompt(configured) {
 
 export async function initSettings() {
   keyBtn.addEventListener("click", () => openKeyModal(false));
+  if (scoutToggleBtn) {
+    scoutToggleBtn.addEventListener("change", handleScoutToggleClick);
+  }
+  if (scoutAutoBtn) {
+    scoutAutoBtn.addEventListener("change", handleScoutAutoClick);
+  }
+
   cancelBtn.addEventListener("click", () => {
     modal.close();
     resolvePendingKeyPrompt(false);
@@ -43,8 +54,10 @@ export async function initSettings() {
   form.addEventListener("submit", handleSaveKey);
 
   on("settings:open-key-modal", (reason) => openKeyModal(true, reason));
+  on("scout:refresh", refreshScoutSettings);
 
   await refreshKeyStatus();
+  await refreshScoutSettings();
 }
 
 export async function refreshKeyStatus() {
@@ -52,11 +65,136 @@ export async function refreshKeyStatus() {
     const status = await api.getApiKeyStatus(false);
     state.hasApiKey = Boolean(status && status.configured);
     updateButtonBadge(status);
+    emit("settings:key-changed");
     return status;
   } catch {
     state.hasApiKey = false;
     updateButtonBadge({ configured: false });
+    emit("settings:key-changed");
     return { configured: false };
+  }
+}
+
+export async function refreshScoutSettings() {
+  let telemetry = null;
+  try {
+    const cfg = await api.getScoutSettings();
+    state.scout = cfg || {
+      enabled: false,
+      configured_enabled: false,
+      auto_approve: false,
+      active_model: null,
+      max_tokens: 30000,
+      available_lite_models: [],
+    };
+    telemetry = cfg && cfg.telemetry ? cfg.telemetry : null;
+  } catch {
+    state.scout = {
+      enabled: false,
+      configured_enabled: false,
+      auto_approve: false,
+      active_model: null,
+      max_tokens: 30000,
+      available_lite_models: [],
+    };
+  }
+  if (telemetry) {
+    emit("telemetry:updated", telemetry);
+  }
+  renderScoutToggleButtons();
+  emit("scout:changed", state.scout);
+  return state.scout;
+}
+
+function formatShortModel(modelId) {
+  if (!modelId) return "";
+  return String(modelId).replace(/^gemini-/, "");
+}
+
+function renderScoutToggleButtons() {
+  if (!scoutToggleBtn || !scoutAutoBtn) return;
+  const s = state.scout || {};
+  const enabled = Boolean(s.enabled);
+  const autoApprove = Boolean(s.auto_approve);
+  const shortModel = formatShortModel(s.active_model);
+
+  scoutToggleBtn.checked = enabled;
+  scoutToggleBtn.title = enabled
+    ? `Scout AI ON · Model: ${s.active_model || "-lite"} (LOW/MINIMAL thinking) · Click to turn Off`
+    : state.hasApiKey
+      ? "Scout AI OFF · Click to enable lightweight -lite workspace search, output triage & header updates"
+      : "Scout AI OFF · Click to save a Gemini API key and enable Scout (works in both Bridge & API modes)";
+
+  if (scoutPanelBody) {
+    scoutPanelBody.classList.toggle("hidden", !enabled);
+  }
+  if (scoutModelBadge) {
+    scoutModelBadge.classList.toggle("hidden", !enabled);
+    if (enabled) {
+      scoutModelBadge.textContent = shortModel || "-lite";
+      scoutModelBadge.title = `Active Scout model: ${s.active_model || "-lite"}`;
+    }
+  }
+
+  scoutAutoBtn.checked = enabled && autoApprove;
+  scoutAutoBtn.disabled = !enabled;
+  scoutAutoBtn.title = autoApprove
+    ? "Auto-run prompts ON: scout_workspace prompts run automatically without pausing at a gate"
+    : "Auto-run prompts OFF: pause at a gate before running scout_workspace prompts";
+}
+
+async function handleScoutToggleClick() {
+  const currentlyEnabled = Boolean(state.scout && state.scout.enabled);
+  const targetEnabled = !currentlyEnabled;
+  if (targetEnabled && !state.hasApiKey) {
+    if (scoutToggleBtn) scoutToggleBtn.checked = false;
+    const saved = await requestApiKeyForSessionSetup(
+      "Save a Gemini API key to enable Local AI Scout (uses lightweight -lite models in both Bridge & API modes)."
+    );
+    if (!saved) {
+      if (scoutToggleBtn) scoutToggleBtn.checked = false;
+      return;
+    }
+  }
+
+  if (scoutToggleBtn) scoutToggleBtn.disabled = true;
+  try {
+    const cfg = await api.updateScoutSettings({ enabled: targetEnabled });
+    state.scout = cfg;
+    if (cfg && cfg.telemetry) {
+      emit("telemetry:updated", cfg.telemetry);
+    }
+    renderScoutToggleButtons();
+    emit("scout:changed", state.scout);
+  } catch (err) {
+    if (scoutToggleBtn) scoutToggleBtn.checked = currentlyEnabled;
+    emit("chat:error", err.message);
+  } finally {
+    if (scoutToggleBtn) scoutToggleBtn.disabled = false;
+  }
+}
+
+async function handleScoutAutoClick() {
+  if (!state.scout || !state.scout.enabled) {
+    if (scoutAutoBtn) scoutAutoBtn.checked = false;
+    return;
+  }
+  const prevAuto = Boolean(state.scout.auto_approve);
+  const nextAuto = !prevAuto;
+  if (scoutAutoBtn) scoutAutoBtn.disabled = true;
+  try {
+    const cfg = await api.updateScoutSettings({ auto_approve: nextAuto });
+    state.scout = cfg;
+    if (cfg && cfg.telemetry) {
+      emit("telemetry:updated", cfg.telemetry);
+    }
+    renderScoutToggleButtons();
+    emit("scout:changed", state.scout);
+  } catch (err) {
+    if (scoutAutoBtn) scoutAutoBtn.checked = prevAuto;
+    emit("chat:error", err.message);
+  } finally {
+    if (scoutAutoBtn) scoutAutoBtn.disabled = false;
   }
 }
 
@@ -78,6 +216,7 @@ async function openKeyModal(forceNotice = false, customError = "") {
     const status = await api.getApiKeyStatus(false);
     state.hasApiKey = Boolean(status.configured);
     updateButtonBadge(status);
+    emit("settings:key-changed");
     if (status.configured) {
       statusMsg.textContent = `Current key (${status.source}): ${status.masked_preview} · Stored at ${status.key_file}`;
     } else {
@@ -113,6 +252,8 @@ async function handleSaveKey(ev) {
       masked_preview: res.masked_preview,
       source: res.source,
     });
+    emit("settings:key-changed");
+    await refreshScoutSettings();
     const resolver = keyPromptResolver;
     keyPromptResolver = null;
     modal.close();
@@ -133,6 +274,8 @@ async function handleClearKey() {
     await api.clearApiKey();
     state.hasApiKey = false;
     updateButtonBadge({ configured: false });
+    emit("settings:key-changed");
+    await refreshScoutSettings();
     statusMsg.textContent = "Saved key removed. Only Playground Bridge sessions can run until a key is saved.";
   } catch (err) {
     errorEl.textContent = err.message;
@@ -148,3 +291,4 @@ function updateButtonBadge(status) {
     keyBtn.title = "No Gemini API key configured (optional for Playground Bridge sessions)";
   }
 }
+

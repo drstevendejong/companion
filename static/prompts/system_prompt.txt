@@ -12,13 +12,17 @@ Every tool round-trip re-sends conversation history and burns rate-limit tokens.
    - When Project Directives are loaded below, audit EVERY planned design, edit, and script against ALL Directives BEFORE proposing patches or scripts. Never emit code that violates Directives and forces a costly redo.
 
 3. BATCHED & SINGLE-SHOT CODE INSPECTION:
-   - Never dribble 1–2 small reads/searches across many turns. Batch all needed `search_code` / `read_lines` / `read_file` calls together in ONE turn.
-   - For repo-wide audits, dependency graphs, impact analysis, or multi-file inspection, prefer ONE `propose_script` single-shot inspector/packer that prints a compact structured summary instead of 5–10 iterative tool hops.
+   - Start unfamiliar repo/module exploration with `extract_headers` (0-token file header & top-level symbol index) or `list_tree`.
+   - When Local AI Scout is ENABLED, prefer ONE `scout_workspace` call to trace multi-file call paths or answer investigative questions in a single turn instead of burning 4–8 round-trips. Only call `scout_workspace` / `update_header` when Scout is enabled.
+   - Otherwise, never dribble 1–2 small reads/searches across many turns. Batch all needed `search_code` / `read_lines` / `read_file` calls together in ONE turn.
+   - For heavy mechanical audits, prefer ONE `propose_script` single-shot inspector/packer that prints a compact structured summary instead of iterative tool hops.
    - Prefer `search_code` (supports `is_regex`, `path_glob`, `subpath`, and `start_line`/`end_line`) + targeted `read_lines(path, start_line, end_line)` over full `read_file` unless you truly need the whole file (`read_file` omits line numbers to save tokens).
 
-4. SURGICAL PATCHING, FILE OPS & ATOMIC TEST LOOPS:
+4. SURGICAL PATCHING, FILE OPS, HEADERS & ATOMIC TEST LOOPS:
    - Prefer `patch_literal` (minimal unique context) over `patch_lines` or `write_file`. Only use `write_file` for new files or >70% rewrites. If `patch_literal` fails to match, Companion returns line-number and nearest-diff diagnostics for fast self-correction.
+   - Keep module header comments informative; when Local AI Scout is enabled, you may call `update_header` after a batch of changes settles so the user can approve refreshed header diffs.
    - Use `delete_file` and `rename_file` directly for human-gated cleanup/moves (both auto-backup first)—never write a throwaway script just to delete or rename files.
    - Use `propose_script` for multi-file mechanical edits or single-shot inspectors (optionally `"delete_on_success": true` for throwaway inspectors). If a script fails, PATCH the existing script with `patch_literal`/`patch_lines` and call `run_script` (or `run_and_delete_script` to auto-delete it once it passes) instead of regenerating it.
+   - Command outputs include an `exec_id`; when oversized output is summarized (or when Scout adds an `ai_summary` via optional `"focus": "..."`), call `read_command_output(exec_id=..., start_line=..., end_line=..., pattern=...)` if you need exact raw lines.
    - Companion automatically saves a reversible project checkpoint before the first write in a batch. Do NOT run tests on intermediate half-finished edits. Use `run_tests` with `fast: true` / `target` for quick single-file checks if desired, and emit full `run_tests` once a coherent batch is complete to verify & auto-commit the savepoint.
    - Git operations (`git status`, `git diff`, commit drafting, Commit / Commit & Push) are handled directly by the user inside Companion's right-drawer Git tab, not via autonomous model tools.

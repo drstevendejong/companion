@@ -9,9 +9,14 @@ import { emit, estimateTokensLocal, getActiveProject, on, state } from "./state.
 const promptInput = document.getElementById("prompt-input");
 const clipboardParseBtn = document.getElementById("btn-bridge-clipboard-parse");
 
-const directivesPill = document.getElementById("btn-bridge-directives-pill");
+const copySplitWrap = document.getElementById("bridge-copy-split");
 const copyImgBtn = document.getElementById("btn-bridge-copy-img");
 const copyBundleBtn = document.getElementById("btn-bridge-copy-bundle");
+const copyMenuToggleBtn = document.getElementById("btn-bridge-copy-menu-toggle");
+const copyMenu = document.getElementById("bridge-copy-menu");
+const copyWithDirectivesItem = document.getElementById("btn-bridge-copy-with-directives");
+const skipDirectivesItem = document.getElementById("btn-bridge-skip-directives");
+const copyMenuMeta = document.getElementById("bridge-copy-menu-meta");
 
 const detectBar = document.getElementById("bridge-prompt-detect-bar");
 const detectKeepBtn = document.getElementById("btn-prompt-keep-text");
@@ -43,7 +48,37 @@ let dismissedDetectForText = null;
 const mdContentCache = new Map(); // `${projectId}:${path}` -> markdown text
 
 export function initBridge() {
-  copyBundleBtn.addEventListener("click", copyPromptBundle);
+  copyBundleBtn.addEventListener("click", () => copyPromptBundle());
+  if (copyMenuToggleBtn) {
+    copyMenuToggleBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      toggleCopyMenu();
+    });
+  }
+  if (copyWithDirectivesItem) {
+    copyWithDirectivesItem.addEventListener("click", () => {
+      closeCopyMenu();
+      void copyPromptBundle(true);
+    });
+  }
+  if (skipDirectivesItem) {
+    skipDirectivesItem.addEventListener("click", () => {
+      directivesOverride = !isBridgeDirectivesChecked();
+      closeCopyMenu();
+      syncDirectivesPillForSession();
+      emit("composer:updated");
+    });
+  }
+  document.addEventListener("click", (ev) => {
+    if (!copyMenu || copyMenu.classList.contains("hidden")) return;
+    if (copySplitWrap && copySplitWrap.contains(ev.target)) return;
+    closeCopyMenu();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && copyMenu && !copyMenu.classList.contains("hidden")) {
+      closeCopyMenu();
+    }
+  });
   copyImgBtn.addEventListener("click", copyNextCdpImage);
   clipboardParseBtn.addEventListener("click", () => handleClipboardQuickParse(true));
   closePasteBtn.addEventListener("click", () => setManualPasteOpen(false, false));
@@ -71,29 +106,21 @@ export function initBridge() {
   copyOutputBtn.addEventListener("click", handleCopyOutputClick);
   dismissOutputBtn.addEventListener("click", hideOutputBar);
 
-  directivesPill.addEventListener("click", () => {
-    directivesOverride = !isBridgeDirectivesChecked();
-    syncDirectivesPillForSession();
-    emit("composer:updated");
-  });
-
-  on("bridge:copy-bundle", copyPromptBundle);
+  on("bridge:copy-bundle", () => copyPromptBundle());
   on("bridge:run-detected-prompt", runDetectedBridgeFromPrompt);
   on("bridge:session-synced", syncDirectivesPillForSession);
   on("composer:attachments-changed", () => {
     syncImageCopyButton();
-    syncCopyBundleHighlight();
+    syncDirectivesPillForSession();
   });
   on("composer:updated", () => {
-    syncCopyBundleHighlight();
-    syncPromptDetectBar();
+    syncDirectivesPillForSession();
   });
   on("app:mode-changed", () => {
+    closeCopyMenu();
     syncManualPasteVisibility();
     syncDirectivesPillForSession();
     syncImageCopyButton();
-    syncCopyBundleHighlight();
-    syncPromptDetectBar();
   });
 
   on("bridge:auto-copy-result", async ({ key, text, mdCacheKey, mdContent }) => {
@@ -165,6 +192,11 @@ export function formatBridgeToolResults(toolEvents) {
       blocks.push(`- **${name}**${targetPart} **Error**: ${resp.error}`);
     } else if (name === "list_tree") {
       blocks.push(`### \`list_tree\` (${resp.subpath || "."})\n\`\`\`text\n${resp.tree || ""}\n\`\`\``);
+    } else if (name === "extract_headers") {
+      blocks.push(
+        `### \`extract_headers\` (\`${resp.pattern || "."}\` · ${resp.file_count ?? 0} files, ${resp.header_count ?? 0} headers)\n` +
+          `\`\`\`text\n${resp.formatted || ""}\n\`\`\``
+      );
     } else if (name === "search_code") {
       blocks.push(
         `### \`search_code\` (\`${resp.pattern || ""}\` · ${resp.total_hits ?? 0} hits)\n` +
@@ -176,6 +208,28 @@ export function formatBridgeToolResults(toolEvents) {
         `### \`${name}\` (\`${p}\` · ${resp.total_lines ?? "?"} lines)\n` +
           `\`\`\`text\n${resp.content || ""}\n\`\`\``
       );
+    } else if (name === "read_command_output") {
+      const eid = resp.exec_id || "latest";
+      if (!resp.found) {
+        blocks.push(`- **read_command_output** (\`${eid}\`): Not found (${resp.error || "buffer empty"})`);
+      } else {
+        blocks.push(
+          `### \`read_command_output\` (\`${eid}\` · ${resp.shown_lines ?? "?"}/${resp.total_lines ?? "?"} lines)\n` +
+            `\`\`\`text\n${resp.content || ""}\n\`\`\``
+        );
+      }
+    } else if (name === "scout_workspace") {
+      const stepsLbl = `${resp.steps_taken ?? resp.steps_count ?? 0} steps`;
+      const modelLbl = resp.model_used || resp.model || "scout";
+      const stopLbl = resp.stopped_early ? " · stopped early" : "";
+      blocks.push(`### \`scout_workspace\` (${modelLbl} · ${stepsLbl}${stopLbl})\n${String(resp.answer || "").trim()}`);
+    } else if (name === "update_header") {
+      const staged = Array.isArray(resp.staged_paths) ? resp.staged_paths : [];
+      const unchanged = Array.isArray(resp.unchanged_paths) ? resp.unchanged_paths : [];
+      let msg = `- **update_header**: Drafted **${staged.length}** human-gated header patch(es)`;
+      if (staged.length) msg += ` (\`${staged.join(", ")}\`)`;
+      if (unchanged.length) msg += `; ${unchanged.length} unchanged`;
+      blocks.push(`${msg}.`);
     } else if (resp.applied) {
       blocks.push(`- **${name}**: Patch applied to \`${resp.path}\` (backup: \`${resp.backup_path}\`)`);
     } else if (resp.renamed) {
@@ -185,7 +239,10 @@ export function formatBridgeToolResults(toolEvents) {
     } else if (resp.written) {
       if (resp.executed) {
         const delNote = resp.deleted ? " and deleted temporary script" : "";
-        let line = `- **${name}**: Wrote \`${resp.path}\` and executed${delNote} (exit code \`${resp.exit_code}\`).`;
+        const eidNote = resp.exec_id ? ` · \`exec_id=${resp.exec_id}\`` : "";
+        let line = `- **${name}**: Wrote \`${resp.path}\` and executed${delNote} (exit code \`${resp.exit_code}\`${eidNote}).`;
+        const aiSum = String(resp.ai_summary || "").trim();
+        if (aiSum) line += `\n> **Scout Summary:** ${aiSum}`;
         const preview = String(resp.output_preview || "").trim();
         if (preview) {
           line += `\n\`\`\`text\n${preview}\n\`\`\``;
@@ -208,10 +265,18 @@ export function formatBridgeToolResults(toolEvents) {
           : ok
             ? "OK"
             : "FAILED";
-      let line = `- **${name}** (\`${cmd}\`): **${statusLbl}** (exit code \`${code}\`).`;
+      const eidNote = resp.exec_id ? ` · \`exec_id=${resp.exec_id}\`` : "";
+      let line = `- **${name}** (\`${cmd}\`): **${statusLbl}** (exit code \`${code}\`${eidNote}).`;
+      const aiSum = String(resp.ai_summary || "").trim();
+      if (aiSum) {
+        const quoted = aiSum.split("\n").join("\n> ");
+        line += `\n> **Scout Summary:** ${quoted}`;
+      }
       const preview = String(resp.output_preview || "").trim();
       if (preview) {
         line += `\n\`\`\`text\n${preview}\n\`\`\``;
+      } else if (aiSum && resp.exec_id) {
+        line += `\n*(Raw output omitted to save tokens — call \`read_command_output\` with \`exec_id=${resp.exec_id}\` if exact lines are needed.)*`;
       }
       blocks.push(line);
     } else if (resp.deleted) {
@@ -222,10 +287,18 @@ export function formatBridgeToolResults(toolEvents) {
       const passed = Boolean(resp.passed) && code === 0 && !resp.has_traceback;
       const statusLbl = passed ? "PASSED" : "FAILED";
       const scopeNote = resp.is_full_suite === false ? " (quick/targeted check — savepoint stays active)" : "";
-      let line = `- **run_tests** (\`${cmd}\`): **${statusLbl}** (exit code \`${code}\`)${scopeNote}.`;
+      const eidNote = resp.exec_id ? ` · \`exec_id=${resp.exec_id}\`` : "";
+      let line = `- **run_tests** (\`${cmd}\`): **${statusLbl}** (exit code \`${code}\`${eidNote})${scopeNote}.`;
+      const aiSum = String(resp.ai_summary || "").trim();
+      if (aiSum) {
+        const quoted = aiSum.split("\n").join("\n> ");
+        line += `\n> **Scout Summary:** ${quoted}`;
+      }
       const preview = String(resp.output_preview || "").trim();
       if (preview) {
         line += `\n\`\`\`text\n${preview}\n\`\`\``;
+      } else if (aiSum && resp.exec_id) {
+        line += `\n*(Raw output omitted to save tokens — call \`read_command_output\` with \`exec_id=${resp.exec_id}\` if exact lines are needed.)*`;
       }
       blocks.push(line);
     } else {
@@ -264,10 +337,38 @@ function syncManualPasteVisibility() {
   pasteWrap.classList.toggle("hidden", !manualPasteOpen);
 }
 
+let isCopyingBundle = false;
+
+function hasComposerDraft() {
+  return Boolean((promptInput.value || "").trim()) || (state.attachments || []).length > 0;
+}
+
+function closeCopyMenu() {
+  if (!copyMenu) return;
+  copyMenu.classList.add("hidden");
+  if (copyMenuToggleBtn) copyMenuToggleBtn.setAttribute("aria-expanded", "false");
+}
+
+function toggleCopyMenu() {
+  if (!copyMenu || !state.activeSessionId) return;
+  const open = copyMenu.classList.contains("hidden");
+  copyMenu.classList.toggle("hidden", !open);
+  if (copyMenuToggleBtn) copyMenuToggleBtn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
 function syncCopyBundleHighlight() {
   if (!copyBundleBtn) return;
-  const hasDraft = Boolean((promptInput.value || "").trim()) || (state.attachments || []).length > 0;
-  copyBundleBtn.classList.toggle("is-prompt-ready", isBridgeDirectivesChecked() || hasDraft);
+  const hasSession = Boolean(state.activeSessionId);
+  const hasDraft = hasComposerDraft();
+  const includeDir = isBridgeDirectivesChecked();
+  const canCopy = hasSession && (hasDraft || includeDir);
+  if (!isCopyingBundle) {
+    copyBundleBtn.disabled = !canCopy;
+  }
+  copyBundleBtn.classList.toggle("is-prompt-ready", canCopy);
+  if (copyMenuToggleBtn) {
+    copyMenuToggleBtn.disabled = !hasSession || isCopyingBundle;
+  }
 }
 
 function syncDirectivesPillForSession() {
@@ -277,22 +378,59 @@ function syncDirectivesPillForSession() {
     lastSyncedSessionId = sid;
     directivesOverride = null;
     queuedImages = [];
+    closeCopyMenu();
     hideOutputBar();
     setManualPasteOpen(false, false);
     syncImageCopyButton();
   }
   const checked = isBridgeDirectivesChecked();
   const alreadySent = Boolean(s && s.directives_sent);
-  directivesPill.classList.toggle("is-pending", checked);
-  directivesPill.classList.toggle("is-sent", !checked);
-  if (checked) {
-    directivesPill.textContent = alreadySent ? "Directives: Re-include" : "Directives: On";
-  } else {
-    directivesPill.textContent = alreadySent ? "Directives ✓" : "Directives: Off";
+  const hasDraft = hasComposerDraft();
+
+  if (!isCopyingBundle && copyBundleBtn) {
+    copyBundleBtn.textContent = checked ? "Copy + Directives" : "Copy Prompt";
+    copyBundleBtn.title = checked
+      ? "Copy prompt, attachments & Project Directives for Playground (Ctrl+Enter)"
+      : hasDraft
+        ? "Copy prompt & attachments to clipboard for Playground (Ctrl+Enter)"
+        : "Type a prompt or use the menu (▾) to copy Directives";
   }
-  if (!copyBundleBtn.disabled) {
-    copyBundleBtn.textContent = checked ? "Copy Starter \u2192 Playground" : "Copy Prompt \u2192 Playground";
+
+  if (copyWithDirectivesItem) {
+    if (!checked) {
+      copyWithDirectivesItem.classList.remove("hidden");
+      copyWithDirectivesItem.textContent = hasDraft
+        ? "Copy Prompt + Directives"
+        : "Copy Directives Only";
+      copyWithDirectivesItem.title = hasDraft
+        ? "Bundle current prompt & attachments with Project Directives for Playground"
+        : "Copy Project Directives & Tool Contract alone (for a new Playground chat)";
+    } else if (hasDraft) {
+      copyWithDirectivesItem.classList.add("hidden");
+    } else {
+      copyWithDirectivesItem.classList.add("hidden");
+    }
   }
+
+  if (skipDirectivesItem) {
+    if (!alreadySent) {
+      skipDirectivesItem.classList.remove("hidden");
+      skipDirectivesItem.textContent = checked ? "Skip Directives" : "Include Directives";
+      skipDirectivesItem.title = checked
+        ? "Do not include Project Directives in next copy"
+        : "Include Project Directives in next copy";
+    } else {
+      skipDirectivesItem.classList.add("hidden");
+    }
+  }
+
+  if (copyMenuMeta) {
+    const baseDirTip = state.directivesInfoText || "Project Directives & Tool Contract";
+    copyMenuMeta.textContent = alreadySent
+      ? `Already sent · ${baseDirTip}`
+      : `First turn · ${baseDirTip}`;
+  }
+
   syncCopyBundleHighlight();
   syncPromptDetectBar();
 }
@@ -362,17 +500,22 @@ function syncImageCopyButton() {
   }
 }
 
-async function copyPromptBundle() {
+async function copyPromptBundle(forceIncludeDirectives = null) {
   if (!state.activeSessionId) return;
   const prompt = promptInput.value.trim();
   const hasAtts = (state.attachments || []).length > 0;
-  const includeDir = isBridgeDirectivesChecked();
+  const includeDir =
+    typeof forceIncludeDirectives === "boolean"
+      ? forceIncludeDirectives
+      : isBridgeDirectivesChecked();
   if (!prompt && !hasAtts && !includeDir) return;
 
   const sentAttachments = [...state.attachments];
   const imgAtts = sentAttachments.filter((a) => a.kind === "image");
 
+  isCopyingBundle = true;
   copyBundleBtn.disabled = true;
+  if (copyMenuToggleBtn) copyMenuToggleBtn.disabled = true;
   copyBundleBtn.textContent = "Bundling...";
 
   try {
@@ -396,6 +539,7 @@ async function copyPromptBundle() {
     if (res.session) state.activeSession = res.session;
     if (res.messages) state.messages = res.messages;
     directivesOverride = null;
+    isCopyingBundle = false;
     syncDirectivesPillForSession();
     setManualPasteOpen(false, false);
     emit("composer:updated");
@@ -403,17 +547,15 @@ async function copyPromptBundle() {
 
     copyBundleBtn.textContent = `Copied (~${Number(res.estimated_tokens || 0).toLocaleString()} tok)`;
     setTimeout(() => {
-      copyBundleBtn.textContent = isBridgeDirectivesChecked()
-        ? "Copy Starter \u2192 Playground"
-        : "Copy Prompt \u2192 Playground";
+      syncDirectivesPillForSession();
     }, 2000);
   } catch (err) {
+    isCopyingBundle = false;
     emit("chat:error", err.message);
-    copyBundleBtn.textContent = isBridgeDirectivesChecked()
-      ? "Copy Starter \u2192 Playground"
-      : "Copy Prompt \u2192 Playground";
+    syncDirectivesPillForSession();
   } finally {
-    copyBundleBtn.disabled = false;
+    isCopyingBundle = false;
+    syncCopyBundleHighlight();
   }
 }
 
@@ -529,6 +671,9 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true, opts = {}) {
       }
     }
 
+    if (res.telemetry) {
+      emit("telemetry:updated", res.telemetry);
+    }
     emit("session:updated");
     emit("chat:loaded");
     if (extraWarnings.length > 0) {

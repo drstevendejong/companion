@@ -113,8 +113,17 @@ export const api = {
 
   // Git
   gitStatus: (projectId) => requestJson(`/api/git/status?project_id=${encodeURIComponent(projectId)}`),
-  gitDraftMessage: (projectId, model) =>
-    requestJson("/api/git/draft-message", { method: "POST", body: JSON.stringify({ project_id: projectId, model }) }),
+  gitDraftMessage: (projectId, model, useScout = false) =>
+    requestJson("/api/git/draft-message", {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, model, use_scout: Boolean(useScout) }),
+    }),
+  gitUpdateHeaders: (body) =>
+    requestJson("/api/git/update-headers", {
+      method: "POST",
+      body: JSON.stringify(body),
+      timeoutMs: 120000,
+    }),
   gitCommit: (body) => requestJson("/api/git/commit", { method: "POST", body: JSON.stringify(body) }),
 
   // CDP
@@ -124,9 +133,21 @@ export const api = {
   cdpConsole: (wsUrl) =>
     requestJson("/api/cdp/console", { method: "POST", body: JSON.stringify({ ws_url: wsUrl }) }),
 
-  // Settings (API Key, Telemetry)
+  // Settings (API Key, Telemetry, Local AI Scout)
   getTelemetry: (model = null) =>
     requestJson(`/api/settings/telemetry${model ? `?model=${encodeURIComponent(model)}` : ""}`),
+  getScoutSettings: () => requestJson("/api/settings/scout"),
+  updateScoutSettings: (body) =>
+    requestJson("/api/settings/scout", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  pauseScoutRun: (runId) =>
+    requestJson(`/api/chat/scout/${encodeURIComponent(runId)}/pause`, { method: "POST" }),
+  resumeScoutRun: (runId) =>
+    requestJson(`/api/chat/scout/${encodeURIComponent(runId)}/resume`, { method: "POST" }),
+  stopScoutRun: (runId) =>
+    requestJson(`/api/chat/scout/${encodeURIComponent(runId)}/stop`, { method: "POST" }),
   getApiKeyStatus: (verify = false) => requestJson(`/api/settings/api-key?verify=${verify ? "true" : "false"}`),
   saveApiKey: (apiKey, validateKey = true) =>
     requestJson("/api/settings/api-key", {

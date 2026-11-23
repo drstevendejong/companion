@@ -26,10 +26,15 @@ export async function refreshTabs() {
   try {
     const res = await api.cdpTabs(port);
     const hasTabs = Boolean(res.connected && res.tabs && res.tabs.length > 0);
+    tabSelect.classList.toggle("hidden", !hasTabs);
     shotBtn.classList.toggle("hidden", !hasTabs);
     consoleBtn.classList.toggle("hidden", !hasTabs);
+    refreshBtn.innerHTML = hasTabs ? "&#8635;" : "Chrome &#8635;";
+    refreshBtn.title = hasTabs
+      ? `Refresh Chrome :${port} tabs`
+      : `Chrome :${port} offline — click to check debug tabs`;
     if (!hasTabs) {
-      tabSelect.innerHTML = `<option value="">Chrome :${port} (${res.connected ? "0 tabs" : "Offline"})</option>`;
+      tabSelect.innerHTML = "";
       return;
     }
     const prev = tabSelect.value;
@@ -40,16 +45,19 @@ export async function refreshTabs() {
       tabSelect.value = prev;
     }
   } catch {
+    tabSelect.classList.add("hidden");
     shotBtn.classList.add("hidden");
     consoleBtn.classList.add("hidden");
-    tabSelect.innerHTML = `<option value="">Chrome :${port} (Offline)</option>`;
+    tabSelect.innerHTML = "";
+    refreshBtn.innerHTML = "Chrome &#8635;";
+    refreshBtn.title = `Chrome :${port} offline — click to check debug tabs`;
   }
 }
 
 async function captureScreenshot() {
   const wsUrl = tabSelect.value;
   if (!wsUrl) {
-    emit("chat:error", "No Chrome :9222 tab selected. Click Refresh Tabs once Chrome is open in debug mode.");
+    emit("chat:error", "No Chrome :9222 tab selected. Click Chrome refresh once Chrome is open in debug mode.");
     return;
   }
   shotBtn.disabled = true;
@@ -67,7 +75,7 @@ async function captureScreenshot() {
     emit("chat:error", err.message);
   } finally {
     shotBtn.disabled = false;
-    shotBtn.textContent = "CDP Screenshot";
+    shotBtn.textContent = "Screenshot";
   }
 }
 
@@ -86,7 +94,7 @@ async function captureConsole() {
     emit("chat:error", err.message);
   } finally {
     consoleBtn.disabled = false;
-    consoleBtn.textContent = "CDP Console";
+    consoleBtn.textContent = "Console";
   }
 }
 

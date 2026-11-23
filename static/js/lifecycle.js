@@ -143,6 +143,14 @@ export function initLifecycle() {
             msg.type === "exec_done"
           ) {
             emit("terminal:stream-event", msg);
+          } else if (
+            msg.type === "scout_start" ||
+            msg.type === "scout_step" ||
+            msg.type === "scout_hop" ||
+            msg.type === "scout_paused" ||
+            msg.type === "scout_done"
+          ) {
+            emit("scout:stream-event", msg);
           }
         } catch {
           // ignore malformed keepalive payload

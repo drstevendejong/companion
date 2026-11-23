@@ -18,6 +18,7 @@ export function initChat() {
   on("chat:loaded", () => renderMessages({ preserveScroll: false }));
   on("chat:refresh-badges", () => renderMessages({ preserveScroll: true }));
   on("chat:live-exec", updateLiveExecPreview);
+  on("scout:stream-event", handleScoutStreamEvent);
   on("chat:error", async (msg) => {
     const text = String(msg || "Unknown error");
     const errKey = `err:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
@@ -87,6 +88,7 @@ function renderMessages({ preserveScroll = false } = {}) {
     state.messages.length > 0 ||
     activities.length > 0 ||
     checkpoints.length > 0 ||
+    Boolean(state.liveScoutRun) ||
     Boolean(state.pendingStatusText);
 
   if (!hasAnything) {
@@ -227,7 +229,9 @@ function renderMessages({ preserveScroll = false } = {}) {
     actCursor += 1;
   }
 
-  if (state.pendingStatusText) {
+  if (state.liveScoutRun) {
+    renderLiveScoutCard(state.liveScoutRun);
+  } else if (state.pendingStatusText) {
     const liveSlice = formatLivePreviewSlice(state.liveExec && state.liveExec.output);
     const pendingCard = document.createElement("article");
     pendingCard.className = "msg-card msg-exec";
@@ -394,6 +398,12 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
   }
 
   for (const execResp of executedScripts) {
+    if (execResp.ai_summary) {
+      const sumDiv = document.createElement("div");
+      sumDiv.className = "scout-summary-banner";
+      sumDiv.textContent = `Scout Summary${execResp.ai_summary_model ? ` (${execResp.ai_summary_model})` : ""}: ${execResp.ai_summary}`;
+      card.appendChild(sumDiv);
+    }
     if (execResp.output_preview) {
       const pre = document.createElement("pre");
       pre.className = "exec-preview";
@@ -402,11 +412,27 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
     }
   }
   for (const testResp of testRuns) {
+    if (testResp.ai_summary) {
+      const sumDiv = document.createElement("div");
+      sumDiv.className = "scout-summary-banner";
+      sumDiv.textContent = `Scout Summary${testResp.ai_summary_model ? ` (${testResp.ai_summary_model})` : ""}: ${testResp.ai_summary}`;
+      card.appendChild(sumDiv);
+    }
     if (testResp.output_preview) {
       const pre = document.createElement("pre");
       pre.className = "exec-preview";
       pre.textContent = testResp.output_preview;
       card.appendChild(pre);
+    }
+  }
+  for (const ev of events) {
+    const resp = ev.response || {};
+    if (ev.tool_name === "scout_workspace" && resp.answer && !resp.error) {
+      const sumDiv = document.createElement("div");
+      sumDiv.className = "scout-summary-banner";
+      const mLabel = resp.model_used ? `${resp.model_used} · ` : "";
+      sumDiv.textContent = `Scout Findings (${mLabel}${resp.steps_taken ?? 0} steps):\n${resp.answer}`;
+      card.appendChild(sumDiv);
     }
   }
 
@@ -889,16 +915,24 @@ function formatTimeHHMMSS(isoStr) {
 
 function estimateToolPayloadBytes(name, resp) {
   if (name === "list_tree" && resp.tree) return resp.tree.length;
+  if (name === "extract_headers" && resp.formatted) return resp.formatted.length;
   if (name === "search_code" && resp.matches) return resp.matches.length;
-  if ((name === "read_lines" || name === "read_file") && resp.content) return resp.content.length;
+  if ((name === "read_lines" || name === "read_file" || name === "read_command_output") && resp.content) {
+    return resp.content.length;
+  }
+  if (name === "scout_workspace" && resp.answer) return resp.answer.length;
   if (resp.output_bytes) return Number(resp.output_bytes);
   return 0;
 }
 
 function estimateToolPayloadTokens(name, resp) {
   if (name === "list_tree" && resp.tree) return estimateTokensLocal(resp.tree);
+  if (name === "extract_headers" && resp.formatted) return estimateTokensLocal(resp.formatted);
   if (name === "search_code" && resp.matches) return estimateTokensLocal(resp.matches);
-  if ((name === "read_lines" || name === "read_file") && resp.content) return estimateTokensLocal(resp.content);
+  if ((name === "read_lines" || name === "read_file" || name === "read_command_output") && resp.content) {
+    return estimateTokensLocal(resp.content);
+  }
+  if (name === "scout_workspace" && resp.answer) return estimateTokensLocal(resp.answer);
   return 0;
 }
 
@@ -907,6 +941,22 @@ function formatSingleToolDetail(name, resp, bytes) {
   if (resp.denied_by_user) return `${name} — Denied`;
   if (resp.applied) return `${name}: Patched ${resp.path}`;
   if (resp.renamed) return `${name}: Renamed ${resp.old_path} -> ${resp.new_path}`;
+  if (name === "extract_headers" && !resp.error) {
+    return `extract_headers(${resp.pattern || "."}) — ${resp.file_count ?? 0} files, ${resp.header_count ?? 0} headers${sz}`;
+  }
+  if (name === "read_command_output" && !resp.error) {
+    if (!resp.found) return `read_command_output(${resp.exec_id || "latest"}) — Not found`;
+    return `read_command_output(${resp.exec_id || "latest"}) — ${resp.shown_lines ?? "?"}/${resp.total_lines ?? "?"} lines${sz}`;
+  }
+  if (name === "scout_workspace" && !resp.error) {
+    const hopNote = Array.isArray(resp.models_hopped) && resp.models_hopped.length ? ` · hopped ${resp.models_hopped.join("→")}` : "";
+    const stopNote = resp.stopped_early ? " · stopped early" : "";
+    return `scout_workspace(${resp.model_used || "scout"}) — ${resp.steps_taken ?? 0} steps, ~${Number(resp.tokens_used || 0).toLocaleString()} tok${hopNote}${stopNote}`;
+  }
+  if (name === "update_header" && !resp.error) {
+    const n = Array.isArray(resp.staged_paths) ? resp.staged_paths.length : (resp.staged_count ?? 0);
+    return `update_header — Drafted ${n} human-gated header patch(es)`;
+  }
   if (resp.written) {
     const delSuffix = resp.deleted ? ", auto-deleted" : "";
     return `${name}: Wrote ${resp.path}${resp.executed ? ` (exit ${resp.exit_code}${delSuffix})` : ""}`;
@@ -943,6 +993,15 @@ function formatToolCallSummary(tc) {
   const name = tc.name || "tool";
   const a = tc.args || {};
   if (name === "list_tree") return `list_tree(${a.subpath || "."}, depth=${a.max_depth ?? 3})`;
+  if (name === "extract_headers") return `extract_headers(${a.pattern || "."})`;
+  if (name === "read_command_output") {
+    return `read_command_output(${a.exec_id || "latest"}${a.pattern ? `, "${a.pattern}"` : ""})`;
+  }
+  if (name === "scout_workspace") return `scout_workspace(${a.subpath || "."}, "${String(a.goal || "").slice(0, 48)}")`;
+  if (name === "update_header") {
+    const pList = Array.isArray(a.paths) ? a.paths.join(", ") : (a.paths || a.path || "");
+    return `update_header(${pList})`;
+  }
   if (name === "search_code") {
     const scope = [a.subpath, a.path_glob, a.start_line || a.end_line ? `L${a.start_line || 1}-${a.end_line || ""}` : ""]
       .filter(Boolean)
@@ -963,6 +1022,150 @@ function formatToolCallSummary(tc) {
   }
   if (name === "run_tests") return a.summary ? `run_tests(${a.summary})` : "run_tests";
   return name;
+}
+
+function handleScoutStreamEvent(msg) {
+  if (!msg) return;
+  if (state.activeSessionId && msg.session_id && msg.session_id !== state.activeSessionId) {
+    return;
+  }
+  if (msg.type === "scout_start") {
+    state.liveScoutRun = {
+      run_id: msg.run_id,
+      session_id: msg.session_id,
+      goal: msg.goal || "",
+      subpath: msg.subpath || ".",
+      model: msg.model || "lite",
+      max_steps: Number(msg.max_steps || 8),
+      max_tokens: Number(msg.max_tokens || 30000),
+      steps: [],
+      hops: [],
+      paused: false,
+      stopped: false,
+      tokens_used: 0,
+    };
+    emit("chat:refresh-badges");
+    return;
+  }
+  if (!state.liveScoutRun || (msg.run_id && state.liveScoutRun.run_id !== msg.run_id)) {
+    return;
+  }
+  if (msg.type === "scout_step") {
+    if (msg.model) state.liveScoutRun.model = msg.model;
+    if (msg.tokens_used !== undefined) state.liveScoutRun.tokens_used = Number(msg.tokens_used || 0);
+    state.liveScoutRun.steps.push({
+      step: msg.step,
+      max_steps: msg.max_steps || state.liveScoutRun.max_steps,
+      tool: msg.tool || "read",
+      summary: msg.summary || "",
+      status: msg.status || "ok",
+    });
+    emit("chat:refresh-badges");
+  } else if (msg.type === "scout_hop") {
+    state.liveScoutRun.model = msg.to_model || state.liveScoutRun.model;
+    state.liveScoutRun.hops.push({
+      from_model: msg.from_model,
+      to_model: msg.to_model,
+      reason: msg.reason || "",
+    });
+    emit("chat:refresh-badges");
+  } else if (msg.type === "scout_paused") {
+    state.liveScoutRun.paused = Boolean(msg.paused);
+    emit("chat:refresh-badges");
+  } else if (msg.type === "scout_done") {
+    state.liveScoutRun = null;
+    emit("chat:refresh-badges");
+    emit("telemetry:refresh");
+  }
+}
+
+function renderLiveScoutCard(run) {
+  const card = document.createElement("article");
+  card.className = "msg-card scout-live-card";
+  const stepCount = run.steps.length;
+  const statusLabel = run.stopped
+    ? "Stopping..."
+    : run.paused
+      ? "Paused"
+      : `Step ${stepCount}/${run.max_steps}`;
+  const badgeCls = run.paused ? "is-restored" : "is-running";
+
+  card.innerHTML = `
+    <div class="msg-header">
+      <span class="msg-role">Local AI Scout · ${escapeHtml(run.model)}</span>
+      <span class="exec-badge ${badgeCls}">${escapeHtml(statusLabel)}</span>
+    </div>
+    <div class="companion-summary-line">${escapeHtml(run.goal || "Investigating workspace...")}</div>
+    <div class="meta-line mono tabular mt-2">Scope: ${escapeHtml(run.subpath || ".")} · ~${Number(run.tokens_used || 0).toLocaleString()} / ${Number(run.max_tokens || 30000).toLocaleString()} tok</div>
+  `;
+
+  if (run.hops && run.hops.length > 0) {
+    const lastHop = run.hops[run.hops.length - 1];
+    const hopEl = document.createElement("div");
+    hopEl.className = "scout-hop-note";
+    hopEl.textContent = `Model hop: ${lastHop.from_model} → ${lastHop.to_model}${lastHop.reason ? ` (${lastHop.reason})` : ""}`;
+    card.appendChild(hopEl);
+  }
+
+  if (run.steps && run.steps.length > 0) {
+    const list = document.createElement("div");
+    list.className = "scout-steps-list";
+    for (const s of run.steps) {
+      const row = document.createElement("div");
+      row.className = "scout-step-item";
+      row.innerHTML = `<span class="scout-step-tool">[${s.step}/${s.max_steps}] ${escapeHtml(s.tool)}</span><span>${escapeHtml(s.summary)}</span>`;
+      list.appendChild(row);
+    }
+    card.appendChild(list);
+    list.scrollTop = list.scrollHeight;
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "exec-actions";
+
+  const pauseBtn = document.createElement("button");
+  pauseBtn.type = "button";
+  pauseBtn.className = "btn btn-secondary btn-xs";
+  pauseBtn.textContent = run.paused ? "Resume Scout" : "Pause";
+  pauseBtn.disabled = Boolean(run.stopped);
+  pauseBtn.addEventListener("click", async () => {
+    pauseBtn.disabled = true;
+    try {
+      if (run.paused) {
+        await api.resumeScoutRun(run.run_id);
+        run.paused = false;
+      } else {
+        await api.pauseScoutRun(run.run_id);
+        run.paused = true;
+      }
+      emit("chat:refresh-badges");
+    } catch (err) {
+      emit("chat:error", err.message);
+    } finally {
+      pauseBtn.disabled = false;
+    }
+  });
+
+  const stopBtn = document.createElement("button");
+  stopBtn.type = "button";
+  stopBtn.className = "btn btn-danger btn-xs";
+  stopBtn.textContent = "Stop (Keep Findings)";
+  stopBtn.disabled = Boolean(run.stopped);
+  stopBtn.addEventListener("click", async () => {
+    stopBtn.disabled = true;
+    run.stopped = true;
+    try {
+      await api.stopScoutRun(run.run_id);
+      emit("chat:refresh-badges");
+    } catch (err) {
+      run.stopped = false;
+      emit("chat:error", err.message);
+    }
+  });
+
+  actions.append(pauseBtn, stopBtn);
+  card.appendChild(actions);
+  chatStream.appendChild(card);
 }
 
 function formatLivePreviewSlice(rawOutput) {

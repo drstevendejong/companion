@@ -4,16 +4,23 @@ routes/bridge.py - Playground Bridge endpoints (0 Gemini API tokens spent).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from models import BridgeBundleRequest, BridgePackFilesRequest, BridgeParseRequest
+from models import (
+    BridgeBundleRequest,
+    BridgePackFilesRequest,
+    BridgeParseRequest,
+    SessionUpdate,
+)
+from routes.chat import _get_effective_scout_settings, _maybe_append_scout_notice
 from services import bridge as bridge_svc
-from services import fs_tools
-from services.gemini_client import READ_ONLY_TOOLS, prepare_tool_gate_preview
+from services import fs_tools, local_scout
+from services.gemini_client import READ_ONLY_TOOLS, SCOUT_TOOLS, prepare_tool_gate_preview
 from services.token_utils import estimate_tokens
 
 router = APIRouter(prefix="/api/bridge", tags=["bridge"])
@@ -22,6 +29,7 @@ router = APIRouter(prefix="/api/bridge", tags=["bridge"])
 @router.post("/bundle")
 def create_bridge_bundle(payload: BridgeBundleRequest, request: Request) -> Dict[str, Any]:
     db = request.app.state.db
+    gemini = getattr(request.app.state, "gemini", None)
     session = db.get_session(payload.session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -30,6 +38,14 @@ def create_bridge_bundle(payload: BridgeBundleRequest, request: Request) -> Dict
     project = db.get_project(session.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
+
+    scout_cfg = _get_effective_scout_settings(db, gemini)
+    scout_enabled = bool(scout_cfg.get("enabled"))
+    target_bit = 1 if scout_enabled else 0
+    current_announced = getattr(session, "scout_announced_state", 0)
+    scout_notice = ""
+    if current_announced != target_bit:
+        scout_notice = bridge_svc.build_scout_state_notice(scout_enabled)
 
     include_dir = (
         bool(payload.include_directives)
@@ -41,6 +57,8 @@ def create_bridge_bundle(payload: BridgeBundleRequest, request: Request) -> Dict
         prompt=payload.prompt,
         attachments=payload.attachments,
         include_directives=include_dir,
+        scout_enabled=scout_enabled,
+        scout_state_notice=scout_notice,
     )
 
     if payload.record_turn and (payload.prompt.strip() or payload.attachments or include_dir):
@@ -59,10 +77,13 @@ def create_bridge_bundle(payload: BridgeBundleRequest, request: Request) -> Dict
             attachments=payload.attachments,
         )
 
+    updates: Dict[str, Any] = {}
     if include_dir and not session.directives_sent:
-        from models import SessionUpdate
-
-        db.update_session(session.id, SessionUpdate(directives_sent=True))
+        updates["directives_sent"] = True
+    if payload.record_turn and current_announced != target_bit:
+        updates["scout_announced_state"] = target_bit
+    if updates:
+        db.update_session(session.id, SessionUpdate(**updates))
 
     return {
         **bundle,
@@ -72,8 +93,13 @@ def create_bridge_bundle(payload: BridgeBundleRequest, request: Request) -> Dict
 
 
 @router.post("/parse")
-def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict[str, Any]:
+async def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict[str, Any]:
     db = request.app.state.db
+    gemini = getattr(request.app.state, "gemini", None)
+    app = getattr(request, "app", None)
+    if app is not None and hasattr(app, "state"):
+        app.state.event_loop = asyncio.get_running_loop()
+
     session = db.get_session(payload.session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -82,6 +108,10 @@ def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict
     project = db.get_project(session.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
+
+    scout_cfg = _get_effective_scout_settings(db, gemini)
+    scout_enabled = bool(scout_cfg.get("enabled"))
+    scout_auto = bool(scout_cfg.get("auto_approve"))
 
     parsed = bridge_svc.parse_playground_markdown(payload.raw_markdown)
     actions = parsed["actions"]
@@ -110,20 +140,38 @@ def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict
     for idx, act in enumerate(actions):
         tool_name = act["tool"]
         args = act["args"]
+        target_label = str(
+            args.get("path")
+            or args.get("old_path")
+            or args.get("target")
+            or args.get("pattern")
+            or args.get("subpath")
+            or ""
+        )
+        if tool_name in SCOUT_TOOLS and not scout_enabled:
+            err_msg = f"{tool_name}: Local AI Scout is currently OFF or missing a configured API key."
+            warnings.append(err_msg)
+            error_count += 1
+            db.add_message(
+                session.id,
+                role="tool_event",
+                text=json.dumps({
+                    "tool_name": tool_name,
+                    "call_id": f"bridge-{idx}",
+                    "response": {
+                        "error": "Local AI Scout is currently OFF or missing a configured API key.",
+                        "target": target_label,
+                    },
+                }),
+            )
+            continue
+
         try:
             preview = prepare_tool_gate_preview(project, tool_name, args)
         except Exception as exc:
             err_msg = f"{tool_name}: {exc}"
             warnings.append(err_msg)
             error_count += 1
-            target_label = str(
-                args.get("path")
-                or args.get("old_path")
-                or args.get("target")
-                or args.get("pattern")
-                or args.get("subpath")
-                or ""
-            )
             db.add_message(
                 session.id,
                 role="tool_event",
@@ -154,6 +202,53 @@ def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict
             auto_executed += 1
             continue
 
+        if (
+            tool_name == "scout_workspace"
+            and scout_enabled
+            and scout_auto
+            and preview.get("category") == "scout"
+            and gemini is not None
+        ):
+            try:
+                scout_res = await asyncio.to_thread(
+                    local_scout.run_scout_workspace,
+                    gemini,
+                    db,
+                    project,
+                    session_id=session.id,
+                    goal=str(preview.get("goal") or ""),
+                    subpath=str(preview.get("subpath") or "."),
+                    max_steps=int(preview.get("max_steps") or 8),
+                    max_tokens=int(scout_cfg.get("max_tokens") or 30_000),
+                    app=app,
+                    event_loop=asyncio.get_running_loop(),
+                )
+                compact = bridge_svc.serialize_tool_response("scout_workspace", scout_res)
+                db.add_message(
+                    session.id,
+                    role="tool_event",
+                    text=json.dumps({
+                        "tool_name": tool_name,
+                        "call_id": f"bridge-{idx}",
+                        "response": compact,
+                    }),
+                )
+                auto_executed += 1
+                continue
+            except Exception as exc:
+                warnings.append(f"scout_workspace: {exc}")
+                error_count += 1
+                db.add_message(
+                    session.id,
+                    role="tool_event",
+                    text=json.dumps({
+                        "tool_name": tool_name,
+                        "call_id": f"bridge-{idx}",
+                        "response": {"error": str(exc), "target": target_label},
+                    }),
+                )
+                continue
+
         ui_preview = {
             k: v for k, v in preview.items()
             if k not in ("prepared_result", "prepared_patch")
@@ -171,7 +266,12 @@ def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict
     messages = db.list_messages(session.id)
     bridge_reply_text = ""
     if (auto_executed > 0 or error_count > 0) and not pending_gates:
-        bridge_reply_text = bridge_svc.format_trailing_tool_events(messages)
+        bridge_reply_text = _maybe_append_scout_notice(
+            db,
+            db.get_session(session.id) or session,
+            scout_enabled,
+            bridge_svc.format_trailing_tool_events(messages),
+        )
     error_reply_text = (
         bridge_svc.format_trailing_tool_events(messages, errors_only=True)
         if error_count > 0
@@ -190,6 +290,9 @@ def parse_bridge_response(payload: BridgeParseRequest, request: Request) -> Dict
         "bridge_reply_text": bridge_reply_text,
         "error_reply_text": error_reply_text,
         "warnings": warnings,
+        "telemetry": local_scout.get_telemetry_snapshot(
+            db, gemini, model=getattr(session, "model", None)
+        ),
     }
 
 

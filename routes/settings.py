@@ -9,9 +9,30 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from services import key_store
+from models import ScoutSettingsUpdate
+from services import key_store, local_scout, model_catalog
+from services.key_store import has_configured_api_key
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+
+def _scout_status_payload(db: Any, gemini: Any) -> Dict[str, Any]:
+    has_key = has_configured_api_key(gemini)
+    cfg = db.get_scout_settings(has_key=has_key)
+    try:
+        candidates = local_scout._get_candidate_models(gemini) if has_key else []
+    except Exception:
+        candidates = model_catalog.rank_light_scout_models(
+            model_catalog.get_fallback_catalog(), allow_non_lite_fallback=False
+        )
+    telemetry = local_scout.get_telemetry_snapshot(db, gemini)
+    return {
+        **cfg,
+        "has_key": has_key,
+        "active_model": candidates[0] if candidates else None,
+        "available_lite_models": candidates,
+        "telemetry": telemetry,
+    }
 
 
 class ApiKeySaveRequest(BaseModel):
@@ -24,7 +45,37 @@ def get_telemetry(
     request: Request,
     model: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
-    return request.app.state.db.get_rate_telemetry(model=model)
+    return local_scout.get_telemetry_snapshot(
+        request.app.state.db,
+        getattr(request.app.state, "gemini", None),
+        model=model,
+    )
+
+
+@router.get("/scout")
+def get_scout_settings_endpoint(request: Request) -> Dict[str, Any]:
+    return _scout_status_payload(request.app.state.db, request.app.state.gemini)
+
+
+@router.post("/scout")
+def update_scout_settings_endpoint(
+    payload: ScoutSettingsUpdate, request: Request
+) -> Dict[str, Any]:
+    db = request.app.state.db
+    gemini = request.app.state.gemini
+    has_key = has_configured_api_key(gemini)
+    if payload.enabled is True and not has_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Configure a Gemini API key first before enabling Local AI Scout.",
+        )
+    db.set_scout_settings(
+        enabled=payload.enabled,
+        auto_approve=payload.auto_approve,
+        max_tokens=payload.max_tokens,
+        summarize_threshold_chars=payload.summarize_threshold_chars,
+    )
+    return _scout_status_payload(db, gemini)
 
 
 @router.get("/api-key")

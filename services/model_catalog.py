@@ -107,6 +107,73 @@ def _deduplicate_models(raw_models: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return filtered
 
 
+def is_lite_model_id(model_id: str) -> bool:
+    """Returns True if a Gemini model identifier represents a lightweight -lite variant."""
+    mid = (model_id or "").lower()
+    return ("-lite" in mid) or mid.endswith("lite") or (" flash-lite" in mid)
+
+
+def rank_light_scout_models(
+    catalog: Dict[str, Any],
+    *,
+    cooldowns: Optional[Dict[str, float]] = None,
+    now_ts: Optional[float] = None,
+    allow_non_lite_fallback: bool = False,
+) -> List[str]:
+    """
+    Returns an ordered list of usable lightweight model IDs for Local AI Scout hopping.
+    Strictly prioritizes `-lite` models so primary Flash/Pro/Hydrogen quota for main API mode
+    is preserved, skips models currently in 429 cooldown, and handles future model naming cleanly.
+    """
+    now = float(now_ts if now_ts is not None else time.time())
+    cooling = cooldowns or {}
+    raw_models = list((catalog or {}).get("models") or [])
+    paid_only = set((catalog or {}).get("paid_only_models") or [])
+
+    def _eligible(m: Dict[str, Any]) -> bool:
+        mid = str(m.get("id") or "").strip()
+        if not mid or mid in paid_only:
+            return False
+        status = m.get("tier_status")
+        if status in ("paid_only", "unavailable"):
+            return False
+        if float(cooling.get(mid, 0.0)) > now:
+            return False
+        return True
+
+    eligible = [m for m in raw_models if _eligible(m)]
+    has_any_lite_in_catalog = any(
+        is_lite_model_id(str(m.get("id") or ""))
+        and str(m.get("id") or "") not in paid_only
+        and m.get("tier_status") not in ("paid_only", "unavailable")
+        for m in raw_models
+    )
+    lite_models = [m for m in eligible if is_lite_model_id(str(m.get("id") or ""))]
+    lite_models.sort(key=_model_sort_key)
+    ordered_ids = [str(m["id"]) for m in lite_models]
+
+    if allow_non_lite_fallback or (not has_any_lite_in_catalog and not ordered_ids):
+        non_lite = [
+            m for m in eligible
+            if not is_lite_model_id(str(m.get("id") or ""))
+            and "pro" not in str(m.get("id") or "").lower()
+            and "carbon" not in str(m.get("id") or "").lower()
+            and "argon" not in str(m.get("id") or "").lower()
+            and "neon" not in str(m.get("id") or "").lower()
+        ]
+        non_lite.sort(key=_model_sort_key)
+        for m in non_lite:
+            mid = str(m["id"])
+            if mid not in ordered_ids:
+                ordered_ids.append(mid)
+
+    if not ordered_ids and not raw_models and not cooling:
+        return ["gemini-3.1-flash-lite"]
+    return ordered_ids
+
+
+
+
 def _probe_single_model(client: Any, model_id: str) -> Tuple[str, Optional[str]]:
     """
     Runs a 1-token minimal probe to classify model access on the active API key.

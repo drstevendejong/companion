@@ -164,10 +164,21 @@ async def run_project_command(
         output = output[-MAX_COMMAND_OUTPUT_CHARS:]
         truncated = True
 
+    exit_code = -1 if timed_out else (proc.returncode if proc.returncode is not None else 0)
+    from services import output_buffer
+
+    exec_id = output_buffer.record_command_output(
+        command,
+        output,
+        exit_code=exit_code,
+        duration_ms=elapsed_ms,
+    )
+
     return {
+        "exec_id": exec_id,
         "command": command,
         "resolved_argv": argv,
-        "exit_code": -1 if timed_out else (proc.returncode if proc.returncode is not None else 0),
+        "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_ms": elapsed_ms,
         "output": output,

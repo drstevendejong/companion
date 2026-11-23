@@ -339,7 +339,8 @@ class TestPlaygroundBridge(unittest.TestCase):
                 payload = models.BridgeParseRequest(
                     session_id="s1", raw_markdown=mixed_md, auto_approve_reads=True
                 )
-                res = route_bridge.parse_bridge_response(payload, req)
+                import asyncio as _asyncio
+                res = _asyncio.run(route_bridge.parse_bridge_response(payload, req))
                 self.assertEqual(res["auto_executed_count"], 1)
                 self.assertEqual(res["staged_count"], 3)
                 self.assertEqual(
@@ -356,10 +357,10 @@ class TestPlaygroundBridge(unittest.TestCase):
                 db2 = FakeDB()
                 req2 = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=db2)))
                 reads_only = '```json\n{"tool": "read_file", "path": "app.py"}\n```'
-                res2 = route_bridge.parse_bridge_response(
+                res2 = _asyncio.run(route_bridge.parse_bridge_response(
                     models.BridgeParseRequest(session_id="s1", raw_markdown=reads_only, auto_approve_reads=True),
                     req2,
-                )
+                ))
                 self.assertEqual(res2["auto_executed_count"], 1)
                 self.assertEqual(res2["staged_count"], 0)
                 self.assertIn("x = 1", res2["bridge_reply_text"])
@@ -368,10 +369,10 @@ class TestPlaygroundBridge(unittest.TestCase):
                 db3 = FakeDB()
                 req3 = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=db3)))
                 truncated = 'json\n[\n{\n"tool": "patch_literal",\n"path": "app.py",\n"old_text": "partial'
-                res3 = route_bridge.parse_bridge_response(
+                res3 = _asyncio.run(route_bridge.parse_bridge_response(
                     models.BridgeParseRequest(session_id="s1", raw_markdown=truncated, auto_approve_reads=True),
                     req3,
-                )
+                ))
                 self.assertEqual(res3["parsed_count"], 0)
                 self.assertTrue(res3["warnings"])
                 self.assertIn("truncated", res3["warnings"][0].lower())
@@ -386,10 +387,10 @@ class TestPlaygroundBridge(unittest.TestCase):
                     '  {"tool": "patch_literal", "path": "app.py", "old_text": "x = 1", "new_text": "x = 9"}\n'
                     "]"
                 )
-                res4 = route_bridge.parse_bridge_response(
+                res4 = _asyncio.run(route_bridge.parse_bridge_response(
                     models.BridgeParseRequest(session_id="s1", raw_markdown=mixed_err_md, auto_approve_reads=True),
                     req4,
-                )
+                ))
                 self.assertEqual(res4["error_count"], 2)
                 self.assertEqual(res4["staged_count"], 1)
                 self.assertEqual(len(res4["pending_gates"]), 1)
@@ -403,10 +404,10 @@ class TestPlaygroundBridge(unittest.TestCase):
                 all_err_md = (
                     '[{"tool": "patch_literal", "path": "app.py", "old_text": "missing", "new_text": "a"}]'
                 )
-                res5 = route_bridge.parse_bridge_response(
+                res5 = _asyncio.run(route_bridge.parse_bridge_response(
                     models.BridgeParseRequest(session_id="s1", raw_markdown=all_err_md, auto_approve_reads=True),
                     req5,
-                )
+                ))
                 self.assertEqual(res5["error_count"], 1)
                 self.assertEqual(res5["staged_count"], 0)
                 self.assertIn("Target literal block not found in 'app.py'", res5["bridge_reply_text"])

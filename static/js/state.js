@@ -25,7 +25,36 @@ export const state = {
   apiEnabled: false,
   hasApiKey: false,
   directivesTokensEst: 0,
-  telemetry: { rpm: 0, tpm: 0, rpd: 0, next_minute_reset_sec: 0, rpd_reset_label: "00:00 PT" },
+  directivesInfoText: "",
+  telemetry: {
+    rpm: 0,
+    tpm: 0,
+    rpd: 0,
+    next_minute_reset_sec: 0,
+    rpd_reset_label: "00:00 PT",
+    models: [],
+    scout: {
+      active_model: null,
+      rpm: 0,
+      tpm: 0,
+      rpd: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      thinking_tokens: 0,
+      total_tokens: 0,
+      next_minute_reset_sec: 0,
+      models: [],
+    },
+  },
+  scout: {
+    enabled: false,
+    configured_enabled: false,
+    auto_approve: false,
+    active_model: null,
+    max_tokens: 30000,
+    available_lite_models: [],
+  },
+  liveScoutRun: null,
 };
 
 const listeners = new Map();

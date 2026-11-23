@@ -21,6 +21,8 @@ from config import (
     DB_MAX_RESOLVED_CHECKPOINTS_PER_PROJECT,
     DB_MAX_RESOLVED_GATES,
     DB_VACUUM_MIN_BYTES,
+    OUTPUT_SUMMARIZE_THRESHOLD_CHARS,
+    SCOUT_DEFAULT_MAX_TOKENS,
 )
 from models import (
     AttachmentItem,
@@ -121,6 +123,7 @@ class CompanionDB:
                     thinking_level TEXT NOT NULL DEFAULT 'HIGH',
                     auto_approve_read_tokens INTEGER NOT NULL DEFAULT 0,
                     directives_sent INTEGER NOT NULL DEFAULT 0,
+                    scout_announced_state INTEGER NOT NULL DEFAULT -1,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     thinking_tokens INTEGER NOT NULL DEFAULT 0,
@@ -176,6 +179,7 @@ class CompanionDB:
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     thinking_tokens INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'main',
                     created_ts REAL NOT NULL
                 );
 
@@ -233,6 +237,17 @@ class CompanionDB:
                 # Existing legacy sessions predate Bridge mode and are API sessions
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN api_enabled INTEGER NOT NULL DEFAULT 1"
+                )
+            if "scout_announced_state" not in session_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN scout_announced_state INTEGER NOT NULL DEFAULT -1"
+                )
+            usage_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(api_usage_events)").fetchall()
+            }
+            if "source" not in usage_cols:
+                conn.execute(
+                    "ALTER TABLE api_usage_events ADD COLUMN source TEXT NOT NULL DEFAULT 'main'"
                 )
 
     # --- Projects ---
@@ -349,6 +364,7 @@ class CompanionDB:
         last_ctx = int(row["last_context_tokens"] or 0) if "last_context_tokens" in row_keys else 0
         dir_sent = bool(row["directives_sent"]) if "directives_sent" in row_keys else False
         api_enabled = bool(row["api_enabled"]) if "api_enabled" in row_keys else True
+        scout_ann = int(row["scout_announced_state"]) if "scout_announced_state" in row_keys and row["scout_announced_state"] is not None else -1
         return SessionInfo(
             id=row["id"],
             project_id=row["project_id"],
@@ -358,6 +374,7 @@ class CompanionDB:
             thinking_level=row["thinking_level"],
             auto_approve_read_tokens=row["auto_approve_read_tokens"],
             directives_sent=dir_sent,
+            scout_announced_state=scout_ann,
             token_stats=TokenStats(
                 input_tokens=row["input_tokens"],
                 output_tokens=row["output_tokens"],
@@ -428,15 +445,25 @@ class CompanionDB:
         thinking_level = changes.get("thinking_level", existing.thinking_level)
         auto_read = changes.get("auto_approve_read_tokens", existing.auto_approve_read_tokens)
         directives_sent = changes.get("directives_sent", existing.directives_sent)
+        scout_announced_state = changes.get("scout_announced_state", existing.scout_announced_state)
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE sessions
                 SET title = ?, model = ?, thinking_level = ?,
-                    auto_approve_read_tokens = ?, directives_sent = ?, updated_at = ?
+                    auto_approve_read_tokens = ?, directives_sent = ?, scout_announced_state = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (title, model, thinking_level, auto_read, 1 if directives_sent else 0, now, session_id),
+                (
+                    title,
+                    model,
+                    thinking_level,
+                    auto_read,
+                    1 if directives_sent else 0,
+                    int(scout_announced_state),
+                    now,
+                    session_id,
+                ),
             )
         return self.get_session(session_id)
 
@@ -763,6 +790,60 @@ class CompanionDB:
     def set_api_enabled(self, enabled: bool) -> None:
         self.set_setting("api_enabled", "true" if enabled else "false")
 
+    # --- Local AI Scout Settings ---
+
+    def _get_bool_setting(self, key: str, default: bool) -> bool:
+        raw = self.get_setting(key)
+        if raw is None:
+            return default
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    def _get_int_setting(self, key: str, default: int, minimum: int = 0) -> int:
+        raw = self.get_setting(key)
+        if raw is None:
+            return default
+        try:
+            return max(minimum, int(raw.strip()))
+        except ValueError:
+            return default
+
+    def get_scout_settings(self, has_key: bool = True) -> Dict[str, Any]:
+        raw_enabled = self._get_bool_setting("scout_enabled", False)
+        return {
+            "enabled": bool(raw_enabled and has_key),
+            "configured_enabled": raw_enabled,
+            "auto_approve": self._get_bool_setting("scout_auto_approve", False),
+            "max_tokens": self._get_int_setting(
+                "scout_max_tokens", SCOUT_DEFAULT_MAX_TOKENS, minimum=4_000
+            ),
+            "summarize_threshold_chars": self._get_int_setting(
+                "scout_summarize_threshold_chars",
+                OUTPUT_SUMMARIZE_THRESHOLD_CHARS,
+                minimum=500,
+            ),
+        }
+
+    def set_scout_settings(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        auto_approve: Optional[bool] = None,
+        max_tokens: Optional[int] = None,
+        summarize_threshold_chars: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if enabled is not None:
+            self.set_setting("scout_enabled", "true" if enabled else "false")
+        if auto_approve is not None:
+            self.set_setting("scout_auto_approve", "true" if auto_approve else "false")
+        if max_tokens is not None:
+            self.set_setting("scout_max_tokens", str(max(4_000, int(max_tokens))))
+        if summarize_threshold_chars is not None:
+            self.set_setting(
+                "scout_summarize_threshold_chars",
+                str(max(500, int(summarize_threshold_chars))),
+            )
+        return self.get_scout_settings(has_key=True)
+
     # --- Rate Telemetry (RPM, TPM, RPD since 00:00 Pacific) ---
 
     def record_api_usage(
@@ -770,20 +851,23 @@ class CompanionDB:
         model: str,
         usage: TokenStats,
         created_ts: Optional[float] = None,
+        source: str = "main",
     ) -> None:
         ts = float(created_ts if created_ts is not None else time.time())
+        clean_source = "scout" if str(source or "").strip().lower() == "scout" else "main"
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO api_usage_events (
-                    model, input_tokens, output_tokens, thinking_tokens, created_ts
-                ) VALUES (?, ?, ?, ?, ?)
+                    model, input_tokens, output_tokens, thinking_tokens, source, created_ts
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     model,
                     int(usage.input_tokens or 0),
                     int(usage.output_tokens or 0),
                     int(usage.thinking_tokens or 0),
+                    clean_source,
                     ts,
                 ),
             )
@@ -794,10 +878,12 @@ class CompanionDB:
         self,
         model: Optional[str] = None,
         now_ts: Optional[float] = None,
+        scout_models: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         ts = float(now_ts if now_ts is not None else time.time())
         cutoff_min = ts - 60.0
         midnight_ts, pacific_date = _pacific_midnight_utc(ts)
+        window_floor = min(cutoff_min, midnight_ts)
 
         with self._connect() as conn:
             all_min = conn.execute(
@@ -842,8 +928,176 @@ class CompanionDB:
                 mod_min = all_min
                 mod_day = all_day
 
+            per_model_rows = conn.execute(
+                """
+                SELECT model,
+                       SUM(CASE WHEN created_ts > ? THEN 1 ELSE 0 END) AS rpm,
+                       COALESCE(SUM(CASE WHEN created_ts > ? THEN input_tokens ELSE 0 END), 0) AS tpm,
+                       COALESCE(SUM(CASE WHEN created_ts > ? THEN (input_tokens + output_tokens + thinking_tokens) ELSE 0 END), 0) AS total_tpm,
+                       MIN(CASE WHEN created_ts > ? THEN created_ts ELSE NULL END) AS oldest_min_ts,
+                       SUM(CASE WHEN created_ts >= ? THEN 1 ELSE 0 END) AS rpd,
+                       COALESCE(SUM(CASE WHEN created_ts >= ? THEN input_tokens ELSE 0 END), 0) AS input_tokens_day,
+                       COALESCE(SUM(CASE WHEN created_ts >= ? THEN output_tokens ELSE 0 END), 0) AS output_tokens_day,
+                       COALESCE(SUM(CASE WHEN created_ts >= ? THEN thinking_tokens ELSE 0 END), 0) AS thinking_tokens_day,
+                       COALESCE(SUM(CASE WHEN created_ts >= ? THEN (input_tokens + output_tokens + thinking_tokens) ELSE 0 END), 0) AS total_tokens_day,
+                       SUM(CASE WHEN source = 'scout' AND created_ts > ? THEN 1 ELSE 0 END) AS scout_rpm,
+                       COALESCE(SUM(CASE WHEN source = 'scout' AND created_ts > ? THEN input_tokens ELSE 0 END), 0) AS scout_tpm,
+                       MIN(CASE WHEN source = 'scout' AND created_ts > ? THEN created_ts ELSE NULL END) AS oldest_scout_min_ts,
+                       SUM(CASE WHEN source = 'scout' AND created_ts >= ? THEN 1 ELSE 0 END) AS scout_rpd,
+                       COALESCE(SUM(CASE WHEN source = 'scout' AND created_ts >= ? THEN input_tokens ELSE 0 END), 0) AS scout_input_tokens_day,
+                       COALESCE(SUM(CASE WHEN source = 'scout' AND created_ts >= ? THEN output_tokens ELSE 0 END), 0) AS scout_output_tokens_day,
+                       COALESCE(SUM(CASE WHEN source = 'scout' AND created_ts >= ? THEN thinking_tokens ELSE 0 END), 0) AS scout_thinking_tokens_day,
+                       COALESCE(SUM(CASE WHEN source = 'scout' AND created_ts >= ? THEN (input_tokens + output_tokens + thinking_tokens) ELSE 0 END), 0) AS scout_total_tokens_day
+                FROM api_usage_events
+                WHERE created_ts >= ? AND created_ts <= ?
+                GROUP BY model
+                ORDER BY scout_total_tokens_day DESC, total_tokens_day DESC, model ASC
+                """,
+                (
+                    cutoff_min,
+                    cutoff_min,
+                    cutoff_min,
+                    cutoff_min,
+                    midnight_ts,
+                    midnight_ts,
+                    midnight_ts,
+                    midnight_ts,
+                    midnight_ts,
+                    cutoff_min,
+                    cutoff_min,
+                    cutoff_min,
+                    midnight_ts,
+                    midnight_ts,
+                    midnight_ts,
+                    midnight_ts,
+                    midnight_ts,
+                    window_floor,
+                    ts,
+                ),
+            ).fetchall()
+
         oldest_ts = mod_min["oldest_ts"] if mod_min else None
         next_decay = max(0, int((float(oldest_ts) + 60.0 - ts) + 0.999)) if oldest_ts is not None else 0
+
+        models_map: Dict[str, Dict[str, Any]] = {}
+        models_list: List[Dict[str, Any]] = []
+        for r in per_model_rows:
+            m_name = str(r["model"])
+            m_oldest = r["oldest_min_ts"]
+            m_decay = (
+                max(0, int((float(m_oldest) + 60.0 - ts) + 0.999))
+                if m_oldest is not None
+                else 0
+            )
+            entry = {
+                "model": m_name,
+                "rpm": int(r["rpm"] or 0),
+                "tpm": int(r["tpm"] or 0),
+                "total_tpm": int(r["total_tpm"] or 0),
+                "rpd": int(r["rpd"] or 0),
+                "input_tokens": int(r["input_tokens_day"] or 0),
+                "output_tokens": int(r["output_tokens_day"] or 0),
+                "thinking_tokens": int(r["thinking_tokens_day"] or 0),
+                "total_tokens": int(r["total_tokens_day"] or 0),
+                "scout_rpm": int(r["scout_rpm"] or 0),
+                "scout_tpm": int(r["scout_tpm"] or 0),
+                "scout_rpd": int(r["scout_rpd"] or 0),
+                "scout_input_tokens": int(r["scout_input_tokens_day"] or 0),
+                "scout_output_tokens": int(r["scout_output_tokens_day"] or 0),
+                "scout_thinking_tokens": int(r["scout_thinking_tokens_day"] or 0),
+                "scout_total_tokens": int(r["scout_total_tokens_day"] or 0),
+                "oldest_scout_min_ts": float(r["oldest_scout_min_ts"]) if r["oldest_scout_min_ts"] is not None else None,
+                "next_minute_reset_sec": m_decay,
+            }
+            models_map[m_name] = entry
+            models_list.append({k: v for k, v in entry.items() if k != "oldest_scout_min_ts"})
+
+        scout_candidate_order = [str(m) for m in (scout_models or []) if str(m or "").strip()]
+        scout_selected_ids: List[str] = []
+        seen_scout: set[str] = set()
+        # Include any model explicitly active for Scout + any model with Scout usage today/minute
+        for m_name, entry in models_map.items():
+            if entry["scout_rpd"] > 0 or entry["scout_rpm"] > 0:
+                if m_name not in seen_scout:
+                    seen_scout.add(m_name)
+                    scout_selected_ids.append(m_name)
+        if scout_candidate_order:
+            active_scout_model = scout_candidate_order[0]
+            if active_scout_model not in seen_scout:
+                seen_scout.add(active_scout_model)
+                scout_selected_ids.insert(0, active_scout_model)
+            # Keep active candidate first, then other models with usage sorted by activity
+            scout_selected_ids.sort(
+                key=lambda mid: (
+                    0 if mid == active_scout_model else 1,
+                    -(models_map.get(mid, {}).get("scout_total_tokens", 0)),
+                    -(models_map.get(mid, {}).get("total_tokens", 0)),
+                    mid,
+                )
+            )
+        else:
+            active_scout_model = scout_selected_ids[0] if scout_selected_ids else None
+
+        scout_model_entries: List[Dict[str, Any]] = []
+        scout_rpm_total = 0
+        scout_tpm_total = 0
+        scout_rpd_total = 0
+        scout_tokens_total = 0
+        scout_input_total = 0
+        scout_output_total = 0
+        scout_thinking_total = 0
+        scout_oldest_ts: Optional[float] = None
+
+        for m_id in scout_selected_ids:
+            e = models_map.get(m_id)
+            if e is None:
+                scout_model_entries.append({
+                    "model": m_id,
+                    "rpm": 0,
+                    "tpm": 0,
+                    "rpd": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thinking_tokens": 0,
+                    "total_tokens": 0,
+                    "model_rpm": 0,
+                    "model_tpm": 0,
+                    "model_rpd": 0,
+                    "model_total_tokens": 0,
+                    "next_minute_reset_sec": 0,
+                })
+                continue
+            scout_rpm_total += e["scout_rpm"]
+            scout_tpm_total += e["scout_tpm"]
+            scout_rpd_total += e["scout_rpd"]
+            scout_tokens_total += e["scout_total_tokens"]
+            scout_input_total += e["scout_input_tokens"]
+            scout_output_total += e["scout_output_tokens"]
+            scout_thinking_total += e["scout_thinking_tokens"]
+            if e["oldest_scout_min_ts"] is not None:
+                if scout_oldest_ts is None or e["oldest_scout_min_ts"] < scout_oldest_ts:
+                    scout_oldest_ts = e["oldest_scout_min_ts"]
+            scout_model_entries.append({
+                "model": m_id,
+                "rpm": e["scout_rpm"],
+                "tpm": e["scout_tpm"],
+                "rpd": e["scout_rpd"],
+                "input_tokens": e["scout_input_tokens"],
+                "output_tokens": e["scout_output_tokens"],
+                "thinking_tokens": e["scout_thinking_tokens"],
+                "total_tokens": e["scout_total_tokens"],
+                "model_rpm": e["rpm"],
+                "model_tpm": e["tpm"],
+                "model_rpd": e["rpd"],
+                "model_total_tokens": e["total_tokens"],
+                "next_minute_reset_sec": e["next_minute_reset_sec"],
+            })
+
+        scout_decay = (
+            max(0, int((float(scout_oldest_ts) + 60.0 - ts) + 0.999))
+            if scout_oldest_ts is not None
+            else 0
+        )
 
         return {
             "model": model,
@@ -856,6 +1110,19 @@ class CompanionDB:
             "next_minute_reset_sec": next_decay,
             "pacific_date": pacific_date,
             "rpd_reset_label": "00:00 PT",
+            "models": models_list,
+            "scout": {
+                "active_model": active_scout_model,
+                "rpm": scout_rpm_total,
+                "tpm": scout_tpm_total,
+                "rpd": scout_rpd_total,
+                "input_tokens": scout_input_total,
+                "output_tokens": scout_output_total,
+                "thinking_tokens": scout_thinking_total,
+                "total_tokens": scout_tokens_total,
+                "next_minute_reset_sec": scout_decay,
+                "models": scout_model_entries,
+            },
         }
 
     # --- Project Checkpoints (Transactional Savepoints) ---

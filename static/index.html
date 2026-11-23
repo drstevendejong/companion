@@ -46,53 +46,72 @@
         <div id="session-list" class="session-list"></div>
       </div>
 
-      <div id="api-sidebar-block" class="sidebar-block">
-        <div class="block-header">
-          <label class="field-label" for="model-select">Model</label>
-          <button id="btn-refresh-models" class="btn btn-ghost btn-xs" title="Refresh live models &amp; probe free/paid access (uses 1 req/model)">&#8635;</button>
-        </div>
-        <select id="model-select" class="select-input"></select>
-
-        <div class="row-gap mt-2">
-          <div class="col-half">
-            <label class="field-label" for="thinking-select">Thinking</label>
-            <select id="thinking-select" class="select-input"></select>
+      <div id="main-ai-block" class="sidebar-block ai-panel-block">
+        <div class="ai-panel-head">
+          <div class="row-gap">
+            <span class="ai-panel-title">Main AI</span>
+            <button id="btn-refresh-models" class="btn btn-ghost btn-xs api-only" title="Refresh live models &amp; probe free/paid access (uses 1 req/model)">&#8635;</button>
           </div>
-          <div class="col-half">
-            <label class="field-label" for="auto-read-input">Auto-Read &le; tok</label>
-            <input id="auto-read-input" type="number" min="0" step="250" value="0" class="text-input tabular" />
-          </div>
+          <label class="ai-switch-wrap" title="Toggle Main AI (creates a new API or Playground Bridge session)">
+            <input id="btn-main-ai-toggle" type="checkbox" class="toggle-switch toggle-switch-sm" aria-label="Toggle Main AI" />
+          </label>
         </div>
 
-        <div id="telemetry-block" class="token-meter mt-3">
-          <div class="meter-row">
-            <span>Context Window</span>
-            <span id="token-total-label" class="mono tabular">0 / 1,048,576</span>
-          </div>
-          <div class="meter-track">
-            <div id="token-meter-fill" class="meter-fill" style="width: 0%;"></div>
-          </div>
-          <div class="rate-telemetry-grid">
-            <div class="rate-cell" title="Requests in the last 60 seconds for the selected model">
-              <span class="rate-lbl">RPM</span>
-              <span id="telemetry-rpm" class="rate-val mono tabular">0</span>
+        <div id="api-sidebar-block" class="ai-panel-body api-only">
+          <select id="model-select" class="select-input select-sm"></select>
+
+          <div class="row-gap mt-2">
+            <div class="col-half">
+              <label class="field-label" for="thinking-select">Thinking</label>
+              <select id="thinking-select" class="select-input select-sm"></select>
             </div>
-            <div class="rate-cell" title="Input tokens in the last 60 seconds for the selected model">
-              <span class="rate-lbl">TPM</span>
-              <span id="telemetry-tpm" class="rate-val mono tabular">0</span>
-            </div>
-            <div class="rate-cell" title="Requests today since 00:00 Pacific Time">
-              <span class="rate-lbl">RPD</span>
-              <span id="telemetry-rpd" class="rate-val mono tabular">0</span>
+            <div class="col-half">
+              <label class="field-label" for="auto-read-input">Auto-Read &le; tok</label>
+              <input id="auto-read-input" type="number" min="0" step="250" value="0" class="text-input text-input-sm tabular" />
             </div>
           </div>
-          <div id="token-breakdown" class="meta-line mono tabular">Resets: 60s · 00:00 PT</div>
+
+          <div id="telemetry-block" class="token-meter mt-2">
+            <div class="meter-row">
+              <span>Context</span>
+              <span id="token-total-label" class="mono tabular">0 / 1,048,576</span>
+            </div>
+            <div class="meter-track">
+              <div id="token-meter-fill" class="meter-fill" style="width: 0%;"></div>
+            </div>
+            <div class="ai-stat-strip">
+              <span id="main-stats-line" class="meta-line mono tabular">0 RPM &middot; 0 TPM &middot; 0 RPD</span>
+              <button id="btn-main-details" type="button" class="btn btn-ghost btn-xs ai-details-btn" aria-expanded="false">Details</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="bridge-sidebar-block" class="ai-panel-body bridge-only">
+          <div class="meta-line ai-bridge-note">Playground Bridge &middot; Main AI uses 0 API tokens (copy/paste with Playground).</div>
         </div>
       </div>
 
-      <div id="bridge-sidebar-block" class="sidebar-block">
-        <div class="field-label">Playground Bridge Active</div>
-        <div class="meta-line" style="white-space:normal;">0 Gemini API calls or tokens can be spent. Copy bundles to AI Studio Playground and paste responses back for AST-checked diff gates.</div>
+      <div id="scout-telemetry-block" class="sidebar-block ai-panel-block">
+        <div class="ai-panel-head">
+          <div class="row-gap">
+            <span class="ai-panel-title">Scout AI</span>
+            <span id="scout-telemetry-model" class="meta-line mono hidden"></span>
+          </div>
+          <label class="ai-switch-wrap" title="Toggle Local AI Scout (uses lightweight -lite models in both Bridge &amp; API modes)">
+            <input id="btn-scout-toggle" type="checkbox" class="toggle-switch toggle-switch-sm" aria-label="Toggle Scout AI" />
+          </label>
+        </div>
+
+        <div id="scout-panel-body" class="ai-panel-body hidden">
+          <label class="ai-subswitch-row" for="btn-scout-auto" title="Auto-approve scout_workspace investigation prompts without pausing at a gate">
+            <span class="meta-line">Auto-run prompts</span>
+            <input id="btn-scout-auto" type="checkbox" class="toggle-switch toggle-switch-sm" />
+          </label>
+          <div class="ai-stat-strip">
+            <span id="scout-stats-line" class="meta-line mono tabular">0 RPM &middot; 0 TPM &middot; 0 tok</span>
+            <button id="btn-scout-details" type="button" class="btn btn-ghost btn-xs ai-details-btn" aria-expanded="false">Details</button>
+          </div>
+        </div>
       </div>
 
       <div class="sidebar-footer">
@@ -110,14 +129,8 @@
           <button id="btn-expand-sidebar" type="button" class="btn btn-secondary btn-xs pane-expand-btn" title="Show Sessions panel">Sessions &gt;</button>
           <input id="session-title-input" class="session-title-input" type="text" value="Select or create a session" disabled />
           <span id="active-session-mode-badge" class="session-mode-tag is-bridge hidden">BRIDGE</span>
-          <button id="btn-bridge-directives-pill" type="button" class="directives-pill is-pending bridge-only" title="Toggle including Project Directives &amp; Tool Contract on next prompt copy">Directives: On</button>
-          <span id="directives-meta" class="meta-line"></span>
         </div>
         <div class="topbar-right">
-          <select id="cdp-tab-select" class="select-input select-compact" title="Chrome :9222 Target Tab">
-            <option value="">Chrome :9222 (Not connected)</option>
-          </select>
-          <button id="btn-cdp-refresh" class="btn btn-ghost btn-sm" title="Refresh Chrome :9222 tabs">Refresh Tabs</button>
           <button id="btn-expand-drawer" type="button" class="btn btn-secondary btn-xs pane-expand-btn" title="Show Files &amp; Tools panel">&lt; Files</button>
         </div>
       </header>
@@ -181,17 +194,28 @@
 
         <div class="composer-bar">
           <div class="composer-actions">
-            <button id="btn-run-post-tests" class="btn btn-secondary btn-sm">Run Tests</button>
-            <button id="btn-cdp-shot" class="btn btn-secondary btn-sm hidden" title="Capture Chrome screenshot">CDP Screenshot</button>
-            <button id="btn-cdp-console" class="btn btn-secondary btn-sm hidden" title="Capture Chrome console output">CDP Console</button>
+            <div id="cdp-controls-group" class="cdp-controls-group">
+              <select id="cdp-tab-select" class="select-input select-compact hidden" title="Chrome :9222 Target Tab"></select>
+              <button id="btn-cdp-shot" type="button" class="btn btn-secondary btn-xs hidden" title="Capture Chrome screenshot">Screenshot</button>
+              <button id="btn-cdp-console" type="button" class="btn btn-secondary btn-xs hidden" title="Capture Chrome console output">Console</button>
+              <button id="btn-cdp-refresh" type="button" class="btn btn-ghost btn-xs" title="Check Chrome :9222 debug tabs">Chrome &#8635;</button>
+            </div>
           </div>
           <div class="composer-right">
             <span id="composer-token-est" class="meta-line mono tabular">~0 tok</span>
-            <button id="btn-retry-turn" type="button" class="btn btn-secondary btn-sm hidden api-only" title="Retry unfinished Gemini turn">Retry Turn</button>
-            <button id="btn-cancel-req" type="button" class="btn btn-danger btn-sm hidden api-only" title="Abort waiting on Gemini">Cancel</button>
+            <button id="btn-retry-turn" type="button" class="btn btn-secondary hidden api-only" title="Retry unfinished Gemini turn">Retry Turn</button>
+            <button id="btn-cancel-req" type="button" class="btn btn-danger hidden api-only" title="Abort waiting on Gemini">Cancel</button>
             <button id="btn-send" class="btn btn-primary api-only">Send</button>
-            <button id="btn-bridge-copy-img" type="button" class="btn btn-secondary btn-sm hidden bridge-only" title="Copy attached CDP image to clipboard for Ctrl+V into Playground">Copy CDP Image</button>
-            <button id="btn-bridge-copy-bundle" type="button" class="btn btn-secondary btn-sm bridge-only" title="Bundle prompt &amp; attachments to clipboard for AI Studio Playground (Ctrl+Enter)">Copy Starter &rarr; Playground</button>
+            <button id="btn-bridge-copy-img" type="button" class="btn btn-secondary hidden bridge-only" title="Copy attached CDP image to clipboard for Ctrl+V into Playground">Copy CDP Image</button>
+            <div id="bridge-copy-split" class="split-btn bridge-only">
+              <button id="btn-bridge-copy-bundle" type="button" class="btn btn-secondary split-btn-main" title="Copy prompt &amp; attachments bundle to clipboard for Playground (Ctrl+Enter)">Copy + Directives</button>
+              <button id="btn-bridge-copy-menu-toggle" type="button" class="btn btn-secondary split-btn-caret" title="Directives options" aria-haspopup="menu" aria-expanded="false" aria-label="Directives options">&#9662;</button>
+              <div id="bridge-copy-menu" class="split-btn-menu hidden" role="menu">
+                <button id="btn-bridge-copy-with-directives" type="button" class="split-btn-item" role="menuitem">Copy Directives Only</button>
+                <button id="btn-bridge-skip-directives" type="button" class="split-btn-item hidden" role="menuitem">Skip Directives</button>
+                <div id="bridge-copy-menu-meta" class="split-btn-meta meta-line mono"></div>
+              </div>
+            </div>
             <button id="btn-bridge-clipboard-parse" type="button" class="btn btn-primary bridge-cta-main bridge-only" title="Read AI reply from clipboard, run safe reads, and stage writes/scripts behind approval gates">Paste &amp; Run AI Reply</button>
           </div>
         </div>
@@ -226,6 +250,7 @@
         <div class="pane-toolbar">
           <input id="custom-cmd-input" class="text-input mono" type="text" placeholder="python developer/tools/run_tests.py" />
           <button id="btn-run-custom" class="btn btn-primary btn-sm">Run</button>
+          <button id="btn-run-post-tests" class="btn btn-secondary btn-sm" title="Run configured project Post-Patch Test Command">Run Tests</button>
         </div>
         <div id="preset-buttons" class="preset-row"></div>
         <div class="output-header">
@@ -251,8 +276,11 @@
         <div class="git-commit-box">
           <div class="row-between">
             <label class="field-label" for="git-message-input">Commit Message</label>
-            <button id="btn-git-draft" class="btn btn-secondary btn-sm api-only">Draft with Gemini</button>
-            <button id="btn-git-copy-diff" type="button" class="btn btn-secondary btn-sm bridge-only">Copy Git Diff</button>
+            <div class="row-gap">
+              <button id="btn-git-update-headers" type="button" class="btn btn-secondary btn-xs hidden" title="Draft comment header updates for modified files via Local AI Scout">Update Headers</button>
+              <button id="btn-git-draft" type="button" class="btn btn-secondary btn-sm hidden">Draft with Gemini</button>
+              <button id="btn-git-copy-diff" type="button" class="btn btn-secondary btn-sm bridge-only">Copy Git Diff</button>
+            </div>
           </div>
           <textarea id="git-message-input" class="text-input mono" rows="3" placeholder="feat: describe changes..."></textarea>
           <div class="row-gap mt-2">
@@ -383,15 +411,16 @@
   <!-- Session Setup Modal -->
   <dialog id="session-setup-modal" class="modal">
     <form id="session-setup-form" method="dialog" class="modal-card">
-      <h3>Session Setup</h3>
+      <h3 id="session-setup-title">Session Setup</h3>
+      <p id="session-setup-subtitle" class="meta-line modal-status hidden"></p>
       <label class="field-label" for="new-session-name">Session Name</label>
       <input id="new-session-name" class="text-input" type="text" required placeholder="Session 1" />
 
       <div class="sidebar-block mode-switch-block mt-3" style="border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
         <label class="mode-toggle-row" for="new-session-api-toggle">
           <span class="mode-toggle-copy">
-            <span class="field-label" style="margin:0;">Use Gemini API</span>
-            <span id="new-session-mode-hint" class="meta-line">OFF · Playground Bridge (0 API tokens, copy/paste)</span>
+            <span class="field-label" style="margin:0;">Use Main AI (Gemini API)</span>
+            <span id="new-session-mode-hint" class="meta-line">OFF &middot; Playground Bridge (0 Main AI tokens, copy/paste)</span>
           </span>
           <input id="new-session-api-toggle" type="checkbox" class="toggle-switch" />
         </label>
@@ -401,10 +430,19 @@
 
       <div class="modal-actions mt-3">
         <button id="btn-cancel-session-setup" type="button" class="btn btn-ghost">Cancel</button>
-        <button id="btn-confirm-session-setup" type="submit" class="btn btn-primary">OK</button>
+        <button id="btn-confirm-session-setup" type="submit" class="btn btn-primary">Create Session</button>
       </div>
     </form>
   </dialog>
+
+  <!-- Floating AI Telemetry Details Popover -->
+  <div id="ai-details-popover" class="ai-details-popover hidden" role="dialog" aria-label="AI Telemetry Details">
+    <div class="ai-details-head">
+      <span id="ai-details-title" class="ai-panel-title">AI Details</span>
+      <button id="btn-close-ai-details" type="button" class="btn btn-ghost btn-xs" title="Close">&times;</button>
+    </div>
+    <div id="ai-details-body" class="ai-details-body"></div>
+  </div>
 
   <!-- Disconnected Overlay (shown if Chrome blocks script window.close() on terminal exit) -->
   <div id="server-closed-overlay" class="server-closed-overlay hidden">

@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from config import THINKING_LEVELS
 from models import SessionCreate, SessionInfo, SessionUpdate
+from services import local_scout
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -47,6 +48,7 @@ def create_session(payload: SessionCreate, request: Request) -> SessionInfo:
 @router.get("/{session_id}")
 def get_session_detail(session_id: str, request: Request) -> Dict[str, Any]:
     db = request.app.state.db
+    gemini = getattr(request.app.state, "gemini", None)
     session = db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -64,7 +66,7 @@ def get_session_detail(session_id: str, request: Request) -> Dict[str, Any]:
         "messages": messages,
         "pending_gates": db.list_pending_gates(session_id),
         "checkpoints": db.list_checkpoints(session_id) if hasattr(db, "list_checkpoints") else [],
-        "telemetry": db.get_rate_telemetry(model=session.model),
+        "telemetry": local_scout.get_telemetry_snapshot(db, gemini, model=session.model),
     }
 
 
