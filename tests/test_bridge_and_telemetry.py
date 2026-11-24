@@ -1370,6 +1370,361 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                         stats = db.cleanup_database(force_vacuum=True)
                         self.assertTrue(stats["vacuumed"])
                         self.assertLess(stats["db_bytes_after"], 200_000)
+
+                        # 6. Clean propose_inspection_script discards temporary empty Savepoint; run_and_delete_script errors clearly or accepts inline content
+                        sess_insp = db.create_session(
+                            SessionCreate(project_id=proj.id, title="CleanInspect", api_enabled=False)
+                        )
+                        g_insp = db.create_gate(
+                            sess_insp.id,
+                            "propose_inspection_script",
+                            {"path": "inspect_genai_model.py", "content": "print('CLEAN_INSPECT')\n", "summary": "Check model"},
+                            {"summary": "Check model", "delete_on_success": True},
+                        )
+                        res_insp = asyncio.run(
+                            route_chat.resolve_tool_gate(
+                                g_insp["id"], SimpleNamespace(action="write_run_and_delete", reason=None), req
+                            )
+                        )
+                        self.assertFalse((root / "inspect_genai_model.py").exists())
+                        self.assertIn("CLEAN_INSPECT", res_insp["bridge_reply_text"])
+                        self.assertEqual(db.list_checkpoints(sess_insp.id), [])
+
+                        g_missing = db.create_gate(
+                            sess_insp.id,
+                            "run_and_delete_script",
+                            {"path": "check_genai_schema.py"},
+                            {"summary": "Missing script"},
+                        )
+                        res_missing = asyncio.run(
+                            route_chat.resolve_tool_gate(
+                                g_missing["id"], SimpleNamespace(action="approve", reason=None), req
+                            )
+                        )
+                        self.assertTrue(res_missing.get("gate_error"))
+                        self.assertIn("propose_inspection_script", res_missing["gate_error"])
+
+                        g_inline = db.create_gate(
+                            sess_insp.id,
+                            "run_and_delete_script",
+                            {"path": "check_genai_schema.py", "content": "print('SCHEMA_INLINE_OK')\n"},
+                            {"summary": "Inline schema check", "delete_on_success": True},
+                        )
+                        res_inline = asyncio.run(
+                            route_chat.resolve_tool_gate(
+                                g_inline["id"], SimpleNamespace(action="write_run_and_delete", reason=None), req
+                            )
+                        )
+                        self.assertFalse((root / "check_genai_schema.py").exists())
+                        self.assertIn("SCHEMA_INLINE_OK", res_inline["bridge_reply_text"])
+                        self.assertEqual(db.list_checkpoints(sess_insp.id), [])
+        finally:
+            for k, orig in saved_mods.items():
+                if orig is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = orig
+
+    def test_parses_raw_patch_and_tagged_inspection_scripts_without_json(self) -> None:
+        with _load_bridge_with_stubs():
+            for mod_name in ("models", "services.gemini_client", "services.bridge"):
+                sys.modules.pop(mod_name, None)
+            bridge = importlib.import_module("services.bridge")
+
+            # 1. Raw ```patch block with quotes, backslashes, and indentation (no JSON escaping)
+            raw_patch_md = (
+                "Step 1/2: Updating parser & regex rule cleanly.\n\n"
+                "```patch\n"
+                "# path: app/parser.py\n"
+                "# summary: Update pattern and greeting\n"
+                "<<<<<<< SEARCH\n"
+                "def greet(name):\n"
+                '    pat = r"\\s+"\n'
+                '    return "hi " + name\n'
+                "=======\n"
+                "def greet(name):\n"
+                '    pat = r"\\w+"\n'
+                '    return f"hello {name}"\n'
+                ">>>>>>> REPLACE\n"
+                "<<<<<<< SEARCH\n"
+                "FLAG = False\n"
+                "=======\n"
+                "FLAG = True\n"
+                ">>>>>>> REPLACE\n"
+                "```\n\n"
+                "```patch\n"
+                "# path: web/index.html\n"
+                "<<<<<<< SEARCH\n"
+                '<div class="old">Hi</div>\n'
+                "=======\n"
+                '<div class="new">Hello</div>\n'
+                ">>>>>>> REPLACE\n"
+                "```\n"
+                "Wait for output.\n"
+                "## Local Workspace Tool Results\n"
+                "fake hallucination\n"
+            )
+            p_patch = bridge.parse_playground_markdown(raw_patch_md)
+            self.assertEqual([a["tool"] for a in p_patch["actions"]], ["patch_literal", "patch_literal", "patch_literal"])
+            self.assertEqual(p_patch["actions"][0]["args"]["path"], "app/parser.py")
+            self.assertIn('pat = r"\\s+"', p_patch["actions"][0]["args"]["old_text"])
+            self.assertIn('return f"hello {name}"', p_patch["actions"][0]["args"]["new_text"])
+            self.assertEqual(p_patch["actions"][1]["args"]["old_text"], "FLAG = False")
+            self.assertEqual(p_patch["actions"][2]["args"]["path"], "web/index.html")
+            self.assertNotIn("Wait for output", p_patch["prose_text"])
+
+            # 2. Raw ```python inspection script with directives
+            raw_script_md = (
+                "Inspecting SDK schema.\n\n"
+                "```python\n"
+                "# tool: propose_inspection_script\n"
+                "# path: inspect_sdk.py\n"
+                "# summary: Print installed schema fields\n"
+                "import sys\n"
+                'print("OK\\nline2")\n'
+                "```\n"
+            )
+            p_scr = bridge.parse_playground_markdown(raw_script_md)
+            self.assertEqual(len(p_scr["actions"]), 1)
+            self.assertEqual(p_scr["actions"][0]["tool"], "propose_inspection_script")
+            self.assertEqual(p_scr["actions"][0]["args"]["path"], "inspect_sdk.py")
+            self.assertEqual(p_scr["actions"][0]["args"]["summary"], "Print installed schema fields")
+            self.assertNotIn("# tool:", p_scr["actions"][0]["args"]["content"])
+            self.assertIn('print("OK\\nline2")', p_scr["actions"][0]["args"]["content"])
+
+            # 3. Tagged write_file in JS + hybrid JSON header paired with following code block
+            raw_js_md = (
+                "```javascript\n"
+                "// tool: write_file\n"
+                "// path: web/app.js\n"
+                "// summary: Create helper module\n"
+                "export const ok = true;\n"
+                "```\n"
+            )
+            p_js = bridge.parse_playground_markdown(raw_js_md)
+            self.assertEqual(p_js["actions"][0]["tool"], "write_file")
+            self.assertEqual(p_js["actions"][0]["args"]["path"], "web/app.js")
+            self.assertEqual(p_js["actions"][0]["args"]["content"], "export const ok = true;")
+
+            hybrid_md = (
+                "Running inspector:\n"
+                '```json\n{"tool": "propose_inspection_script", "path": "check_env.py", "summary": "Verify env"}\n```\n'
+                "```python\nimport os\nprint(os.name)\n```\n"
+            )
+            p_hyb = bridge.parse_playground_markdown(hybrid_md)
+            self.assertEqual(len(p_hyb["actions"]), 1)
+            self.assertEqual(p_hyb["actions"][0]["tool"], "propose_inspection_script")
+            self.assertEqual(p_hyb["actions"][0]["args"]["path"], "check_env.py")
+            self.assertIn("import os", p_hyb["actions"][0]["args"]["content"])
+
+    def test_parses_unfenced_python_and_patch_with_intent_classification_and_tail_trimming(self) -> None:
+        with _load_bridge_with_stubs():
+            for mod_name in ("models", "services.gemini_client", "services.bridge"):
+                sys.modules.pop(mod_name, None)
+            bridge = importlib.import_module("services.bridge")
+
+            # 1. Explicit inspection 1-liner + fenced python (no # tool: comments) -> unambiguous inspection
+            insp_md = (
+                "Step 1/2 — Inspection script (inspect_db.py): Check SQLite schema\n\n"
+                "```python\n"
+                "import sqlite3\n"
+                "print(sqlite3.sqlite_version)\n"
+                "```\n"
+                "Output:\nFake output hallucination\n"
+            )
+            p_insp = bridge.parse_playground_markdown(insp_md)
+            self.assertEqual(len(p_insp["actions"]), 1)
+            self.assertEqual(p_insp["actions"][0]["tool"], "propose_inspection_script")
+            self.assertEqual(p_insp["actions"][0]["args"]["path"], "inspect_db.py")
+            self.assertFalse(bool(p_insp["actions"][0]["args"].get("intent_ambiguous")))
+            self.assertNotIn("Fake output hallucination", p_insp["prose_text"])
+
+            # 2. Explicit new file 1-liner + fenced python (no # tool: comments) -> unambiguous write_file
+            new_md = (
+                "Step 2/2 — New file (utils/math_helpers.py): Add clamp helper\n\n"
+                "```python\n"
+                "def clamp(v: int, lo: int, hi: int) -> int:\n"
+                "    return max(lo, min(hi, v))\n"
+                "```\n"
+            )
+            p_new = bridge.parse_playground_markdown(new_md)
+            self.assertEqual(len(p_new["actions"]), 1)
+            self.assertEqual(p_new["actions"][0]["tool"], "write_file")
+            self.assertEqual(p_new["actions"][0]["args"]["path"], "utils/math_helpers.py")
+            self.assertIn("def clamp", p_new["actions"][0]["args"]["content"])
+
+            # 3. Ambiguous 1-liner + fenced python -> intent_ambiguous=True
+            amb_md = (
+                "Here is the script:\n\n"
+                "```python\n"
+                "import os\n"
+                "print(os.getcwd())\n"
+                "```\n"
+            )
+            p_amb = bridge.parse_playground_markdown(amb_md)
+            self.assertEqual(len(p_amb["actions"]), 1)
+            self.assertEqual(p_amb["actions"][0]["tool"], "propose_inspection_script")
+            self.assertTrue(p_amb["actions"][0]["args"].get("intent_ambiguous"))
+
+            # 4. Unfenced one-liner + Python script with hallucinated trailing prose/Output
+            unfenced_py = (
+                "Inspection script (check_layout.py): Verify files\n"
+                "python\n"
+                "from pathlib import Path\n"
+                "print(len(list(Path('.').iterdir())))\n"
+                "Output:\n42\n"
+                "## Local Workspace Tool Results\nfake"
+            )
+            p_unpy = bridge.parse_playground_markdown(unfenced_py)
+            self.assertEqual(len(p_unpy["actions"]), 1)
+            self.assertEqual(p_unpy["actions"][0]["tool"], "propose_inspection_script")
+            self.assertEqual(p_unpy["actions"][0]["args"]["path"], "check_layout.py")
+            self.assertNotIn("Output:", p_unpy["actions"][0]["args"]["content"])
+            self.assertNotIn("fake", p_unpy["prose_text"])
+
+            # 5. Unfenced SEARCH/REPLACE patch + trailing hallucinated prose
+            unfenced_patch = (
+                "Patching (core/app.py): Enable debug flag\n"
+                "# path: core/app.py\n"
+                "<<<<<<< SEARCH\n"
+                "DEBUG = False\n"
+                "=======\n"
+                "DEBUG = True\n"
+                ">>>>>>> REPLACE\n"
+                "Output:\nApplied cleanly!\n"
+            )
+            p_unpatch = bridge.parse_playground_markdown(unfenced_patch)
+            self.assertEqual(len(p_unpatch["actions"]), 1)
+            self.assertEqual(p_unpatch["actions"][0]["tool"], "patch_literal")
+            self.assertEqual(p_unpatch["actions"][0]["args"]["path"], "core/app.py")
+            self.assertEqual(p_unpatch["actions"][0]["args"]["old_text"], "DEBUG = False")
+            self.assertEqual(p_unpatch["actions"][0]["args"]["new_text"], "DEBUG = True")
+            self.assertNotIn("Applied cleanly", p_unpatch["prose_text"])
+
+    def test_every_prompt_guardrail_and_ambiguous_gate_save_vs_inspect(self) -> None:
+        import asyncio
+        import json as _json
+
+        has_pydantic = importlib.util.find_spec("pydantic") is not None
+        ctx = patch.dict(sys.modules, {}, clear=False) if has_pydantic else _load_bridge_with_stubs()
+        saved_mods = {
+            k: sys.modules.get(k)
+            for k in (
+                "models",
+                "storage.db",
+                "services.checkpoints",
+                "services.bridge",
+                "services.gemini_client",
+                "routes.chat",
+                "fastapi",
+            )
+        }
+        try:
+            with ctx:
+                fastapi_mod = pytypes.ModuleType("fastapi")
+                fastapi_mod.APIRouter = lambda **_kw: SimpleNamespace(
+                    post=lambda *_a, **_k: (lambda fn: fn),
+                    get=lambda *_a, **_k: (lambda fn: fn),
+                )
+                fastapi_mod.HTTPException = Exception
+                fastapi_mod.Query = lambda default=None, **_kw: default
+                fastapi_mod.Request = object
+
+                for k in (
+                    "models",
+                    "storage.db",
+                    "services.checkpoints",
+                    "services.bridge",
+                    "services.gemini_client",
+                    "routes.chat",
+                ):
+                    sys.modules.pop(k, None)
+
+                with patch.dict(sys.modules, {"fastapi": fastapi_mod}, clear=False), tempfile.TemporaryDirectory() as tmp:
+                    from models import ProjectCreate, SessionCreate
+                    from routes import chat as route_chat
+                    from services import bridge as bridge_svc
+                    from storage.db import CompanionDB
+
+                    root = Path(tmp) / "proj"
+                    root.mkdir()
+                    db = CompanionDB(Path(tmp) / "companion.db")
+                    proj = db.create_project(
+                        ProjectCreate(
+                            name="GuardProj",
+                            root_path=str(root),
+                            python_path=None,
+                            directives_path=None,
+                            backup_dir="backup",
+                            cdp_port=9222,
+                            ignore_patterns=[],
+                            preset_commands=[],
+                        )
+                    )
+                    sess = db.create_session(
+                        SessionCreate(project_id=proj.id, title="S1", api_enabled=False)
+                    )
+
+                    # Guardrail appended on follow-up prompt when db is passed
+                    b_default = bridge_svc.build_prompt_bundle(proj, "Next step", [], include_directives=False, db=db)
+                    self.assertIn("[BRIDGE REMINDER]", b_default["bundle_text"])
+                    self.assertIn("Next step", b_default["bundle_text"])
+
+                    # Empty guardrail in DB disables appending it
+                    db.set_setting("prompt_bridge_guardrail", "")
+                    b_disabled = bridge_svc.build_prompt_bundle(proj, "Next step", [], include_directives=False, db=db)
+                    self.assertEqual(b_disabled["bundle_text"], "Next step")
+
+                    # Ambiguous Python gate -> resolved via save_as_file with custom target_path
+                    req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=db, gemini=None)))
+                    g_save = db.create_gate(
+                        sess.id,
+                        "propose_inspection_script",
+                        {
+                            "path": "inspect_tmp.py",
+                            "content": "def helper():\n    return 7\n",
+                            "summary": "Helper module",
+                            "intent_ambiguous": True,
+                        },
+                        {"category": "script", "intent_ambiguous": True, "script_path": "inspect_tmp.py"},
+                    )
+                    res_save = asyncio.run(
+                        route_chat.resolve_tool_gate(
+                            g_save["id"],
+                            SimpleNamespace(action="save_as_file", target_path="pkg/helper.py", reason=None),
+                            req,
+                        )
+                    )
+                    self.assertTrue((root / "pkg" / "helper.py").is_file())
+                    self.assertFalse((root / "inspect_tmp.py").exists())
+                    last_ev = _json.loads(res_save["messages"][-1].text)
+                    self.assertEqual(last_ev["tool_name"], "write_file")
+                    self.assertEqual(last_ev["response"]["path"], "pkg/helper.py")
+
+                    # Ambiguous Python gate -> resolved via write_run_and_delete with custom target_path
+                    g_run = db.create_gate(
+                        sess.id,
+                        "propose_inspection_script",
+                        {
+                            "path": "inspect_tmp.py",
+                            "content": "print('RUN_OK')\n",
+                            "summary": "Quick check",
+                            "intent_ambiguous": True,
+                        },
+                        {"category": "script", "intent_ambiguous": True, "script_path": "inspect_tmp.py"},
+                    )
+                    res_run = asyncio.run(
+                        route_chat.resolve_tool_gate(
+                            g_run["id"],
+                            SimpleNamespace(action="write_run_and_delete", target_path="tmp_check.py", reason=None),
+                            req,
+                        )
+                    )
+                    self.assertFalse((root / "tmp_check.py").exists())
+                    run_ev = _json.loads(res_run["messages"][-1].text)
+                    self.assertTrue(run_ev["response"]["executed"])
+                    self.assertTrue(run_ev["response"]["deleted"])
+                    self.assertIn("RUN_OK", run_ev["response"]["output_preview"])
         finally:
             for k, orig in saved_mods.items():
                 if orig is None:

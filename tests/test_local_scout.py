@@ -832,6 +832,143 @@ class TestLocalScoutLoop(_StubbedScoutTestCase):
         self.assertGreaterEqual(parsed["telemetry"]["scout"]["rpd"], 1)
         self.assertGreaterEqual(parsed["telemetry"]["scout"]["total_tokens"], 365)
 
+    def test_script_failure_classification_and_retry_script_route(self) -> None:
+        """propose_script defaults delete_on_success=True; runtime errors are retryable while static errors are not."""
+        gemini_client = importlib.import_module("services.gemini_client")
+
+        db_path = Path(self.tmp.name) / "script_retry.db"
+        db = self.db_mod.CompanionDB(db_path)
+        proj = db.create_project(self.models_mod.ProjectCreate(name="Repo", root_path=str(self.root)))
+        sess = db.create_session(self.models_mod.SessionCreate(project_id=proj.id, title="Bridge", api_enabled=False))
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=db, gemini=None, event_loop=None)))
+
+        # 1. propose_script preview defaults delete_on_success=True
+        prev = gemini_client.prepare_tool_gate_preview(
+            proj, "propose_script", {"path": "tmp_probe.py", "content": "print('hi')\n"}
+        )
+        self.assertTrue(prev["delete_on_success"])
+
+        # 2. Failure classifier distinguishes static vs runtime errors
+        self.assertEqual(
+            self.chat_rt.classify_script_failure("SyntaxError: invalid syntax", 1, "def broken(:\n"),
+            "static",
+        )
+        self.assertEqual(
+            self.chat_rt.classify_script_failure("Traceback:\nNameError: name 'x' is not defined\n", 1, "print(x)\n"),
+            "static",
+        )
+        self.assertEqual(
+            self.chat_rt.classify_script_failure(
+                "urllib.error.URLError: <urlopen error [WinError 10061] No connection could be made>\n",
+                1,
+                "print('ok')\n",
+            ),
+            "runtime",
+        )
+
+        # 3. Runtime-failing temporary script stays on disk with retryable=True; Retry succeeds -> auto-deletes & replaces trailing tool_event
+        flag_file = self.root / "chrome_ready.txt"
+        script_code = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "if not Path('chrome_ready.txt').exists():\n"
+            "    raise ConnectionRefusedError('Chrome :9222 not open')\n"
+            "print('PROBE_CONNECTED_OK')\n"
+        )
+        gate = db.create_gate(
+            sess.id,
+            "propose_script",
+            {"path": "probe_cdp.py", "content": script_code, "summary": "Probe CDP"},
+            {"summary": "Probe CDP", "delete_on_success": True},
+        )
+        fail_res = asyncio.run(
+            self.chat_rt.resolve_tool_gate(gate["id"], SimpleNamespace(action="write_run_and_delete", reason=None), req)
+        )
+        self.assertTrue((self.root / "probe_cdp.py").is_file())
+        self.assertIn("ConnectionRefusedError", fail_res["bridge_reply_text"])
+        ev_fail = json.loads(db.list_messages(sess.id)[-1].text)["response"]
+        self.assertEqual(ev_fail["failure_kind"], "runtime")
+        self.assertTrue(ev_fail["retryable"])
+        self.assertTrue(ev_fail["auto_delete_on_success"])
+
+        # Open "Chrome :9222" and retry script
+        flag_file.write_text("ready", encoding="utf-8")
+        retry_res = asyncio.run(
+            self.chat_rt.retry_failed_script(
+                self.models_mod.RetryScriptRequest(
+                    session_id=sess.id,
+                    path="probe_cdp.py",
+                    auto_delete=True,
+                    tool_name="propose_script",
+                ),
+                req,
+            )
+        )
+        self.assertFalse((self.root / "probe_cdp.py").exists(), "Passing retry must auto-delete temporary script")
+        self.assertIn("PROBE_CONNECTED_OK", retry_res["bridge_reply_text"])
+        self.assertNotIn("ConnectionRefusedError", retry_res["bridge_reply_text"])
+        self.assertEqual(db.list_checkpoints(sess.id), [], "Auto-deleted temp script with no other changes should not keep a Savepoint")
+
+        # 4. Static syntax error script cannot be retried
+        (self.root / "broken_static.py").write_text("def oops(:\n    pass\n", encoding="utf-8")
+        with self.assertRaises(Exception):
+            asyncio.run(
+                self.chat_rt.retry_failed_script(
+                    self.models_mod.RetryScriptRequest(session_id=sess.id, path="broken_static.py"),
+                    req,
+                )
+            )
+
+    def test_scout_emits_phase_direct_synthesis_and_guaranteed_done(self) -> None:
+        db_path = Path(self.tmp.name) / "scout_events.db"
+        db = self.db_mod.CompanionDB(db_path)
+        proj = db.create_project(self.models_mod.ProjectCreate(name="Repo", root_path=str(self.root)))
+        sess = db.create_session(self.models_mod.SessionCreate(project_id=proj.id, title="Bridge", api_enabled=False))
+
+        emitted: List[Dict[str, Any]] = []
+
+        def _capture_emit(app, loop, payload):
+            emitted.append(payload)
+
+        # Direct text response on step 1 (no function calls) still emits phase, synthesis step, and done
+        models_direct = _ScriptedModels([_make_response(text="Direct synthesis answer.", tokens=(150, 25, 5))])
+        gw = _FakeGeminiGateway(SimpleNamespace(models=models_direct))
+        with patch.object(self.local_scout, "_emit_ws", side_effect=_capture_emit):
+            res = self.local_scout.run_scout_workspace(
+                gw,
+                db,
+                proj,
+                session_id=sess.id,
+                goal="Find where auth happens",
+                subpath=".",
+                max_steps=4,
+            )
+        self.assertEqual(res["answer"], "Direct synthesis answer.")
+        types_seen = [e["type"] for e in emitted]
+        self.assertIn("scout_start", types_seen)
+        self.assertIn("scout_phase", types_seen)
+        self.assertIn("scout_step", types_seen)
+        self.assertEqual(types_seen[-1], "scout_done")
+
+        # Even if generation throws, scout_done is guaranteed in finally
+        emitted.clear()
+        class _BoomModels:
+            def generate_content(self, **_kw):
+                raise RuntimeError("boom error")
+        gw_boom = _FakeGeminiGateway(SimpleNamespace(models=_BoomModels()))
+        with patch.object(self.local_scout, "_emit_ws", side_effect=_capture_emit):
+            with self.assertRaises(RuntimeError):
+                self.local_scout.run_scout_workspace(
+                    gw_boom,
+                    db,
+                    proj,
+                    session_id=sess.id,
+                    goal="Fail test",
+                    subpath=".",
+                    max_steps=2,
+                )
+        self.assertEqual(emitted[-1]["type"], "scout_done")
+
 
 @unittest.skipUnless(HAS_WEB_DEPS, "fastapi/httpx/google-genai required for HTTP TestClient integration tests")
 class TestScoutApiAndBridgeWorkflow(unittest.TestCase):

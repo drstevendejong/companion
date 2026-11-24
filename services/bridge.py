@@ -21,40 +21,93 @@ from models import AttachmentItem, ProjectProfile
 from services import fs_tools
 from services.token_utils import estimate_tokens
 
+DEFAULT_BRIDGE_GUARDRAIL = (
+    "> **[BRIDGE REMINDER]** Add a 1-line summary right before your block stating intent + target path "
+    "(`Inspection script (path.py): ...`, `New file (path.ext): ...`, or `Patching (path.ext): ...`). "
+    "Emit raw ```patch or ```python (never compress Python inside JSON). "
+    "HARD STOP immediately after closing ``` (or end of code)—zero trailing prose or fake output."
+)
+
 _FALLBACK_BRIDGE_TOOL_CONTRACT = """--- COMPANION BRIDGE TOOL CONTRACT ---
 STRICT OUTPUT RULES:
-1) Add a plain-English one-liner BEFORE every JSON command, preferably with an indication of progress (e.g., "Step 2/4: Patching IMAP client...").
-2) Generate AT MOST ONE ```json command block per message (if batching multiple actions, put them inside ONE JSON array `[...]` in that single ```json block).
-3) Generate all output ONCE ONLY—never repeat, duplicate, or echo prose or JSON blocks in the same reply.
+1) Add a plain-English one-liner BEFORE every command or code block stating progress AND intent + target path, e.g.:
+   - `Step 2/4 — Inspection script (inspect_tmp.py): Check database schema fields`
+   - `Step 2/4 — New file (utils/helper.py): Create helper module`
+   - `Step 2/4 — Patching (core/client.py): Fix retry timeout`
+2) Prefer RAW fenced ```patch blocks for edits and RAW fenced ```python (or target-language) blocks for scripts and new files—never compress Python indentation inside JSON strings! When using JSON commands, emit AT MOST ONE ```json command block per message (batch multiple JSON actions inside ONE JSON array `[...]`).
+3) Generate all output ONCE ONLY—never repeat, duplicate, or echo prose, code, or JSON blocks in the same reply.
+4) HARD STOP: End your response IMMEDIATELY after the closing ``` (or end of code). Never emit `Output:`, `Wait for output`, `## Local Workspace Tool Results`, or any trailing prose afterward (Companion truncates anything after the code block).
 
-To inspect files or propose edits for human-gated diff review and auto-backup, emit a single ```json block containing a tool action object (or a JSON array of objects). All inspect/patch tools work generically on any UTF-8 text/code file type (Python, JS/TS, HTML/CSS, SQL, Go, Rust, config, etc.):
-- {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block", "new_text": "replacement", "summary": "1-line reason"} (returns nearest line-number + diff diagnostics if old_text mismatches)
+RECOMMENDED ZERO-ESCAPING CODE FORMATS (NO JSON STRING ESCAPING NEEDED):
+A) Surgical Code Edits (`patch_literal`) — emit one or more ```patch blocks with `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`:
+```patch
+# path: path/to/file.py
+# summary: 1-line reason
+<<<<<<< SEARCH
+exact existing lines (indentation preserved verbatim)
+=======
+replacement lines (indentation preserved verbatim)
+>>>>>>> REPLACE
+```
+
+B) Temporary Inspection / Verification Scripts (`propose_inspection_script` — NEVER for code edits; auto-deletes cleanly on exit 0 without leaving a savepoint) — state `Inspection script (path.py): ...` in the one-liner and emit a raw ```python block:
+```python
+# tool: propose_inspection_script
+# path: developer/inspect_tmp.py
+# summary: What this temporary inspection script checks or prints
+import sys
+print("diagnostic output")
+```
+
+C) New Files / Full Rewrites (`write_file`) — state `New file (path/to/file.ext): ...` in the one-liner and emit a fenced block in the target language with top directive comments:
+`# tool: write_file`, `# path: path/to/file.py`, `# summary: 1-line reason` (also supports `// ...` or `<!-- ... -->`).
+
+JSON COMMAND TOOLS (ideal for reads, searches, file ops, tests, and re-running failed scripts):
+- {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block", "new_text": "replacement", "summary": "1-line reason"}
 - {"tool": "patch_lines", "path": "path/to/file", "start_line": 10, "end_line": 20, "new_text": "replacement", "summary": "1-line reason"}
 - {"tool": "write_file", "path": "path/to/file", "content": "full file text", "summary": "1-line reason"}
 - {"tool": "delete_file", "path": "path/to/file", "summary": "1-line reason"} (human-gated delete; auto-backed up first)
 - {"tool": "rename_file", "old_path": "old/path", "new_path": "new/path", "summary": "1-line reason"} (human-gated move/rename; auto-backed up first)
-- {"tool": "propose_script", "path": "packer.py", "content": "python helper script text", "summary": "e.g. Pack target files into packed_context.md"} (optional `"delete_on_success": true` for one-shot inspection scripts)
-- {"tool": "run_script", "path": "packer.py", "summary": "1-line reason"} (human-gated run of an existing/patched .py script in project Python; optional `"args": "--flag"`)
-- {"tool": "run_and_delete_script", "path": "probe.py", "summary": "1-line reason"} (human-gated run of an inspection/temporary .py script; automatically deletes the script if exit code is 0 with no traceback, or keeps it on disk on error so you can patch & re-run; optional `"args": "--flag"`)
-- {"tool": "run_tests", "summary": "1-line reason"} (human-gated full suite — auto-commits savepoint on pass; optional `"fast": true` / `"target": "file"` runs quick check without committing savepoint; never call on broken intermediate steps)
+- {"tool": "propose_inspection_script", "path": "inspect_tmp.py", "content": "...", "summary": "..."} (alias: `propose_script`; temporary inspection script—auto-deletes on clean exit 0; stays on disk only on error for patching)
+- {"tool": "run_script", "path": "script.py", "summary": "1-line reason"} (human-gated run of a permanent/kept .py script in project Python; optional `"args": "--flag"`)
+- {"tool": "run_and_delete_script", "path": "inspect_tmp.py", "summary": "1-line reason"} (ONLY to re-run a failed temporary script already saved on disk and delete it once it passes; to create+run a new temporary script use `propose_inspection_script`)
+- {"tool": "run_tests", "summary": "1-line reason"} (human-gated full suite — auto-commits savepoint on pass; optional `"fast": true` / `"target": "file"` runs quick check)
 - {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
 - {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120}
 - {"tool": "read_file", "path": "path/to/file"}
 - {"tool": "list_tree", "subpath": ".", "max_depth": 3}
 
 Notes:
-- When you need multiple files/fragments from disk, emit a `propose_script` (e.g. `packer.py`) that writes a clean `.md` bundle file or prints stdout directly (Companion captures stdout automatically). If a temporary/inspection script errors and you patch it, call `run_and_delete_script` to re-run it and clean it up automatically once it succeeds (or `run_script` to keep it).
+- When you need multiple files/fragments from disk, emit a `propose_inspection_script` (e.g. raw ```python block printing stdout directly; Companion captures stdout and auto-deletes passing temporary scripts without leaving a savepoint). If a temporary script fails and you patch it, call `run_and_delete_script` to re-run and auto-delete once it succeeds.
 - Git status, diff viewing, commit message drafting, Commit, and Commit & Push are triggered by the user in Companion's right-drawer Git tab (not via JSON tool calls)."""
 
 
-def get_playground_tool_contract() -> str:
-    """Returns the latest Playground Bridge tool contract from static/prompts/bridge_tool_contract.txt."""
+def get_default_playground_tool_contract() -> str:
+    """Returns the built-in default Playground Bridge tool contract from static/prompts/bridge_tool_contract.txt."""
     from services.gemini_client import load_prompt_file
 
     return load_prompt_file("bridge_tool_contract.txt", _FALLBACK_BRIDGE_TOOL_CONTRACT)
 
 
-PLAYGROUND_TOOL_CONTRACT = get_playground_tool_contract()
+def get_playground_tool_contract(db: Any = None) -> str:
+    """Returns the active Playground Bridge tool contract (DB override if configured, else default file)."""
+    if db is not None and hasattr(db, "get_setting"):
+        override = db.get_setting("prompt_bridge_tool_contract")
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+    return get_default_playground_tool_contract()
+
+
+def get_bridge_guardrail(db: Any = None) -> str:
+    """Returns the every-prompt Bridge guardrail reminder (DB override if set; empty string disables it)."""
+    if db is not None and hasattr(db, "get_setting"):
+        override = db.get_setting("prompt_bridge_guardrail")
+        if override is not None:
+            return str(override).strip()
+    return DEFAULT_BRIDGE_GUARDRAIL
+
+
+PLAYGROUND_TOOL_CONTRACT = get_default_playground_tool_contract()
 
 KNOWN_TOOLS = {
     "list_tree",
@@ -70,6 +123,7 @@ KNOWN_TOOLS = {
     "write_file",
     "delete_file",
     "rename_file",
+    "propose_inspection_script",
     "propose_script",
     "run_script",
     "run_and_delete_script",
@@ -139,7 +193,7 @@ def build_scout_state_notice(enabled: bool) -> str:
             "> **[COMPANION NOTICE] Local AI Scout is NOW ENABLED.** "
             "You may call `{\"tool\": \"scout_workspace\", \"goal\": \"...\", \"subpath\": \".\", \"max_steps\": 8}` "
             "for multi-step read-only codebase traces, `{\"tool\": \"update_header\", \"paths\": [\"...\"]}` "
-            "for human-gated comment header updates, or add `\"focus\": \"question\"` to `run_tests`/`run_script`/`run_and_delete_script`/`propose_script`."
+            "for human-gated comment header updates, or add `\"focus\": \"question\"` to `run_tests`/`run_script`/`run_and_delete_script`/`propose_inspection_script`."
         )
     return (
         "> **[COMPANION NOTICE] Local AI Scout is NOW OFF.** "
@@ -155,6 +209,8 @@ def build_prompt_bundle(
     include_directives: bool = True,
     scout_enabled: Optional[bool] = None,
     scout_state_notice: str = "",
+    db: Any = None,
+    every_prompt_guardrail: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Builds a clipboard-ready Markdown prompt bundle for AI Studio Playground."""
     sections: List[str] = []
@@ -170,8 +226,8 @@ def build_prompt_bundle(
 
         from services.gemini_client import get_base_system_prompt
 
-        sections.append(get_base_system_prompt().strip())
-        sections.append(get_playground_tool_contract().strip())
+        sections.append(get_base_system_prompt(db).strip())
+        sections.append(get_playground_tool_contract(db).strip())
 
         if project.directives_path:
             try:
@@ -210,6 +266,16 @@ def build_prompt_bundle(
             sections.append(f"## Request\n{clean_prompt}")
         else:
             sections.append(clean_prompt)
+
+    if every_prompt_guardrail is not None:
+        guardrail_text = str(every_prompt_guardrail).strip()
+    elif db is not None:
+        guardrail_text = get_bridge_guardrail(db).strip()
+    else:
+        guardrail_text = ""
+
+    if guardrail_text:
+        sections.append(guardrail_text)
 
     bundle_text = "\n\n".join(s for s in sections if s).strip()
     return {
@@ -626,6 +692,21 @@ _HALLUCINATED_STOP_RE = re.compile(
     r"(?m)^\s*(?:#{1,4}\s*Local Workspace Tool Results\b|Wait for output\b.*$)",
     re.IGNORECASE,
 )
+_TRAILING_HALLUCINATION_RE = re.compile(
+    r"^\s*(?:(?:#{1,4}\s*)?(?:Local Workspace Tool Results|Output|Result|Console Output|Terminal Output|Expected Output)\s*:?|Wait for output\b)",
+    re.IGNORECASE,
+)
+_NEW_FILE_INTENT_RE = re.compile(
+    r"\b(?:new\s+(?:code\s+)?file|create\s+(?:new\s+)?(?:python\s+)?file|write_file|full\s+rewrite|rewrite\s+(?:file|module)|save\s+(?:as\s+)?(?:new\s+)?(?:code\s+)?file|add\s+(?:new\s+)?(?:code\s+)?(?:file|module))\b",
+    re.IGNORECASE,
+)
+_INSPECT_INTENT_RE = re.compile(
+    r"\b(?:inspection\s+script|temp(?:orary)?\s+(?:script|probe|inspector|check)|diagnostic\s+script|verification\s+script|probe\s+script|one-shot\s+(?:script|probe|check)|propose_inspection_script|propose_script|run\s+and\s+delete|inspect(?:ion|ing)?\b|diagnos(?:e|ing)|audit(?:ing)?|verify(?:ing)?\s+(?:schema|installed|api|fields|env))\b",
+    re.IGNORECASE,
+)
+_UNFENCED_PY_START_RE = re.compile(
+    r"^\s*(?:#\s*(?:tool|path|file|filename|summary)\s*[:=]|from\s+[A-Za-z_.]+\s+import\b|import\s+[A-Za-z_.]+|(?:async\s+)?def\s+[A-Za-z_]|class\s+[A-Za-z_]|@[A-Za-z_]|if\s+__name__\s*==|with\s+\S|try\s*:|[A-Za-z_][A-Za-z0-9_]*\s*=[^=])"
+)
 
 
 def _strip_hallucinated_continuation(text: str) -> str:
@@ -669,23 +750,48 @@ def _extract_inline_json_actions(text: str) -> List[Dict[str, Any]]:
     return actions
 
 
+def _extract_one_liner_summary(heading_hint: str) -> str:
+    """Extracts the plain-English one-liner immediately preceding a block or code slice."""
+    if not heading_hint:
+        return ""
+    for raw_ln in reversed(heading_hint.splitlines()):
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        if re.fullmatch(r"[-=*_`~]{3,}", ln) or re.fullmatch(r"#{1,6}\s*(?:patch|code|script)\s*", ln, re.IGNORECASE):
+            continue
+        ln = re.sub(r"^(?:[#>*-]+|\d+[.)])\s*", "", ln).strip()
+        if ln.lower() in ("python", "python3", "py", "patch", "diff", "json"):
+            continue
+        if ln:
+            return ln[:220]
+    return ""
+
+
 def _infer_python_script_path(code: str, heading_hint: str, index: int) -> Tuple[str, bool]:
     """
     Infers target script path from explicit comment (# path: ..., # file: ...)
-    or surrounding markdown hint. Returns (path, has_explicit_marker).
+    or surrounding markdown/one-liner hint. Returns (path, has_explicit_marker).
     """
     top_lines = code.splitlines()[:6]
     for ln in top_lines:
         m = re.match(r"^\s*#\s*(?:path|file|filename)\s*[:=]\s*([^\s#]+)", ln, re.IGNORECASE)
         if m:
-            return m.group(1).strip().strip("`'\""), True
+            return m.group(1).strip().strip("`'\"").lstrip("/"), True
         m2 = re.match(r"^\s*#\s*([A-Za-z0-9_./\\-]+\.py)\b", ln)
         if m2:
-            return m2.group(1).strip(), True
+            return m2.group(1).strip().lstrip("/"), True
 
-    hint_match = re.search(r"`([A-Za-z0-9_./\\-]+\.py)`", heading_hint)
-    if hint_match:
-        return hint_match.group(1).lstrip("/"), True
+    if heading_hint:
+        hint_match = re.search(r"`([A-Za-z0-9_./\\-]+\.py)`", heading_hint)
+        if hint_match:
+            return hint_match.group(1).lstrip("/"), True
+        bare_match = re.search(
+            r"(?:^|[\s(`\"'])/?([A-Za-z0-9_./\\-]+\.py)(?=[\s)`\"':,;!?]|$)",
+            heading_hint,
+        )
+        if bare_match:
+            return bare_match.group(1).lstrip("/"), True
 
     if re.search(r"\bpacker\.py\b", code) or re.search(r"\bpacker\.py\b", heading_hint, re.IGNORECASE):
         return "packer.py", False
@@ -699,6 +805,9 @@ def _looks_like_python_script(code: str) -> bool:
         tree = ast.parse(code)
     except SyntaxError:
         return False
+    body = list(getattr(tree, "body", []) or [])
+    if not body:
+        return False
     return any(
         isinstance(
             node,
@@ -710,8 +819,11 @@ def _looks_like_python_script(code: str) -> bool:
                 ast.ClassDef,
                 ast.Assign,
                 ast.AugAssign,
+                ast.AnnAssign,
                 ast.For,
+                ast.AsyncFor,
                 ast.With,
+                ast.AsyncWith,
                 ast.Try,
                 ast.Call,
             ),
@@ -720,13 +832,399 @@ def _looks_like_python_script(code: str) -> bool:
     )
 
 
+def _classify_python_block_intent(
+    heading_hint: str,
+    directives: Dict[str, Any],
+    code: str,
+    inferred_path: str,
+    has_explicit_path: bool,
+) -> Tuple[str, bool]:
+    """
+    Determines whether a Python block is an explicit inspection script, an explicit write_file,
+    a legacy packer.py script, or ambiguous (prompt user at gate).
+    Returns (tool_name, intent_ambiguous).
+    """
+    if directives.get("has_explicit_tool") and directives.get("tool"):
+        return str(directives["tool"]), False
+    if (
+        inferred_path == "packer.py"
+        or re.search(r"\bpacker\.py\b", heading_hint or "", re.IGNORECASE)
+        or re.search(r"\bpacker\.py\b", code or "")
+    ):
+        return "propose_script", False
+
+    hint_text = heading_hint or ""
+    if _NEW_FILE_INTENT_RE.search(hint_text):
+        if has_explicit_path:
+            return "write_file", False
+        return "propose_inspection_script", True
+
+    if _INSPECT_INTENT_RE.search(hint_text):
+        return "propose_inspection_script", False
+
+    return "propose_inspection_script", True
+
+
+_DIRECTIVE_LINE_RE = re.compile(
+    r"^\s*(?:(?:#|//|--)\s*|(?:/\*|<!--)\s*)?"
+    r"(tool|path|file|filename|summary|delete_on_success|replace_all|args|focus)\s*[:=]\s*(.+?)"
+    r"(?:\s*(?:\*/|-->))?\s*$",
+    re.IGNORECASE,
+)
+_SEARCH_START_RE = re.compile(r"^<{7}\s*(?:SEARCH|ORIGINAL|OLD)?\s*$", re.IGNORECASE)
+_SEARCH_MID_RE = re.compile(r"^={7}\s*$")
+_SEARCH_END_RE = re.compile(r"^>{7}\s*(?:REPLACE|NEW)?\s*$", re.IGNORECASE)
+
+
+def _parse_bool_directive(val: str) -> Optional[bool]:
+    low = val.strip().lower()
+    if low in ("true", "1", "yes", "on"):
+        return True
+    if low in ("false", "0", "no", "off"):
+        return False
+    return None
+
+
+def _parse_code_block_directives(content: str, heading_hint: str) -> Dict[str, Any]:
+    """
+    Inspects top comment directives inside a fenced code block, e.g.:
+      # tool: propose_inspection_script
+      # path: inspect_model.py
+      # summary: Inspect installed SDK models
+    or // tool: write_file, /* tool: write_file */, <!-- tool: write_file -->.
+    Returns parsed directive metadata and `stripped_content` (with only pure Companion directive lines removed).
+    """
+    lines = content.splitlines()
+    directives: Dict[str, Any] = {
+        "tool": "",
+        "path": "",
+        "summary": "",
+        "delete_on_success": None,
+        "replace_all": None,
+        "args": None,
+        "focus": None,
+        "has_explicit_tool": False,
+        "has_explicit_path": False,
+        "stripped_content": content,
+    }
+    directive_line_indices: set[int] = set()
+    scan_limit = min(len(lines), 10)
+    idx = 0
+    # Skip optional blank line or shebang line without stripping shebang
+    while idx < scan_limit:
+        raw_ln = lines[idx]
+        stripped_ln = raw_ln.strip()
+        if not stripped_ln or stripped_ln.startswith("#!"):
+            idx += 1
+            continue
+        m = _DIRECTIVE_LINE_RE.match(raw_ln)
+        if not m:
+            break
+        # Require comment syntax (not plain JSON/YAML/Python assignments) for code blocks
+        lead = raw_ln.lstrip()
+        if not (
+            lead.startswith("#")
+            or lead.startswith("//")
+            or lead.startswith("/*")
+            or lead.startswith("<!--")
+            or lead.startswith("--")
+        ):
+            break
+        key = m.group(1).strip().lower()
+        val = m.group(2).strip().strip("`")
+        if key == "tool":
+            t_norm = val.strip("'\"").strip()
+            if t_norm in KNOWN_TOOLS:
+                directives["tool"] = t_norm
+                directives["has_explicit_tool"] = True
+                directive_line_indices.add(idx)
+        elif key in ("path", "file", "filename"):
+            p_val = val.strip("'\" ").lstrip("/")
+            if p_val and ("." in p_val or "/" in p_val or "\\" in p_val):
+                directives["path"] = p_val
+                directives["has_explicit_path"] = True
+                directive_line_indices.add(idx)
+        elif key == "summary":
+            directives["summary"] = val.strip("'\"")
+            directive_line_indices.add(idx)
+        elif key == "delete_on_success":
+            b = _parse_bool_directive(val)
+            if b is not None:
+                directives["delete_on_success"] = b
+                directive_line_indices.add(idx)
+        elif key == "replace_all":
+            b = _parse_bool_directive(val)
+            if b is not None:
+                directives["replace_all"] = b
+                directive_line_indices.add(idx)
+        elif key == "args":
+            directives["args"] = val.strip("'\"")
+            directive_line_indices.add(idx)
+        elif key == "focus":
+            directives["focus"] = val.strip("'\"")
+            directive_line_indices.add(idx)
+        idx += 1
+
+    if directive_line_indices:
+        kept_lines = [ln for i, ln in enumerate(lines) if i not in directive_line_indices]
+        while kept_lines and not kept_lines[0].strip():
+            kept_lines.pop(0)
+        body = "\n".join(kept_lines)
+        if content.endswith("\n") and body and not body.endswith("\n"):
+            body += "\n"
+        directives["stripped_content"] = body
+
+    if not directives["path"] and heading_hint:
+        hint_match = re.search(r"`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)`", heading_hint)
+        if hint_match:
+            directives["path"] = hint_match.group(1).lstrip("/")
+
+    return directives
+
+
+def _parse_patch_search_replace_block(content: str, heading_hint: str) -> List[Dict[str, Any]]:
+    """
+    Parses a raw ```patch / ```diff / ```companion-patch block containing one or more:
+      # path: path/to/file.py
+      # summary: Optional summary
+      <<<<<<< SEARCH
+      exact old lines
+      =======
+      exact new lines
+      >>>>>>> REPLACE
+    into normalized `patch_literal` actions (zero JSON escaping needed).
+    """
+    default_path = ""
+    if heading_hint:
+        hint_match = re.search(r"`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)`", heading_hint)
+        if hint_match:
+            default_path = hint_match.group(1).lstrip("/")
+        else:
+            bare_match = re.search(
+                r"(?:^|[\s(`\"'])/?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)(?=[\s)`\"':,;!?]|$)",
+                heading_hint,
+            )
+            if bare_match:
+                default_path = bare_match.group(1).lstrip("/")
+
+    hint_summary = _extract_one_liner_summary(heading_hint)
+    current_path = default_path
+    current_summary = ""
+    current_replace_all = False
+    actions: List[Dict[str, Any]] = []
+
+    state = "meta"
+    search_lines: List[str] = []
+    replace_lines: List[str] = []
+
+    for ln in content.splitlines():
+        if state == "meta":
+            if _SEARCH_START_RE.match(ln):
+                state = "search"
+                search_lines = []
+                replace_lines = []
+                continue
+            m = _DIRECTIVE_LINE_RE.match(ln)
+            if m:
+                key = m.group(1).strip().lower()
+                val = m.group(2).strip().strip("`'\"")
+                if key in ("path", "file", "filename") and val:
+                    current_path = val.lstrip("/")
+                elif key == "summary":
+                    current_summary = val
+                elif key == "replace_all":
+                    b = _parse_bool_directive(val)
+                    if b is not None:
+                        current_replace_all = b
+                continue
+            m_bare_file = re.match(r"^\s*(?:#|//)?\s*([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)\s*$", ln)
+            if m_bare_file:
+                current_path = m_bare_file.group(1).lstrip("/")
+        elif state == "search":
+            if _SEARCH_MID_RE.match(ln):
+                state = "replace"
+            else:
+                search_lines.append(ln)
+        elif state == "replace":
+            if _SEARCH_END_RE.match(ln):
+                target_path = current_path.strip()
+                if target_path:
+                    args: Dict[str, Any] = {
+                        "path": target_path,
+                        "old_text": "\n".join(search_lines),
+                        "new_text": "\n".join(replace_lines),
+                        "summary": current_summary or hint_summary or f"Surgical patch ({target_path})",
+                    }
+                    if current_replace_all:
+                        args["replace_all"] = True
+                    actions.append({"tool": "patch_literal", "args": args})
+                state = "meta"
+                search_lines = []
+                replace_lines = []
+            else:
+                replace_lines.append(ln)
+
+    return actions
+
+
+def _extract_unfenced_patch_with_end(text: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Fallback extractor for unfenced `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks + trailing hallucination cut."""
+    if "<<<<<<<" not in text or "=======" not in text or ">>>>>>>" not in text:
+        return [], None
+    lines_keep = text.splitlines(keepends=True)
+    lines = [ln.rstrip("\r\n") for ln in lines_keep]
+    line_ends: List[int] = []
+    pos = 0
+    for ln_raw in lines_keep:
+        pos += len(ln_raw)
+        line_ends.append(pos)
+
+    first_marker_idx = None
+    last_end_idx = None
+    for idx, ln in enumerate(lines):
+        if first_marker_idx is None and (_SEARCH_START_RE.match(ln) or _DIRECTIVE_LINE_RE.match(ln)):
+            first_marker_idx = idx
+        if _SEARCH_END_RE.match(ln):
+            last_end_idx = idx
+
+    if last_end_idx is None:
+        return [], None
+
+    meta_start = 0
+    if first_marker_idx is not None:
+        meta_start = max(0, first_marker_idx - 3)
+        heading_hint = "\n".join(lines[meta_start:first_marker_idx])
+    else:
+        heading_hint = ""
+
+    actions = _parse_patch_search_replace_block("\n".join(lines[: last_end_idx + 1]), heading_hint)
+    if not actions:
+        return [], None
+    return actions, line_ends[last_end_idx]
+
+
+def _extract_unfenced_python_with_bounds(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extracts an unfenced Python script (with optional preceding 1-liner prose and/or `python` UI label)
+    and strips trailing hallucinated prose/output lines beyond the valid AST Python prefix.
+    """
+    lines_keep = text.splitlines(keepends=True)
+    lines = [ln.rstrip("\r\n") for ln in lines_keep]
+    if not lines:
+        return None
+    line_ends: List[int] = []
+    pos = 0
+    for ln_raw in lines_keep:
+        pos += len(ln_raw)
+        line_ends.append(pos)
+
+    n = len(lines)
+    start_idx: Optional[int] = None
+    heading_end_idx = 0
+
+    for idx, ln in enumerate(lines):
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        if stripped.lower() in ("python", "python3", "py"):
+            j = idx + 1
+            while j < n and not lines[j].strip():
+                j += 1
+            if j < n:
+                start_idx = j
+                heading_end_idx = idx
+                break
+        if _UNFENCED_PY_START_RE.match(ln):
+            start_idx = idx
+            heading_end_idx = idx
+            break
+
+    if start_idx is None or start_idx >= n:
+        return None
+
+    limit_idx = n
+    for idx in range(start_idx, n):
+        if idx > start_idx and _TRAILING_HALLUCINATION_RE.match(lines[idx]):
+            limit_idx = idx
+            break
+
+    best_end_idx: Optional[int] = None
+    best_code = ""
+    for end_idx in range(limit_idx - 1, start_idx - 1, -1):
+        if not lines[end_idx].strip():
+            continue
+        candidate = "\n".join(lines[start_idx : end_idx + 1])
+        if not _looks_like_python_script(candidate):
+            continue
+        try:
+            tree = ast.parse(candidate)
+        except SyntaxError:
+            continue
+        body = list(getattr(tree, "body", []) or [])
+        if not body:
+            continue
+        last_node = body[-1]
+        # Never swallow a trailing bare identifier/constant word such as "Done" or "Output"
+        if isinstance(last_node, ast.Expr) and isinstance(last_node.value, (ast.Name, ast.Constant)):
+            continue
+        # Require at least one clear code statement (not just prose tokens)
+        has_real_stmt = any(
+            not (isinstance(st, ast.Expr) and isinstance(st.value, (ast.Name, ast.Constant)))
+            for st in body
+        )
+        if not has_real_stmt:
+            continue
+        best_end_idx = end_idx
+        best_code = candidate
+        break
+
+    if best_end_idx is None or not best_code.strip():
+        return None
+
+    heading_hint = "\n".join(lines[max(0, heading_end_idx - 4) : heading_end_idx])
+    directives = _parse_code_block_directives(best_code, heading_hint)
+    inferred_path, explicit_in_code = _infer_python_script_path(
+        directives["stripped_content"] if directives["has_explicit_path"] else best_code,
+        heading_hint,
+        0,
+    )
+    target_path = directives["path"] or inferred_path
+    has_explicit_path = bool(directives["has_explicit_path"] or explicit_in_code)
+    one_liner = _extract_one_liner_summary(heading_hint)
+
+    tool_name, intent_ambiguous = _classify_python_block_intent(
+        heading_hint,
+        directives,
+        best_code,
+        target_path,
+        has_explicit_path,
+    )
+    action_args: Dict[str, Any] = {
+        "path": target_path,
+        "content": directives["stripped_content"] if (directives["has_explicit_tool"] or directives["has_explicit_path"]) else best_code,
+        "summary": directives["summary"] or one_liner or f"Python block parsed from Playground ({target_path})",
+    }
+    if tool_name in ("propose_inspection_script", "propose_script"):
+        if intent_ambiguous:
+            action_args["intent_ambiguous"] = True
+            action_args["has_explicit_path"] = has_explicit_path
+        if directives["delete_on_success"] is not None:
+            action_args["delete_on_success"] = directives["delete_on_success"]
+        if directives["focus"]:
+            action_args["focus"] = directives["focus"]
+
+    return {
+        "action": {"tool": tool_name, "args": action_args},
+        "end_char": line_ends[best_end_idx],
+    }
+
+
 def parse_playground_markdown(raw_markdown: str) -> Dict[str, Any]:
     """
-    Parses Playground output ("Copy as markdown", `.md` inside code block, or bare `json` / JSON copies)
-    into prose_text + normalized Companion tool action requests.
-    Enforces a hard stop immediately after the first valid JSON command block so runaway model
-    hallucinations (e.g. "Wait for output", fake "## Local Workspace Tool Results", or extra blocks)
-    are truncated and ignored.
+    Parses Playground output ("Copy as markdown", `.md` inside code block, bare `json`/JSON,
+    raw ```patch SEARCH/REPLACE blocks, tagged raw code/script blocks, standalone/unfenced Python blocks,
+    or unfenced SEARCH/REPLACE patches) into prose_text + normalized Companion tool action requests.
+    Enforces hard stop on runaway hallucinated continuations.
     """
     cleaned = (raw_markdown or "").strip()
     if not cleaned:
@@ -745,42 +1243,128 @@ def parse_playground_markdown(raw_markdown: str) -> Dict[str, Any]:
         if direct_actions:
             return {"prose_text": "", "actions": direct_actions}
 
-    # 2. Extract fenced blocks and HARD-STOP at the end of the FIRST valid JSON command block
-    blocks = _extract_fenced_blocks(cleaned)
+    # 2. Extract fenced blocks (before any hallucinated continuation)
+    cleaned_pre_hallucination = _strip_hallucinated_continuation(cleaned)
+    blocks = _extract_fenced_blocks(cleaned_pre_hallucination)
+    explicit_actions: List[Dict[str, Any]] = []
+    last_explicit_end = 0
     python_candidates: List[Dict[str, Any]] = []
 
-    for blk in blocks:
+    for idx, blk in enumerate(blocks):
         lang = blk["lang"]
         content = blk["content"]
+        heading_hint = blk.get("heading_hint", "")
+        one_liner = _extract_one_liner_summary(heading_hint)
+
+        # 2a. JSON command block (hard stop right after it, or after its immediately paired code block)
         if lang in ("json", "jsonc", ""):
             found = _extract_actions_from_json_text(content)
             if found:
-                truncated_prose = _strip_hallucinated_continuation(
-                    cleaned[: blk["end_char"]].rstrip()
-                )
+                stop_char = blk["end_char"]
+                content_needing = [
+                    a
+                    for a in found
+                    if a["tool"] in ("propose_inspection_script", "propose_script", "write_file", "run_and_delete_script")
+                    and not str(a["args"].get("content") or "").strip()
+                ]
+                if len(content_needing) == 1 and (idx + 1) < len(blocks):
+                    nxt_blk = blocks[idx + 1]
+                    if nxt_blk["lang"] not in ("json", "jsonc", "patch", "companion-patch", "diff"):
+                        nxt_dir = _parse_code_block_directives(nxt_blk["content"], nxt_blk.get("heading_hint", ""))
+                        raw_body = nxt_dir["stripped_content"] if (nxt_dir["has_explicit_tool"] or nxt_dir["has_explicit_path"]) else nxt_blk["content"]
+                        content_needing[0]["args"]["content"] = raw_body
+                        if not content_needing[0]["args"].get("path") and nxt_dir.get("path"):
+                            content_needing[0]["args"]["path"] = nxt_dir["path"]
+                        if not content_needing[0]["args"].get("summary") and nxt_dir.get("summary"):
+                            content_needing[0]["args"]["summary"] = nxt_dir["summary"]
+                        stop_char = nxt_blk["end_char"]
+                combined_actions = [*explicit_actions, *found] if explicit_actions else found
                 return {
-                    "prose_text": truncated_prose,
-                    "actions": found,
+                    "prose_text": cleaned_pre_hallucination[:stop_char].rstrip(),
+                    "actions": combined_actions,
                 }
+
+        # 2b. Raw SEARCH/REPLACE patch block (```patch / ```diff / conflict markers)
+        has_search_replace = ("<<<<<<<" in content and "=======" in content and ">>>>>>>" in content)
+        if lang in ("patch", "companion-patch", "diff") or (has_search_replace and lang != "markdown"):
+            patch_acts = _parse_patch_search_replace_block(content, heading_hint)
+            if patch_acts:
+                explicit_actions.extend(patch_acts)
+                last_explicit_end = blk["end_char"]
+                continue
+
+        # 2c. Tagged raw script or write_file block (any language with # tool: ... or # path: ...)
+        directives = _parse_code_block_directives(content, heading_hint)
+        dir_tool = directives["tool"]
+        if dir_tool in ("propose_inspection_script", "propose_script", "write_file", "run_and_delete_script"):
+            target_path = directives["path"]
+            if not target_path and lang in ("python", "py"):
+                target_path, _ = _infer_python_script_path(content, heading_hint, len(explicit_actions))
+            if target_path:
+                action_args: Dict[str, Any] = {
+                    "path": target_path,
+                    "content": directives["stripped_content"],
+                    "summary": directives["summary"] or one_liner or f"{dir_tool} ({target_path})",
+                }
+                if directives["delete_on_success"] is not None:
+                    action_args["delete_on_success"] = directives["delete_on_success"]
+                if directives["args"]:
+                    action_args["args"] = directives["args"]
+                if directives["focus"]:
+                    action_args["focus"] = directives["focus"]
+                explicit_actions.append({"tool": dir_tool, "args": action_args})
+                last_explicit_end = blk["end_char"]
+                continue
+
         if lang in ("python", "py"):
-            inferred_path, explicit = _infer_python_script_path(
-                content, blk.get("heading_hint", ""), len(python_candidates)
+            raw_body = directives["stripped_content"] if (directives["has_explicit_tool"] or directives["has_explicit_path"]) else content
+            inferred_path, explicit_hint_path = _infer_python_script_path(
+                raw_body, heading_hint, len(python_candidates) + len(explicit_actions)
             )
+            target_path = directives["path"] or inferred_path
+            has_explicit_path = bool(directives["has_explicit_path"] or explicit_hint_path)
+            classified_tool, intent_ambiguous = _classify_python_block_intent(
+                heading_hint,
+                directives,
+                raw_body,
+                target_path,
+                has_explicit_path,
+            )
+            action_args = {
+                "path": target_path,
+                "content": raw_body,
+                "summary": directives["summary"] or one_liner or f"Python script parsed from Playground block ({target_path})",
+            }
+            if classified_tool in ("propose_inspection_script", "propose_script"):
+                if directives["delete_on_success"] is not None:
+                    action_args["delete_on_success"] = directives["delete_on_success"]
+                if directives["focus"]:
+                    action_args["focus"] = directives["focus"]
+                if intent_ambiguous:
+                    action_args["intent_ambiguous"] = True
+                    action_args["has_explicit_path"] = has_explicit_path
+
+            if not intent_ambiguous and classified_tool != "propose_script":
+                explicit_actions.append({"tool": classified_tool, "args": action_args})
+                last_explicit_end = blk["end_char"]
+                continue
+
             python_candidates.append(
                 {
-                    "tool": "propose_script",
-                    "args": {
-                        "path": inferred_path,
-                        "content": content,
-                        "summary": f"Python script parsed from Playground block ({inferred_path})",
-                    },
+                    "tool": classified_tool,
+                    "args": action_args,
                     "end_char": blk["end_char"],
-                    "explicit": explicit,
+                    "explicit": has_explicit_path,
                 }
             )
 
-    # 3. Fallback: inline unfenced JSON (stopping after first JSON block), else standalone python block
-    cleaned_pre_hallucination = _strip_hallucinated_continuation(cleaned)
+    if explicit_actions:
+        return {
+            "prose_text": cleaned_pre_hallucination[:last_explicit_end].rstrip(),
+            "actions": explicit_actions,
+        }
+
+    # 3. Fallback: inline unfenced JSON (stopping after first JSON block), else fenced/unfenced Python or unfenced patch
     inline_actions, inline_end = _extract_inline_json_actions_with_end(cleaned_pre_hallucination)
     if inline_actions and inline_end is not None:
         return {
@@ -791,28 +1375,23 @@ def parse_playground_markdown(raw_markdown: str) -> Dict[str, Any]:
     if python_candidates:
         first_py = python_candidates[0]
         return {
-            "prose_text": _strip_hallucinated_continuation(cleaned[: first_py["end_char"]].rstrip()),
+            "prose_text": cleaned_pre_hallucination[: first_py["end_char"]].rstrip(),
             "actions": [{"tool": c["tool"], "args": c["args"]} for c in python_candidates],
         }
 
-    m_py = _LEADING_PY_HEADER_RE.match(cleaned_pre_hallucination)
-    if m_py:
-        py_body = m_py.group(1).strip()
-        if _looks_like_python_script(py_body):
-            inferred_path, _ = _infer_python_script_path(py_body, "", 0)
-            return {
-                "prose_text": cleaned_pre_hallucination,
-                "actions": [
-                    {
-                        "tool": "propose_script",
-                        "args": {
-                            "path": inferred_path,
-                            "content": py_body,
-                            "summary": f"Python script parsed from Playground paste ({inferred_path})",
-                        },
-                    }
-                ],
-            }
+    unfenced_patch_actions, unfenced_patch_end = _extract_unfenced_patch_with_end(cleaned_pre_hallucination)
+    if unfenced_patch_actions and unfenced_patch_end is not None:
+        return {
+            "prose_text": cleaned_pre_hallucination[:unfenced_patch_end].rstrip(),
+            "actions": unfenced_patch_actions,
+        }
+
+    unfenced_py = _extract_unfenced_python_with_bounds(cleaned_pre_hallucination)
+    if unfenced_py:
+        return {
+            "prose_text": cleaned_pre_hallucination[: unfenced_py["end_char"]].rstrip(),
+            "actions": [unfenced_py["action"]],
+        }
 
     return {
         "prose_text": cleaned_pre_hallucination,

@@ -1,19 +1,46 @@
 --- COMPANION BRIDGE TOOL CONTRACT ---
 STRICT OUTPUT RULES:
-1) Add a plain-English one-liner BEFORE every JSON command, preferably with an indication of progress (e.g., "Step 2/4: Patching IMAP client...").
-2) Generate AT MOST ONE ```json command block per message (if batching multiple actions, put them inside ONE JSON array `[...]` in that single ```json block).
-3) Generate all output ONCE ONLY—never repeat, duplicate, or echo prose or JSON blocks in the same reply.
-4) HARD STOP: End your response IMMEDIATELY after the closing ``` of your ```json block. Never emit "Wait for output", `## Local Workspace Tool Results`, or any further prose or commands afterward (Companion truncates anything after the closing ```).
+1) Add a plain-English one-liner BEFORE every command or code block stating progress AND intent + target path, e.g.:
+   - `Step 2/4 — Inspection script (inspect_tmp.py): Check database schema fields`
+   - `Step 2/4 — New file (utils/helper.py): Create helper module`
+   - `Step 2/4 — Patching (core/client.py): Fix retry timeout`
+2) Prefer RAW fenced ```patch blocks for edits and RAW fenced ```python (or target-language) blocks for scripts and new files—never compress Python indentation inside JSON strings! When using JSON commands, emit AT MOST ONE ```json command block per message (batch multiple JSON actions inside ONE JSON array `[...]`).
+3) Generate all output ONCE ONLY—never repeat, duplicate, or echo prose, code, or JSON blocks in the same reply.
+4) HARD STOP: End your response IMMEDIATELY after the closing ``` (or end of code). Never emit `Output:`, `Wait for output`, `## Local Workspace Tool Results`, or any trailing prose afterward (Companion truncates anything after the code block).
 
-To inspect files or propose edits for human-gated diff review and auto-backup, emit a single ```json block containing a tool action object (or a JSON array of objects). All inspect/patch tools work generically on any UTF-8 text/code file type (Python, JS/TS, HTML/CSS, SQL, Go, Rust, config, etc.):
+RECOMMENDED ZERO-ESCAPING CODE FORMATS (NO JSON STRING ESCAPING NEEDED):
+A) Surgical Code Edits (`patch_literal`) — emit one or more ```patch blocks with `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`:
+```patch
+# path: path/to/file.py
+# summary: 1-line reason
+<<<<<<< SEARCH
+exact existing lines (indentation preserved verbatim)
+=======
+replacement lines (indentation preserved verbatim)
+>>>>>>> REPLACE
+```
+
+B) Temporary Inspection / Verification Scripts (`propose_inspection_script` — NEVER for code edits; auto-deletes cleanly on exit 0 without leaving a savepoint) — state `Inspection script (path.py): ...` in the one-liner and emit a raw ```python block:
+```python
+# tool: propose_inspection_script
+# path: developer/inspect_tmp.py
+# summary: What this temporary inspection script checks or prints
+import sys
+print("diagnostic output")
+```
+
+C) New Files / Full Rewrites (`write_file`) — state `New file (path/to/file.ext): ...` in the one-liner and emit a fenced block in the target language with top directive comments:
+`# tool: write_file`, `# path: path/to/file.py`, `# summary: 1-line reason` (also supports `// ...` or `<!-- ... -->`).
+
+JSON COMMAND TOOLS (ideal for reads, searches, file ops, tests, and re-running failed scripts):
 - {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block", "new_text": "replacement", "summary": "1-line reason"} (returns nearest line-number + diff diagnostics if old_text mismatches)
 - {"tool": "patch_lines", "path": "path/to/file", "start_line": 10, "end_line": 20, "new_text": "replacement", "summary": "1-line reason"}
 - {"tool": "write_file", "path": "path/to/file", "content": "full file text", "summary": "1-line reason"}
 - {"tool": "delete_file", "path": "path/to/file", "summary": "1-line reason"} (human-gated delete; auto-backed up first)
 - {"tool": "rename_file", "old_path": "old/path", "new_path": "new/path", "summary": "1-line reason"} (human-gated move/rename; auto-backed up first)
-- {"tool": "propose_script", "path": "packer.py", "content": "python helper script text", "summary": "e.g. Pack target files into packed_context.md"} (optional `"delete_on_success": true` for one-shot inspection scripts)
-- {"tool": "run_script", "path": "packer.py", "summary": "1-line reason"} (human-gated run of an existing/patched .py script in project Python; optional `"args": "--flag"`)
-- {"tool": "run_and_delete_script", "path": "probe.py", "summary": "1-line reason"} (human-gated run of an inspection/temporary .py script; automatically deletes the script if exit code is 0 with no traceback, or keeps it on error so you can patch & re-run; optional `"args": "--flag"`)
+- {"tool": "propose_inspection_script", "path": "inspect_tmp.py", "content": "...", "summary": "e.g. Inspect schema fields"} (alias: `propose_script`; temporary inspection script only—executes in venv and auto-deletes on clean exit 0 without leaving a savepoint; stays on disk only on failure for patching)
+- {"tool": "run_script", "path": "script.py", "summary": "1-line reason"} (human-gated run of a permanent/kept .py script in project Python; optional `"args": "--flag"`)
+- {"tool": "run_and_delete_script", "path": "inspect_tmp.py", "summary": "1-line reason"} (ONLY to re-run a failed temporary .py script ALREADY saved on disk and delete it once it passes; to create & run a new temporary script, emit `propose_inspection_script`)
 - {"tool": "run_tests", "summary": "1-line reason"} (human-gated full suite — auto-commits savepoint on pass; optional `"fast": true`, `"target": "path/to/file"`, and `"focus": "question"` when Scout is enabled; never call on broken intermediate steps)
 - {"tool": "extract_headers", "pattern": ".", "include_symbols": true, "max_files": 60} (0-token structural index of file header comments & top-level classes/functions)
 - {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
@@ -27,6 +54,6 @@ Scout-Only Tools (call ONLY when Companion announces `Local AI Scout is NOW ENAB
 - {"tool": "update_header", "paths": ["path/to/file1", "path/to/file2"]} (uses Scout to draft updated top-of-file header comments as human-gated diff patches)
 
 Notes:
-- When you need multiple files/fragments from disk, emit `extract_headers`, `scout_workspace` (if enabled), or a `propose_script` (e.g. `packer.py`) that prints stdout directly (Companion captures stdout on exit 0 as well as errors). For temporary inspection scripts, set `"delete_on_success": true` or—if you patch a failing script—call `run_and_delete_script` to run and automatically delete it once it succeeds.
+- When you need multiple files/fragments or runtime inspection, emit a `propose_inspection_script` (prefer a raw ```python block printing stdout directly; Companion captures stdout on exit 0 as well as errors and auto-deletes passing temporary scripts cleanly). Only call `run_and_delete_script` to re-run a failed temporary script already saved on disk after patching it.
 - Command results include an `exec_id`; if output was summarized, call `read_command_output` to inspect exact raw lines.
 - Git status, diff viewing, commit message drafting, Commit, and Commit & Push are triggered by the user in Companion's right-drawer Git tab (not via JSON tool calls).

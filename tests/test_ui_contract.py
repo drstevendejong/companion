@@ -103,14 +103,32 @@ class TestUiDomContract(unittest.TestCase):
         composer_js = (COMPANION_ROOT / "static" / "js" / "composer.js").read_text(encoding="utf-8")
         self.assertIn("Copy Error", chat_js)
         self.assertIn("Copy Full Output", chat_js)
+        self.assertIn("Retry Script", chat_js)
         self.assertIn("createGateVisibilityButton", chat_js)
+        self.assertIn("resolveActivityAfterCount", chat_js)
+        self.assertIn("scrollChatToBottom", chat_js)
+        self.assertIn("applyArrivalFlash", chat_js)
+        self.assertIn(".msg-card.is-new-arrival", comp_css)
         self.assertIn("chat:live-exec", chat_js)
+        self.assertIn("scout_phase", chat_js)
+        self.assertIn("data-scout-elapsed", chat_js)
+        self.assertIn("propose_inspection_script", chat_js)
         self.assertIn("buildCommandFailureReport", drawer_js)
         self.assertIn("extractFailureExcerpt", drawer_js)
+        self.assertIn("afterMsgId", drawer_js)
         self.assertIn("terminal:stream-event", drawer_js)
         self.assertIn("terminal:stream-event", lifecycle_js)
         self.assertIn("gatesHiddenDueToError", gates_js)
+        self.assertIn("gate-card-", gates_js)
+        self.assertIn("data-live-status", gates_js)
+        self.assertIn("propose_inspection_script", gates_js)
+        self.assertNotIn("Approve & Auto-Approve", gates_js)
         self.assertIn("Run Script in Venv", gates_js)
+        self.assertIn("Run & Delete on Pass", gates_js)
+        self.assertIn("Write & Run (Keep on Disk)", gates_js)
+        self.assertIn("Write to Disk Only", gates_js)
+        runner_py = (COMPANION_ROOT / "services" / "runner.py").read_text(encoding="utf-8")
+        self.assertIn("PYTHONUNBUFFERED", runner_py)
         self.assertIn("buildErrorReasonForDeniedAction", bridge_js)
         self.assertIn("looksLikeBridgeAiOutput", bridge_js)
         self.assertIn("isDetectedPromptAiPending", composer_js)
@@ -136,6 +154,12 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn('id="btn-git-update-headers"', html)
         self.assertIn("btn-scout-toggle", settings_js)
         self.assertIn("btn-git-update-headers", git_js)
+        self.assertIn("btn-companion-settings", settings_js)
+        self.assertIn("save_as_file", gates_js)
+        self.assertIn("intent_ambiguous", gates_js)
+        self.assertIn("Run Temp Inspection (Delete on Pass)", gates_js)
+        self.assertIn("Save as Code File", gates_js)
+        self.assertIn("<<<<<<<", bridge_js)
 
         sessions_js = (COMPANION_ROOT / "static" / "js" / "sessions.js").read_text(encoding="utf-8")
         for panel_id in (
@@ -164,6 +188,8 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn('id="btn-run-post-tests"', tab_terminal)
         self.assertIn(".ai-details-popover", comp_css)
         self.assertIn(".scout-model-list", comp_css)
+        self.assertIn(".modal-wide", comp_css)
+        self.assertIn(".ambiguous-path-row", comp_css)
         self.assertIn("renderScoutTelemetry", sessions_js)
         self.assertIn("toggleDetailsPopover", sessions_js)
 
@@ -174,6 +200,22 @@ class TestUiDomContract(unittest.TestCase):
 
         self.assertIn('id="theme-select"', html)
         self.assertIn('class="sidebar-footer"', html)
+        for req_settings_id in (
+            "btn-companion-settings",
+            "sidebar-theme-label",
+            "companion-settings-modal",
+            "companion-settings-form",
+            "setting-bridge-guardrail",
+            "setting-system-prompt",
+            "setting-bridge-contract",
+            "btn-reset-guardrail",
+            "btn-reset-system-prompt",
+            "btn-reset-bridge-contract",
+            "btn-reset-all-settings",
+            "btn-cancel-companion-settings",
+            "btn-save-companion-settings",
+        ):
+            self.assertIn(f'id="{req_settings_id}"', html)
         for theme_id in ("midnight", "darcula", "nordic-slate", "light", "warm-paper", "espresso", "forest-night"):
             self.assertIn(theme_id, theme_js)
             if theme_id != "midnight":

@@ -457,7 +457,21 @@ export function looksLikeBridgeAiOutput(rawText) {
   if (/(?:^|\n)json\s*\n\s*[\[{][\s\S]*"(?:tool|tool_name)"\s*:/i.test(trimmed)) {
     return true;
   }
-  if (/^\s*```(?:python|py)\b[\s\S]*\b(?:import|from|def|Path)\b/i.test(trimmed)) {
+  if (/```(?:patch|diff)\b[\s\S]*<<<<<<<\s*SEARCH[\s\S]*=======[\s\S]*>>>>>>>\s*REPLACE/i.test(trimmed)) {
+    return true;
+  }
+  if (/<<<<<<<\s*SEARCH\b[\s\S]*\n=======\s*\n[\s\S]*>>>>>>>\s*REPLACE\b/.test(trimmed)) {
+    return true;
+  }
+  if (/```(?:python|py)\b[\s\S]*\b(?:import|from|def|Path)\b/i.test(trimmed)) {
+    return true;
+  }
+  if (
+    /(?:^|\n)(?:python|from\s+[A-Za-z0-9_.]+(?:\s+import\b)|\s*import\s+[A-Za-z0-9_.]+|\s*def\s+[A-Za-z0-9_]+\s*\()/m.test(
+      trimmed
+    ) &&
+    /(?:^|\n)\s*(?:import|from|def|class|print\(|with\s+|for\s+|if\s+|Path\()/m.test(trimmed)
+  ) {
     return true;
   }
   return false;

@@ -32,6 +32,33 @@ class TestGitAndRunner(unittest.TestCase):
         self.assertIn("TEST_OK_42", res["output"])
         self.assertGreater(res["estimated_tokens"], 0)
 
+    def test_runner_streams_python_stdout_unbuffered(self) -> None:
+        import time
+
+        script = self.root / "stream_test.py"
+        script.write_text(
+            "import time\n"
+            "print('FIRST_CHUNK_READY')\n"
+            "time.sleep(0.35)\n"
+            "print('SECOND_CHUNK_READY')\n",
+            encoding="utf-8",
+        )
+        seen: list[tuple[float, str]] = []
+        t0 = time.monotonic()
+
+        async def _on_out(chunk: str) -> None:
+            seen.append((time.monotonic() - t0, chunk))
+
+        res = asyncio.run(
+            runner.run_project_command(self.root, "python stream_test.py", on_output=_on_out)
+        )
+        self.assertEqual(res["exit_code"], 0)
+        first_times = [dt for dt, txt in seen if "FIRST_CHUNK_READY" in txt]
+        second_times = [dt for dt, txt in seen if "SECOND_CHUNK_READY" in txt]
+        self.assertTrue(first_times, f"Missing first chunk in {seen!r}")
+        self.assertTrue(second_times, f"Missing second chunk in {seen!r}")
+        self.assertGreaterEqual(second_times[0] - first_times[0], 0.15)
+
     def test_git_status_and_commit_in_temp_repo(self) -> None:
         subprocess.run(["git", "init"], cwd=self.root, check=True, capture_output=True)
         subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.root, check=True)

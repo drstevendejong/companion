@@ -18,7 +18,26 @@ const clearBtn = document.getElementById("btn-clear-api-key");
 const cancelBtn = document.getElementById("btn-cancel-api-key");
 const saveBtn = document.getElementById("btn-save-api-key");
 
+const companionSettingsBtn = document.getElementById("btn-companion-settings");
+const companionModal = document.getElementById("companion-settings-modal");
+const companionForm = document.getElementById("companion-settings-form");
+const guardrailInput = document.getElementById("setting-bridge-guardrail");
+const systemPromptInput = document.getElementById("setting-system-prompt");
+const bridgeContractInput = document.getElementById("setting-bridge-contract");
+const resetGuardrailBtn = document.getElementById("btn-reset-guardrail");
+const resetSystemPromptBtn = document.getElementById("btn-reset-system-prompt");
+const resetBridgeContractBtn = document.getElementById("btn-reset-bridge-contract");
+const resetAllSettingsBtn = document.getElementById("btn-reset-all-settings");
+const cancelCompanionSettingsBtn = document.getElementById("btn-cancel-companion-settings");
+const saveCompanionSettingsBtn = document.getElementById("btn-save-companion-settings");
+const companionSettingsError = document.getElementById("companion-settings-error");
+
 let keyPromptResolver = null;
+let companionDefaults = {
+  bridge_guardrail: "",
+  system_prompt: "",
+  bridge_tool_contract: "",
+};
 
 function resolvePendingKeyPrompt(configured) {
   if (keyPromptResolver) {
@@ -55,6 +74,34 @@ export async function initSettings() {
 
   on("settings:open-key-modal", (reason) => openKeyModal(true, reason));
   on("scout:refresh", refreshScoutSettings);
+
+  if (companionSettingsBtn && companionModal) {
+    companionSettingsBtn.addEventListener("click", () => openCompanionSettingsModal());
+  }
+  if (cancelCompanionSettingsBtn && companionModal) {
+    cancelCompanionSettingsBtn.addEventListener("click", () => companionModal.close());
+  }
+  if (resetGuardrailBtn && guardrailInput) {
+    resetGuardrailBtn.addEventListener("click", () => {
+      guardrailInput.value = companionDefaults.bridge_guardrail || "";
+    });
+  }
+  if (resetSystemPromptBtn && systemPromptInput) {
+    resetSystemPromptBtn.addEventListener("click", () => {
+      systemPromptInput.value = companionDefaults.system_prompt || "";
+    });
+  }
+  if (resetBridgeContractBtn && bridgeContractInput) {
+    resetBridgeContractBtn.addEventListener("click", () => {
+      bridgeContractInput.value = companionDefaults.bridge_tool_contract || "";
+    });
+  }
+  if (resetAllSettingsBtn) {
+    resetAllSettingsBtn.addEventListener("click", handleResetAllCompanionSettings);
+  }
+  if (companionForm) {
+    companionForm.addEventListener("submit", handleSaveCompanionSettings);
+  }
 
   await refreshKeyStatus();
   await refreshScoutSettings();
@@ -289,6 +336,73 @@ function updateButtonBadge(status) {
   } else {
     keyBtn.textContent = "Key";
     keyBtn.title = "No Gemini API key configured (optional for Playground Bridge sessions)";
+  }
+}
+
+async function openCompanionSettingsModal() {
+  if (!companionModal) return;
+  if (companionSettingsError) companionSettingsError.textContent = "";
+  try {
+    const res = await api.getCompanionSettings();
+    companionDefaults = (res && res.defaults) || companionDefaults;
+    if (guardrailInput) guardrailInput.value = res.bridge_guardrail ?? "";
+    if (systemPromptInput) systemPromptInput.value = res.system_prompt ?? "";
+    if (bridgeContractInput) bridgeContractInput.value = res.bridge_tool_contract ?? "";
+  } catch (err) {
+    if (companionSettingsError) {
+      companionSettingsError.textContent = err.message || "Failed to load Companion settings.";
+    }
+  }
+  if (!companionModal.open) {
+    companionModal.showModal();
+  }
+}
+
+async function handleSaveCompanionSettings(ev) {
+  ev.preventDefault();
+  if (!companionModal) return;
+  if (companionSettingsError) companionSettingsError.textContent = "";
+  if (saveCompanionSettingsBtn) {
+    saveCompanionSettingsBtn.disabled = true;
+    saveCompanionSettingsBtn.textContent = "Saving...";
+  }
+  try {
+    const res = await api.updateCompanionSettings({
+      bridge_guardrail: guardrailInput ? guardrailInput.value : undefined,
+      system_prompt: systemPromptInput ? systemPromptInput.value : undefined,
+      bridge_tool_contract: bridgeContractInput ? bridgeContractInput.value : undefined,
+    });
+    if (res && res.defaults) companionDefaults = res.defaults;
+    companionModal.close();
+  } catch (err) {
+    if (companionSettingsError) {
+      companionSettingsError.textContent = err.message || "Failed to save settings.";
+    }
+  } finally {
+    if (saveCompanionSettingsBtn) {
+      saveCompanionSettingsBtn.disabled = false;
+      saveCompanionSettingsBtn.textContent = "Save Settings";
+    }
+  }
+}
+
+async function handleResetAllCompanionSettings() {
+  if (companionSettingsError) companionSettingsError.textContent = "";
+  if (resetAllSettingsBtn) resetAllSettingsBtn.disabled = true;
+  try {
+    const res = await api.updateCompanionSettings({
+      reset_keys: ["bridge_guardrail", "system_prompt", "bridge_tool_contract"],
+    });
+    companionDefaults = (res && res.defaults) || companionDefaults;
+    if (guardrailInput) guardrailInput.value = res.bridge_guardrail ?? "";
+    if (systemPromptInput) systemPromptInput.value = res.system_prompt ?? "";
+    if (bridgeContractInput) bridgeContractInput.value = res.bridge_tool_contract ?? "";
+  } catch (err) {
+    if (companionSettingsError) {
+      companionSettingsError.textContent = err.message || "Failed to reset defaults.";
+    }
+  } finally {
+    if (resetAllSettingsBtn) resetAllSettingsBtn.disabled = false;
   }
 }
 

@@ -41,6 +41,11 @@ export function applyTheme(themeId, persist = true) {
   if (select && select.value !== id) {
     select.value = id;
   }
+  const themeLbl = document.getElementById("sidebar-theme-label");
+  if (themeLbl) {
+    const found = THEMES.find((t) => t.id === id);
+    themeLbl.textContent = found ? found.label.replace(/\s*\([^)]*\)$/, "") : id;
+  }
   return id;
 }
 

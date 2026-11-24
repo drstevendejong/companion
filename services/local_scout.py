@@ -565,6 +565,7 @@ def run_scout_workspace(
     stopped_early = False
     hit_budget = False
     current_model_idx = 0
+    done_emitted = False
 
     def _emit_pause(is_paused: bool) -> None:
         _emit_ws(
@@ -575,6 +576,22 @@ def run_scout_workspace(
                 "run_id": rid,
                 "session_id": session_id,
                 "paused": is_paused,
+            },
+        )
+
+    def _emit_phase(phase_text: str, active_step: int) -> None:
+        _emit_ws(
+            app,
+            event_loop,
+            {
+                "type": "scout_phase",
+                "run_id": rid,
+                "session_id": session_id,
+                "active_step": active_step,
+                "max_steps": step_cap,
+                "phase": phase_text,
+                "model": active_model,
+                "tokens_used": total_tokens_used,
             },
         )
 
@@ -607,6 +624,7 @@ def run_scout_workspace(
 
             step_num += 1
             preferred = candidates[current_model_idx:] if candidates else []
+            _emit_phase(f"Planning step {step_num}/{step_cap} (calling {active_model})...", step_num)
 
             def _hop_rebuild_and_notify(old_m: str, new_m: str, reason: str) -> None:
                 _on_hop(old_m, new_m, reason)
@@ -633,6 +651,7 @@ def run_scout_workspace(
                     contents = [_make_text_content("user", clean_recap)]
                     candidates = _get_candidate_models(gemini)
                     current_model_idx = 0
+                    _emit_phase(f"Retrying step {step_num}/{step_cap} cleanly...", step_num)
                     resp, used_model, failed_models = _generate_with_model_hop(
                         gemini,
                         db,
@@ -665,7 +684,28 @@ def run_scout_workspace(
 
             if not fcalls:
                 final_answer = text or "(Scout finished without extra output.)"
+                _emit_ws(
+                    app,
+                    event_loop,
+                    {
+                        "type": "scout_step",
+                        "run_id": rid,
+                        "session_id": session_id,
+                        "step": step_num,
+                        "max_steps": step_cap,
+                        "tool": "synthesis",
+                        "summary": "Prepared answer directly",
+                        "status": "ok",
+                        "model": active_model,
+                        "tokens_used": total_tokens_used,
+                    },
+                )
                 break
+
+            call_preview = ", ".join(str(fc.get("name") or "read") for fc in fcalls[:3])
+            if len(fcalls) > 3:
+                call_preview += f" (+{len(fcalls) - 3})"
+            _emit_phase(f"Running local reads ({call_preview})...", step_num)
 
             # Append model tool call turn cleanly
             if raw_parts and hasattr(types, "Content"):
@@ -684,6 +724,7 @@ def run_scout_workspace(
 
                 tname = fc["name"]
                 targs = fc.get("args") or {}
+                _emit_phase(f"Executing {tname}...", step_num)
                 try:
                     result_obj, summary_str = _execute_scout_read_tool(project, tname, targs)
                     status_flag = "ok"
@@ -746,6 +787,7 @@ def run_scout_workspace(
         if not final_answer:
             if not stopped_early and step_num >= step_cap:
                 hit_budget = True
+            _emit_phase("Synthesizing verified findings...", step_num or 1)
             synth_prompt = (
                 "Stop calling tools and synthesize ONLY verified facts observed above into a concise cited answer."
                 if not stopped_early
@@ -787,6 +829,7 @@ def run_scout_workspace(
             "stopped_early": stopped_early,
             "answer": final_answer,
         }
+        done_emitted = True
         _emit_ws(
             app,
             event_loop,
@@ -802,6 +845,20 @@ def run_scout_workspace(
         )
         return out
     finally:
+        if not done_emitted:
+            _emit_ws(
+                app,
+                event_loop,
+                {
+                    "type": "scout_done",
+                    "run_id": rid,
+                    "session_id": session_id,
+                    "model": active_model,
+                    "steps_taken": len(steps_trace),
+                    "tokens_used": total_tokens_used,
+                    "stopped_early": stopped_early,
+                },
+            )
         unregister_scout_run(rid)
 
 

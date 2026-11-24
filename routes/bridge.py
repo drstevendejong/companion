@@ -59,6 +59,7 @@ def create_bridge_bundle(payload: BridgeBundleRequest, request: Request) -> Dict
         include_directives=include_dir,
         scout_enabled=scout_enabled,
         scout_state_notice=scout_notice,
+        db=db,
     )
 
     if payload.record_turn and (payload.prompt.strip() or payload.attachments or include_dir):

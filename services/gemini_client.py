@@ -30,30 +30,36 @@ READ_ONLY_TOOLS = {
 }
 SCOUT_TOOLS = {"scout_workspace", "update_header"}
 PATCH_TOOLS = {"patch_literal", "patch_lines", "write_file", "delete_file", "rename_file"}
-SCRIPT_TOOLS = {"propose_script"}
+SCRIPT_TOOLS = {"propose_inspection_script", "propose_script"}
 COMMAND_TOOLS = {"run_tests", "run_script", "run_and_delete_script"}
 
 _FALLBACK_SYSTEM_PROMPT = """You are a senior coding partner connected to the user's local workspace via human-gated tools.
 Every tool round-trip re-sends conversation history and burns rate-limit tokens. Strictly minimize token usage and round-trips:
 
-1. BRIEF RESPONSES & ANTI-REPETITION:
+1. BRIEF RESPONSES, HARD STOP & ANTI-REPETITION:
    - Be terse and direct. State findings, root causes, and next steps in a few crisp lines—never five-paragraph walkthroughs quoting code the user didn't ask to see.
    - Optionally end with "Need details before we proceed?" when deeper explanation could help.
-   - Always add a single plain-English one-liner (preferably indicating progress, e.g. "Step 2/4: Reading IMAP sync handler...") right before every JSON/tool command.
+   - Always add a single plain-English one-liner (e.g. "Step 2/4 — Inspection script (inspect_tmp.py): Check IMAP sync state" or "Step 2/4 — New file (utils/helper.py): Add parser helper") right before every JSON/tool command, patch, or code block, explicitly stating whether any raw Python block is an **Inspection script** or a **New file** / **Rewrite** and naming the target file path.
    - Generate all output ONCE ONLY—never repeat, duplicate, or re-emit the same prose or tool/JSON block inside a reply.
+   - When emitting commands/patches/scripts, end your response IMMEDIATELY after the closing ``` (or end of code). Never emit "Output:", "Wait for output", "## Local Workspace Tool Results", or fabricated results afterward.
 
 2. DIRECTIVES SELF-CHECK (CRITICAL):
    - When Project Directives are loaded below, audit EVERY planned design, edit, and script against ALL Directives BEFORE proposing patches or scripts. Never emit code that violates Directives and forces a costly redo.
 
 3. BATCHED & SINGLE-SHOT CODE INSPECTION:
-   - Never dribble 1–2 small reads/searches across many turns. Batch all needed `search_code` / `read_lines` / `read_file` calls together in ONE turn.
-   - For repo-wide audits, dependency graphs, impact analysis, or multi-file inspection, prefer ONE `propose_script` single-shot inspector/packer that prints a compact structured summary instead of 5–10 iterative tool hops.
+   - Start unfamiliar repo/module exploration with `extract_headers` (0-token file header & top-level symbol index) or `list_tree`.
+   - When Local AI Scout is ENABLED, prefer ONE `scout_workspace` call to trace multi-file call paths or answer investigative questions in a single turn instead of burning 4–8 round-trips. Only call `scout_workspace` / `update_header` when Scout is enabled.
+   - Otherwise, never dribble 1–2 small reads/searches across many turns. Batch all needed `search_code` / `read_lines` / `read_file` calls together in ONE turn.
+   - For heavy mechanical audits or runtime inspection, prefer ONE `propose_inspection_script` (alias `propose_script`) single-shot inspector/probe as a raw ```python block instead of JSON-escaped strings or iterative tool hops.
    - Prefer `search_code` (supports `is_regex`, `path_glob`, `subpath`, and `start_line`/`end_line`) + targeted `read_lines(path, start_line, end_line)` over full `read_file` unless you truly need the whole file (`read_file` omits line numbers to save tokens).
 
-4. SURGICAL PATCHING, SCRIPTS & ATOMIC TEST LOOPS:
-   - Prefer `patch_literal` (minimal unique context) over `patch_lines` or `write_file`. Only use `write_file` for new files or >70% rewrites. If `patch_literal` fails to match, Companion returns line-number and nearest-diff diagnostics for fast self-correction.
-   - Use `propose_script` for multi-file mechanical edits or single-shot inspectors (set `"delete_on_success": true` if temporary). If a script fails, PATCH the existing script with `patch_literal`/`patch_lines` and call `run_script` (to keep it) or `run_and_delete_script` (to run and automatically delete once it passes).
-   - Companion automatically saves a reversible project checkpoint before the first write in a batch. Do NOT run tests on intermediate half-finished edits—only emit `run_tests` once a coherent batch of changes is complete and ready to verify.
+4. SURGICAL PATCHING, FILE OPS, HEADERS & ATOMIC TEST LOOPS:
+   - Prefer raw ```patch `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks (or `patch_literal` with minimal unique context) over `patch_lines` or `write_file`. Only use `write_file` (or a tagged raw code block) for new files or >70% rewrites. If `patch_literal` fails to match, Companion returns line-number and nearest-diff diagnostics for fast self-correction.
+   - Keep module header comments informative; when Local AI Scout is enabled, you may call `update_header` after a batch of changes settles so the user can approve refreshed header diffs.
+   - Use `delete_file` and `rename_file` directly for human-gated cleanup/moves (both auto-backup first)—never write a throwaway script just to delete or rename files.
+   - Use `propose_inspection_script` (alias `propose_script`) ONLY for temporary inspection/verification/packer scripts—never for permanent code changes (it auto-deletes cleanly on pass without leaving a savepoint; use `patch_literal`/`write_file` for actual code edits). If a temporary script fails, PATCH the existing script and call `run_and_delete_script` to re-run and auto-delete once it passes (or `run_script` for permanent scripts) instead of regenerating it.
+   - Command outputs include an `exec_id`; when oversized output is summarized (or when Scout adds an `ai_summary` via optional `"focus": "..."`), call `read_command_output(exec_id=..., start_line=..., end_line=..., pattern=...)` if you need exact raw lines.
+   - Companion automatically saves a reversible project checkpoint before the first permanent write in a batch. Do NOT run tests on intermediate half-finished edits. Use `run_tests` with `fast: true` / `target` for quick single-file checks if desired, and emit full `run_tests` once a coherent batch is complete to verify & auto-commit the savepoint.
    - Git operations (`git status`, `git diff`, commit drafting, Commit / Commit & Push) are handled directly by the user inside Companion's right-drawer Git tab, not via autonomous model tools.
 """
 
@@ -77,9 +83,18 @@ def load_prompt_file(filename: str, fallback: str) -> str:
     return fallback.strip()
 
 
-def get_base_system_prompt() -> str:
-    """Returns the latest system prompt from static/prompts/system_prompt.txt."""
+def get_default_system_prompt() -> str:
+    """Returns the built-in default system prompt from static/prompts/system_prompt.txt."""
     return load_prompt_file("system_prompt.txt", _FALLBACK_SYSTEM_PROMPT)
+
+
+def get_base_system_prompt(db: Any = None) -> str:
+    """Returns the active system prompt (DB override if configured, else default file)."""
+    if db is not None and hasattr(db, "get_setting"):
+        override = db.get_setting("prompt_system_prompt") or db.get_setting("prompt_system")
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+    return get_default_system_prompt()
 
 
 def get_git_commit_prompt(diff_text: str) -> str:
@@ -90,7 +105,7 @@ def get_git_commit_prompt(diff_text: str) -> str:
     return f"{template}\n\n```diff\n{diff_text}\n```"
 
 
-BASE_SYSTEM_PROMPT = get_base_system_prompt()
+BASE_SYSTEM_PROMPT = get_default_system_prompt()
 
 
 def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
@@ -255,15 +270,15 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
             ),
         ),
         types.FunctionDeclaration(
-            name="propose_script",
-            description="Propose a Python probe, packer, or patcher script to write to disk and optionally run in the project venv (optionally auto-deleting on pass if delete_on_success=true).",
+            name="propose_inspection_script",
+            description="Write & run a temporary Python inspection, probe, or verification script in the project venv and auto-delete once it passes cleanly (keeps on disk only if it fails so you can patch it). Use patch_literal/write_file for permanent code edits.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
-                    "path": types.Schema(type=types.Type.STRING, description="Relative script path, e.g. 'developer/probe_tmp.py'"),
-                    "content": types.Schema(type=types.Type.STRING, description="Executable Python script content"),
-                    "delete_on_success": types.Schema(type=types.Type.BOOLEAN, description="Optional: auto-delete script once it exits cleanly (0 with no traceback); keeps on error for patching"),
-                    "summary": types.Schema(type=types.Type.STRING, description="What this script checks or modifies"),
+                    "path": types.Schema(type=types.Type.STRING, description="Relative script path, e.g. 'developer/inspect_tmp.py'"),
+                    "content": types.Schema(type=types.Type.STRING, description="Executable Python inspection script content"),
+                    "delete_on_success": types.Schema(type=types.Type.BOOLEAN, description="Defaults to true (auto-delete after clean exit 0)."),
+                    "summary": types.Schema(type=types.Type.STRING, description="What this temporary inspection script checks or prints"),
                     **focus_schema,
                 },
                 required=["path", "content"],
@@ -271,7 +286,7 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
         ),
         types.FunctionDeclaration(
             name="run_script",
-            description="Request human-gated execution of an existing (or earlier-in-batch) Python script inside the project venv.",
+            description="Request human-gated execution of an existing (or earlier-in-batch) permanent Python script inside the project venv.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
@@ -285,11 +300,12 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
         ),
         types.FunctionDeclaration(
             name="run_and_delete_script",
-            description="Request human-gated execution of an inspection/temporary Python script in the project venv and automatically delete it once it succeeds cleanly (exit code 0 with no traceback). Keeps the script on failure so you can patch it.",
+            description="Re-run an existing temporary/inspection Python script already saved on disk (e.g. after patching a failed probe) and automatically delete it once it succeeds cleanly (exit code 0 with no traceback). To create AND run a new temporary script in one step, use propose_inspection_script (or pass 'content' here).",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
                     "path": types.Schema(type=types.Type.STRING, description="Relative path to temporary/inspection Python script inside project"),
+                    "content": types.Schema(type=types.Type.STRING, description="Optional Python script content if creating a new temporary inspection script in one step"),
                     "args": types.Schema(type=types.Type.STRING, description="Optional CLI arguments string to pass to the script"),
                     "summary": types.Schema(type=types.Type.STRING, description="Brief note on what this inspection script checks before cleanup"),
                     **focus_schema,
@@ -347,12 +363,16 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
     return types.Tool(function_declarations=decls)
 
 
-def load_system_instruction(project: ProjectProfile, scout_enabled: bool = False) -> str:
-    """Builds system instruction combining externalized system_prompt.txt + optional project Directives .md."""
-    parts = [get_base_system_prompt()]
+def load_system_instruction(
+    project: ProjectProfile,
+    scout_enabled: bool = False,
+    db: Any = None,
+) -> str:
+    """Builds system instruction combining externalized/custom system prompt + optional project Directives .md."""
+    parts = [get_base_system_prompt(db)]
     if scout_enabled:
         parts.append(
-            "\n[LOCAL AI SCOUT: ENABLED] You have `scout_workspace` (delegated multi-step read-only investigation), `update_header` (human-gated header comment updates), and optional `\"focus\"` on `run_tests`/`run_script`/`run_and_delete_script`/`propose_script`. Always use `extract_headers` for fast 0-token structural overviews first."
+            "\n[LOCAL AI SCOUT: ENABLED] You have `scout_workspace` (delegated multi-step read-only investigation), `update_header` (human-gated header comment updates), and optional `\"focus\"` on `run_tests`/`run_script`/`run_and_delete_script`/`propose_inspection_script`. Always use `extract_headers` for fast 0-token structural overviews first."
         )
     else:
         parts.append(
@@ -658,16 +678,33 @@ def prepare_tool_gate_preview(
             "prepared_patch": preview,
         }
 
-    if tool_name == "propose_script":
+    if tool_name in ("propose_inspection_script", "propose_script") or (
+        tool_name == "run_and_delete_script" and isinstance(args.get("content"), str) and args["content"].strip()
+    ):
+        target_path = str(args["path"])
+        is_ambiguous = bool(args.get("intent_ambiguous"))
+        has_explicit_path = bool(args.get("has_explicit_path", True))
         preview = patch_tools.preview_full_write(
-            root, str(args["path"]), str(args["content"])
+            root, target_path, str(args["content"])
         )
         return {
             "category": "script",
-            "title": f"Propose Script: {args['path']}",
-            "summary": str(args.get("summary", "Executable Python script")),
+            "title": (
+                f"Choose Action for Python Code ({target_path})"
+                if is_ambiguous
+                else f"Inspection Script: {target_path}"
+            ),
+            "summary": str(args.get("summary", "Temporary executable Python inspection script")),
+            "detail": (
+                "One-liner did not state whether this Python block is a temporary inspection script or a new/rewritten code file."
+                if is_ambiguous
+                else ""
+            ),
             "script_content": str(args["content"]),
-            "delete_on_success": bool(args.get("delete_on_success", False)),
+            "script_path": target_path,
+            "intent_ambiguous": is_ambiguous,
+            "has_explicit_path": has_explicit_path,
+            "delete_on_success": bool(args.get("delete_on_success", True)),
             "diff": preview["diff"],
             "ast_valid": preview["ast_valid"],
             "estimated_tokens": estimate_tokens(str(args["content"])),
@@ -849,10 +886,11 @@ class GeminiGateway:
         project: ProjectProfile,
         history_contents: List[types.Content],
         scout_enabled: bool = False,
+        db: Any = None,
     ) -> Dict[str, Any]:
         """Executes one Gemini model turn with project directives and tool declarations."""
         client = self._get_client()
-        sys_instruction = load_system_instruction(project, scout_enabled=scout_enabled)
+        sys_instruction = load_system_instruction(project, scout_enabled=scout_enabled, db=db)
 
         thinking_val = session.thinking_level.upper()
         if thinking_val == "XHIGH" and session.model != "gemini-4-hydrogen":

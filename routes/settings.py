@@ -9,11 +9,20 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from models import ScoutSettingsUpdate
-from services import key_store, local_scout, model_catalog
+from models import CompanionSettingsUpdate, ScoutSettingsUpdate
+from services import bridge as bridge_svc
+from services import gemini_client, key_store, local_scout, model_catalog
 from services.key_store import has_configured_api_key
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+
+def _companion_prompt_defaults() -> Dict[str, str]:
+    return {
+        "bridge_guardrail": bridge_svc.DEFAULT_BRIDGE_GUARDRAIL,
+        "system_prompt": gemini_client.get_default_system_prompt(),
+        "bridge_tool_contract": bridge_svc.get_default_playground_tool_contract(),
+    }
 
 
 def _scout_status_payload(db: Any, gemini: Any) -> Dict[str, Any]:
@@ -76,6 +85,26 @@ def update_scout_settings_endpoint(
         summarize_threshold_chars=payload.summarize_threshold_chars,
     )
     return _scout_status_payload(db, gemini)
+
+
+@router.get("/companion")
+def get_companion_settings_endpoint(request: Request) -> Dict[str, Any]:
+    db = request.app.state.db
+    return db.get_companion_prompt_settings(_companion_prompt_defaults())
+
+
+@router.post("/companion")
+def update_companion_settings_endpoint(
+    payload: CompanionSettingsUpdate, request: Request
+) -> Dict[str, Any]:
+    db = request.app.state.db
+    return db.set_companion_prompt_settings(
+        defaults=_companion_prompt_defaults(),
+        bridge_guardrail=payload.bridge_guardrail,
+        system_prompt=payload.system_prompt,
+        bridge_tool_contract=payload.bridge_tool_contract,
+        reset_keys=payload.reset_keys,
+    )
 
 
 @router.get("/api-key")

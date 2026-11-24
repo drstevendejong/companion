@@ -115,8 +115,8 @@
       </div>
 
       <div class="sidebar-footer">
-        <label class="field-label" for="theme-select">Theme</label>
-        <select id="theme-select" class="select-input theme-select" title="Switch UI color theme"></select>
+        <button id="btn-companion-settings" type="button" class="btn btn-secondary btn-sm sidebar-settings-btn" title="Open Companion Appearance &amp; Prompt Settings">Settings</button>
+        <span id="sidebar-theme-label" class="meta-line" title="Active color theme"></span>
       </div>
     </aside>
 
@@ -431,6 +431,53 @@
       <div class="modal-actions mt-3">
         <button id="btn-cancel-session-setup" type="button" class="btn btn-ghost">Cancel</button>
         <button id="btn-confirm-session-setup" type="submit" class="btn btn-primary">Create Session</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Companion Settings Modal (Theme & Prompt Overrides) -->
+  <dialog id="companion-settings-modal" class="modal">
+    <form id="companion-settings-form" method="dialog" class="modal-card modal-wide">
+      <h3>Companion Settings</h3>
+
+      <div class="settings-section">
+        <label class="field-label" for="theme-select">Appearance Theme</label>
+        <select id="theme-select" class="select-input" title="Switch UI color theme"></select>
+      </div>
+
+      <div class="settings-section mt-3">
+        <div class="row-between">
+          <label class="field-label" for="setting-bridge-guardrail">Every-Prompt Guardrail (Bridge)</label>
+          <button id="btn-reset-guardrail" type="button" class="btn btn-ghost btn-xs">Reset</button>
+        </div>
+        <div class="meta-line modal-status">Appended to every copied Bridge prompt so models remember 1-liner intent, raw blocks, and HARD STOP (clear to disable).</div>
+        <textarea id="setting-bridge-guardrail" class="text-input settings-prompt-textarea" rows="3"></textarea>
+      </div>
+
+      <div class="settings-section mt-3">
+        <div class="row-between">
+          <label class="field-label" for="setting-system-prompt">System Prompt (API Mode)</label>
+          <button id="btn-reset-system-prompt" type="button" class="btn btn-ghost btn-xs">Reset</button>
+        </div>
+        <textarea id="setting-system-prompt" class="text-input settings-prompt-textarea" rows="6"></textarea>
+      </div>
+
+      <div class="settings-section mt-3">
+        <div class="row-between">
+          <label class="field-label" for="setting-bridge-contract">Bridge Tool Contract (First Turn)</label>
+          <button id="btn-reset-bridge-contract" type="button" class="btn btn-ghost btn-xs">Reset</button>
+        </div>
+        <textarea id="setting-bridge-contract" class="text-input settings-prompt-textarea" rows="7"></textarea>
+      </div>
+
+      <div id="companion-settings-error" class="error-line"></div>
+
+      <div class="row-between mt-3">
+        <button id="btn-reset-all-settings" type="button" class="btn btn-secondary btn-sm">Reset All Defaults</button>
+        <div class="modal-actions">
+          <button id="btn-cancel-companion-settings" type="button" class="btn btn-ghost">Cancel</button>
+          <button id="btn-save-companion-settings" type="submit" class="btn btn-primary">Save Settings</button>
+        </div>
       </div>
     </form>
   </dialog>

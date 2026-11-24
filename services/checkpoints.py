@@ -386,3 +386,28 @@ def auto_commit_active_checkpoint_on_tests_pass(
     )
     return committed
 
+
+def discard_checkpoint(
+    db: Any,
+    project: Any,
+    checkpoint_id: str,
+) -> bool:
+    """Deletes a temporary no-op checkpoint and cleans its snapshot directory if unused."""
+    cp = db.get_checkpoint(checkpoint_id) if hasattr(db, "get_checkpoint") else None
+    deleted = bool(db.delete_checkpoint(checkpoint_id)) if hasattr(db, "delete_checkpoint") else False
+    active_dirs = set(db.list_active_checkpoint_dirs(project.id)) if hasattr(db, "list_active_checkpoint_dirs") else set()
+    active_resolved = {str(Path(p).resolve()) for p in active_dirs if p}
+    if cp is not None and getattr(cp, "snapshot_dir", None):
+        snap_path = Path(cp.snapshot_dir)
+        try:
+            if snap_path.is_dir() and str(snap_path.resolve()) not in active_resolved:
+                shutil.rmtree(snap_path, ignore_errors=True)
+        except OSError:
+            pass
+    prune_checkpoints_directory(
+        project.root_path,
+        project.backup_dir,
+        active_snapshot_dirs=active_dirs,
+    )
+    return deleted
+

@@ -85,6 +85,13 @@ export const api = {
       timeoutMs: 300000,
       ...options,
     }),
+  retryScript: (body, options = {}) =>
+    requestJson("/api/chat/retry-script", {
+      method: "POST",
+      body: JSON.stringify(body),
+      timeoutMs: 300000,
+      ...options,
+    }),
 
   // Workspace
   getTree: (projectId, subpath = ".", maxDepth = 0) =>
@@ -133,7 +140,13 @@ export const api = {
   cdpConsole: (wsUrl) =>
     requestJson("/api/cdp/console", { method: "POST", body: JSON.stringify({ ws_url: wsUrl }) }),
 
-  // Settings (API Key, Telemetry, Local AI Scout)
+  // Settings (API Key, Telemetry, Local AI Scout, Companion Prompts)
+  getCompanionSettings: () => requestJson("/api/settings/companion"),
+  updateCompanionSettings: (body) =>
+    requestJson("/api/settings/companion", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   getTelemetry: (model = null) =>
     requestJson(`/api/settings/telemetry${model ? `?model=${encodeURIComponent(model)}` : ""}`),
   getScoutSettings: () => requestJson("/api/settings/scout"),

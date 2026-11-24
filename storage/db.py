@@ -585,6 +585,14 @@ class CompanionDB:
             created_at=now,
         )
 
+    def update_message_text(self, message_id: str, text: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE messages SET text = ? WHERE id = ?",
+                (text, message_id),
+            )
+            conn.commit()
+
     # --- Pending Tool Gates ---
 
     def create_gate(
@@ -778,6 +786,59 @@ class CompanionDB:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    def delete_setting(self, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+
+    def get_companion_prompt_settings(self, defaults: Dict[str, str]) -> Dict[str, Any]:
+        keys = ("bridge_guardrail", "system_prompt", "bridge_tool_contract")
+        values: Dict[str, str] = {}
+        customized: Dict[str, bool] = {}
+        for k in keys:
+            raw = self.get_setting(f"prompt_{k}")
+            if raw is None:
+                values[k] = defaults.get(k, "")
+                customized[k] = False
+            else:
+                values[k] = raw
+                customized[k] = True
+        return {
+            **values,
+            "defaults": {k: defaults.get(k, "") for k in keys},
+            "customized": customized,
+        }
+
+    def set_companion_prompt_settings(
+        self,
+        *,
+        defaults: Dict[str, str],
+        bridge_guardrail: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        bridge_tool_contract: Optional[str] = None,
+        reset_keys: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        reset_set = {str(x).strip() for x in (reset_keys or []) if str(x).strip()}
+        updates = {
+            "bridge_guardrail": bridge_guardrail,
+            "system_prompt": system_prompt,
+            "bridge_tool_contract": bridge_tool_contract,
+        }
+        for k, val in updates.items():
+            db_key = f"prompt_{k}"
+            if k in reset_set:
+                self.delete_setting(db_key)
+                continue
+            if val is not None:
+                # For guardrail, allow explicit empty string to disable it cleanly;
+                # if identical to default and not empty, clear custom override.
+                if val == defaults.get(k, "") and k != "bridge_guardrail":
+                    self.delete_setting(db_key)
+                elif val == defaults.get(k, "") and k == "bridge_guardrail":
+                    self.delete_setting(db_key)
+                else:
+                    self.set_setting(db_key, val)
+        return self.get_companion_prompt_settings(defaults)
 
     def get_api_enabled(self, has_key: bool = False) -> bool:
         if not has_key:
@@ -1253,6 +1314,11 @@ class CompanionDB:
             if row:
                 self._prune_checkpoints_conn(conn, row["project_id"])
         return self._row_to_checkpoint(row) if row else None
+
+    def delete_checkpoint(self, checkpoint_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM checkpoints WHERE id = ?", (checkpoint_id,))
+            return bool(cur.rowcount and cur.rowcount > 0)
 
     def cancel_pending_gates(self, session_id: str, reason: str = "Checkpoint restored") -> int:
         with self._connect() as conn:

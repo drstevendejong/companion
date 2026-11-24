@@ -146,10 +146,12 @@ class ToolGateDecision(BaseModel):
         "write_only",
         "write_and_run",
         "write_run_and_delete",
+        "save_as_file",
         "approve_and_auto",
     ]
     start_line: Optional[int] = None
     end_line: Optional[int] = None
+    target_path: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -168,6 +170,15 @@ class RunCommandRequest(BaseModel):
     command: str
     session_id: Optional[str] = None
     is_test_run: bool = False
+
+
+class RetryScriptRequest(BaseModel):
+    session_id: str
+    path: str
+    args: Optional[str] = None
+    auto_delete: bool = True
+    tool_name: str = "run_and_delete_script"
+    focus: Optional[str] = None
 
 
 class GitCommitRequest(BaseModel):
@@ -194,6 +205,13 @@ class ScoutSettingsUpdate(BaseModel):
     auto_approve: Optional[bool] = None
     max_tokens: Optional[int] = None
     summarize_threshold_chars: Optional[int] = None
+
+
+class CompanionSettingsUpdate(BaseModel):
+    bridge_guardrail: Optional[str] = None
+    system_prompt: Optional[str] = None
+    bridge_tool_contract: Optional[str] = None
+    reset_keys: List[str] = Field(default_factory=list)
 
 
 class CdpTargetRequest(BaseModel):

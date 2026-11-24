@@ -9,6 +9,27 @@ const gatesContainer = document.getElementById("pending-gates");
 export function initToolGates() {
   on("chat:loaded", renderPendingGates);
   on("gates:changed", renderPendingGates);
+  document.addEventListener("click", (ev) => {
+    if (!gatesContainer) return;
+    for (const menu of gatesContainer.querySelectorAll(".split-btn-menu:not(.hidden)")) {
+      const wrap = menu.closest(".split-btn");
+      if (wrap && !wrap.contains(ev.target)) {
+        menu.classList.add("hidden");
+        const caret = wrap.querySelector(".split-btn-caret");
+        if (caret) caret.setAttribute("aria-expanded", "false");
+      }
+    }
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && gatesContainer) {
+      for (const menu of gatesContainer.querySelectorAll(".split-btn-menu:not(.hidden)")) {
+        menu.classList.add("hidden");
+        const wrap = menu.closest(".split-btn");
+        const caret = wrap.querySelector(".split-btn-caret");
+        if (caret) caret.setAttribute("aria-expanded", "false");
+      }
+    }
+  });
 }
 
 function renderPendingGates() {
@@ -25,6 +46,7 @@ function renderPendingGates() {
   const totalEst = gates.reduce((sum, g) => sum + Number((g.preview || {}).estimated_tokens || 0), 0);
   const nonScript = gates.filter((g) => (g.preview || {}).category !== "script");
   const scriptOnly = gates.filter((g) => (g.preview || {}).category === "script");
+  const unambiguousScripts = scriptOnly.filter((g) => !(g.preview || {}).intent_ambiguous);
   const batchBar = document.createElement("div");
   batchBar.className = "gates-batch-bar";
 
@@ -45,17 +67,17 @@ function renderPendingGates() {
         )
       )
     );
-  } else if (scriptOnly.length > 0) {
-    const allAutoDelete = scriptOnly.every((g) => Boolean((g.preview || {}).delete_on_success));
+  } else if (unambiguousScripts.length > 0 && unambiguousScripts.length === scriptOnly.length) {
+    const allAutoDelete = unambiguousScripts.every((g) => Boolean((g.preview || {}).delete_on_success));
     batchBtns.appendChild(
       makeBtn(
         allAutoDelete
-          ? `Write, Run & Delete All (${scriptOnly.length})`
-          : `Write & Run All (${scriptOnly.length})`,
+          ? `Write, Run & Delete All (${unambiguousScripts.length})`
+          : `Write & Run All (${unambiguousScripts.length})`,
         "btn btn-primary btn-xs",
         () =>
           decideBatchGates(
-            scriptOnly.map((g) => ({
+            unambiguousScripts.map((g) => ({
               gate_id: g.id,
               decision: { action: (g.preview || {}).delete_on_success ? "write_run_and_delete" : "write_and_run" },
             })),
@@ -190,26 +212,91 @@ function renderPendingGates() {
         )
       );
     } else if (preview.category === "script") {
-      const preferDelete = Boolean(preview.delete_on_success);
-      actions.appendChild(
-        makeBtn("Write to Disk Only", "btn btn-secondary btn-sm", () =>
-          decideGate(gate.id, { action: "write_only" })
-        )
-      );
-      actions.appendChild(
-        makeBtn(
-          "Write & Run in Venv",
-          preferDelete ? "btn btn-secondary btn-sm" : "btn btn-primary btn-sm",
-          () => decideGate(gate.id, { action: "write_and_run" })
-        )
-      );
-      actions.appendChild(
-        makeBtn(
-          "Write, Run & Delete on Pass",
-          preferDelete ? "btn btn-primary btn-sm" : "btn btn-secondary btn-sm",
+      if (preview.intent_ambiguous) {
+        const pathRow = document.createElement("div");
+        pathRow.className = "ambiguous-path-row";
+        const pathLbl = document.createElement("label");
+        pathLbl.className = "meta-line";
+        pathLbl.textContent = "Target Path:";
+        const pathInput = document.createElement("input");
+        pathInput.type = "text";
+        pathInput.className = "text-input mono";
+        pathInput.value = preview.script_path || (gate.args && gate.args.path) || "";
+        pathInput.placeholder = "e.g. inspect_tmp.py or utils/helper.py";
+        pathInput.disabled = Boolean(state.busy);
+        pathRow.append(pathLbl, pathInput);
+        card.appendChild(pathRow);
+
+        const inspectBtn = makeBtn("Run Temp Inspection (Delete on Pass)", "btn btn-primary btn-sm", () => {
+          const targetPath = pathInput.value.trim();
+          decideGate(gate.id, {
+            action: "write_run_and_delete",
+            ...(targetPath ? { target_path: targetPath } : {}),
+          });
+        });
+        inspectBtn.title = "Write temporary script, run in venv, and auto-delete if it passes cleanly";
+
+        const saveBtn = makeBtn("Save as Code File", "btn btn-secondary btn-sm", () => {
+          const targetPath = pathInput.value.trim();
+          decideGate(gate.id, {
+            action: "save_as_file",
+            ...(targetPath ? { target_path: targetPath } : {}),
+          });
+        });
+        saveBtn.title = "Write permanently to disk at Target Path (with savepoint & backup) without executing";
+
+        actions.append(inspectBtn, saveBtn);
+      } else {
+        const splitWrap = document.createElement("div");
+        splitWrap.className = "split-btn";
+
+        const mainBtn = makeBtn(
+          "Run & Delete on Pass",
+          "btn btn-primary btn-sm split-btn-main",
           () => decideGate(gate.id, { action: "write_run_and_delete" })
-        )
-      );
+        );
+        mainBtn.title = "Write script, run in venv, delete on clean pass (keeps on disk if it fails)";
+
+        const caretBtn = makeBtn("▾", "btn btn-primary btn-sm split-btn-caret", (ev) => {
+          ev.stopPropagation();
+          const open = menu.classList.contains("hidden");
+          menu.classList.toggle("hidden", !open);
+          caretBtn.setAttribute("aria-expanded", open ? "true" : "false");
+        });
+        caretBtn.title = "More script options";
+        caretBtn.setAttribute("aria-haspopup", "menu");
+        caretBtn.setAttribute("aria-expanded", "false");
+
+        const menu = document.createElement("div");
+        menu.className = "split-btn-menu is-left hidden";
+        menu.setAttribute("role", "menu");
+
+        const keepItem = document.createElement("button");
+        keepItem.type = "button";
+        keepItem.className = "split-btn-item";
+        keepItem.setAttribute("role", "menuitem");
+        keepItem.textContent = "Write & Run (Keep on Disk)";
+        keepItem.disabled = Boolean(state.busy);
+        keepItem.addEventListener("click", () => {
+          menu.classList.add("hidden");
+          void decideGate(gate.id, { action: "write_and_run" });
+        });
+
+        const writeItem = document.createElement("button");
+        writeItem.type = "button";
+        writeItem.className = "split-btn-item";
+        writeItem.setAttribute("role", "menuitem");
+        writeItem.textContent = "Write to Disk Only";
+        writeItem.disabled = Boolean(state.busy);
+        writeItem.addEventListener("click", () => {
+          menu.classList.add("hidden");
+          void decideGate(gate.id, { action: "write_only" });
+        });
+
+        menu.append(keepItem, writeItem);
+        splitWrap.append(mainBtn, caretBtn, menu);
+        actions.appendChild(splitWrap);
+      }
     } else if (preview.category === "command") {
       const runBtnLabel =
         gate.tool_name === "run_and_delete_script"
@@ -230,11 +317,6 @@ function renderPendingGates() {
           decideGate(gate.id, { action: "approve" })
         )
       );
-      actions.appendChild(
-        makeBtn("Approve & Auto-Approve", "btn btn-secondary btn-sm", () =>
-          decideGate(gate.id, { action: "approve_and_auto" })
-        )
-      );
     } else if (preview.category === "scout_headers") {
       actions.appendChild(
         makeBtn("Draft Header Diffs (Scout)", "btn btn-primary btn-sm", () =>
@@ -252,6 +334,7 @@ function renderPendingGates() {
     if (state.resolvingGateId === gate.id || state.resolvingGateId === "__batch__") {
       const statusRow = document.createElement("div");
       statusRow.className = "meta-line mono";
+      statusRow.dataset.liveStatus = "gate";
       const remainingAfterThis = Math.max(0, gates.length - 1);
       if (!state.apiEnabled) {
         statusRow.textContent = "Executing approved action locally (Bridge mode)...";
@@ -262,10 +345,34 @@ function renderPendingGates() {
             : `Executing action (${remainingAfterThis} gate(s) left before Gemini responds)...`;
       }
       card.appendChild(statusRow);
+
+      const cmdText = String((state.liveExec && state.liveExec.command) || "");
+      const gateTarget = String((gate.args && (gate.args.path || gate.args.target)) || "");
+      const isExecutableGate = preview.category === "script" || preview.category === "command";
+      const matchesBatch =
+        state.resolvingGateId === gate.id ||
+        (isExecutableGate && (!cmdText || !gateTarget || cmdText.includes(gateTarget)));
+      if ((isExecutableGate || Boolean(state.liveExec)) && matchesBatch) {
+        const liveSlice = formatGateLiveSlice(state.liveExec && state.liveExec.output);
+        const livePre = document.createElement("pre");
+        livePre.className = `exec-preview${liveSlice ? "" : " hidden"}`;
+        livePre.dataset.liveExec = `gate-card-${gate.id}`;
+        livePre.textContent = liveSlice;
+        card.appendChild(livePre);
+      }
     } else {
       card.appendChild(actions);
     }
     gatesContainer.appendChild(card);
+  }
+
+  if (state.resolvingGateId) {
+    const activeTarget =
+      gatesContainer.querySelector("[data-live-exec]:not(.hidden)") ||
+      gatesContainer.querySelector("[data-live-status]");
+    if (activeTarget && typeof activeTarget.scrollIntoView === "function") {
+      activeTarget.scrollIntoView({ block: "nearest" });
+    }
   }
 }
 
@@ -274,20 +381,29 @@ async function decideGate(gateId, body) {
   const remainingCount = Math.max(0, (state.pendingGates || []).length - 1);
   const gateObj = (state.pendingGates || []).find((g) => g.id === gateId);
   const gatePath =
-    (gateObj && gateObj.args && (gateObj.args.path || gateObj.args.old_path || gateObj.args.target)) || "";
+    String(body.target_path || "").trim() ||
+    (gateObj && gateObj.args && (gateObj.args.path || gateObj.args.old_path || gateObj.args.target)) ||
+    "";
   const controller = new AbortController();
   state.activeAbortController = controller;
   state.busy = true;
+  state.liveExec = null;
   state.resolvingGateId = gateId;
   if (
     gateObj &&
-    gateObj.tool_name === "propose_script" &&
+    (gateObj.tool_name === "propose_inspection_script" || gateObj.tool_name === "propose_script") &&
+    body.action === "save_as_file"
+  ) {
+    state.pendingStatusText = `Saving code file${gatePath ? `: ${gatePath}` : ""}...`;
+  } else if (
+    gateObj &&
+    (gateObj.tool_name === "propose_inspection_script" || gateObj.tool_name === "propose_script") &&
     (body.action === "write_and_run" || body.action === "write_run_and_delete")
   ) {
     state.pendingStatusText =
       body.action === "write_run_and_delete"
         ? `Running & auto-deleting on pass${gatePath ? `: ${gatePath}` : ""}...`
-        : `Running proposed script${gatePath ? `: ${gatePath}` : ""}...`;
+        : `Running inspection script${gatePath ? `: ${gatePath}` : ""}...`;
   } else if (
     gateObj &&
     (gateObj.tool_name === "run_script" || gateObj.tool_name === "run_and_delete_script") &&
@@ -331,6 +447,7 @@ async function decideGate(gateId, body) {
     state.busy = false;
     state.resolvingGateId = null;
     state.pendingStatusText = null;
+    state.liveExec = null;
     emit("gates:changed");
   }
 }
@@ -340,6 +457,7 @@ async function decideBatchGates(decisions, willCallGemini) {
   const controller = new AbortController();
   state.activeAbortController = controller;
   state.busy = true;
+  state.liveExec = null;
   state.resolvingGateId = "__batch__";
   state.pendingStatusText =
     !state.apiEnabled
@@ -363,15 +481,17 @@ async function decideBatchGates(decisions, willCallGemini) {
     state.busy = false;
     state.resolvingGateId = null;
     state.pendingStatusText = null;
+    state.liveExec = null;
     emit("gates:changed");
   }
 }
 
-function applyGateResponse(res, actionHint) {
+export function applyGateResponse(res, actionHint) {
   state.busy = false;
   state.pendingStatusText = null;
   state.resolvingGateId = null;
   state.liveScoutRun = null;
+  state.liveExec = null;
   state.activeSession = res.session;
   state.messages = res.messages;
   state.pendingGates = res.pending_gates || [];
@@ -490,6 +610,8 @@ async function recoverAfterGateError(err) {
   state.busy = false;
   state.pendingStatusText = null;
   state.resolvingGateId = null;
+  state.liveScoutRun = null;
+  state.liveExec = null;
   if (state.activeSessionId) {
     try {
       const detail = await api.getSessionDetail(state.activeSessionId);
@@ -507,6 +629,12 @@ async function recoverAfterGateError(err) {
   emit("session:updated");
   emit("chat:loaded");
   emit("chat:error", err.message);
+}
+
+function formatGateLiveSlice(rawOutput) {
+  const text = String(rawOutput || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!text.trim()) return "";
+  return text.length > 2500 ? `...\n${text.slice(-2500)}` : text;
 }
 
 function makeBtn(label, className, onClick) {

@@ -457,17 +457,24 @@ async function runTerminalCommand(command, opts = {}) {
 function upsertActivity(sessionId, entry) {
   if (!sessionId) return;
   const list = state.sessionActivities[sessionId] || [];
+  const msgs = state.messages || [];
+  const latestMsgId = msgs.length > 0 ? msgs[msgs.length - 1].id : null;
   const idx = list.findIndex((a) => a.id === entry.id);
   if (idx >= 0) {
+    const prev = list[idx];
     const anchored = {
       ...entry,
-      afterMsgIndex: list[idx].afterMsgIndex ?? (state.messages || []).length,
+      afterMsgIndex: prev.afterMsgIndex ?? msgs.length,
+      afterMsgId: prev.afterMsgId !== undefined ? prev.afterMsgId : latestMsgId,
+      anchorTimestamp: prev.anchorTimestamp || entry.timestamp || new Date().toISOString(),
     };
     list[idx] = anchored;
   } else {
     list.push({
       ...entry,
-      afterMsgIndex: (state.messages || []).length,
+      afterMsgIndex: msgs.length,
+      afterMsgId: latestMsgId,
+      anchorTimestamp: entry.timestamp || new Date().toISOString(),
     });
   }
   state.sessionActivities[sessionId] = list.slice(-10);
@@ -481,11 +488,17 @@ function handleExecStreamEvent(msg) {
       command: msg.command || "",
       source: msg.source || "console",
       output: "",
+      done: false,
     };
     terminalMeta.textContent = `Running: ${state.liveExec.command}...`;
     terminalOutput.textContent = "";
     pasteTermBtn.disabled = true;
-    emit("chat:live-exec", { type: "start", command: state.liveExec.command, output: "" });
+    emit("chat:live-exec", {
+      type: "start",
+      command: state.liveExec.command,
+      source: state.liveExec.source,
+      output: "",
+    });
     return;
   }
   if (msg.type === "exec_chunk") {
@@ -495,6 +508,7 @@ function handleExecStreamEvent(msg) {
         command: "",
         source: msg.source || "console",
         output: "",
+        done: false,
       };
     }
     state.liveExec.output += String(msg.chunk || "");
@@ -506,13 +520,35 @@ function handleExecStreamEvent(msg) {
     const lineCount = state.liveExec.output.split("\n").length;
     const cmdLabel = state.liveExec.command ? `: ${state.liveExec.command}` : "";
     terminalMeta.textContent = `Running${cmdLabel} · ${lineCount} ${lineCount === 1 ? "line" : "lines"} streamed...`;
-    emit("chat:live-exec", { type: "chunk", command: state.liveExec.command, output: state.liveExec.output });
+    emit("chat:live-exec", {
+      type: "chunk",
+      command: state.liveExec.command,
+      source: state.liveExec.source,
+      output: state.liveExec.output,
+    });
     return;
   }
   if (msg.type === "exec_done") {
-    state.liveExec = null;
+    const finalOutput =
+      typeof msg.output === "string" ? msg.output : state.liveExec ? state.liveExec.output : "";
+    if (state.resolvingGateId || state.pendingStatusText) {
+      state.liveExec = {
+        runId: msg.run_id || (state.liveExec && state.liveExec.runId) || null,
+        command: msg.command || (state.liveExec && state.liveExec.command) || "",
+        source: msg.source || (state.liveExec && state.liveExec.source) || "gate",
+        output: finalOutput,
+        done: true,
+      };
+    } else {
+      state.liveExec = null;
+    }
     showTerminalResult(msg, { suppressMdBar: true });
-    emit("chat:live-exec", { type: "done", command: msg.command || "", output: msg.output || "" });
+    emit("chat:live-exec", {
+      type: "done",
+      command: msg.command || "",
+      source: msg.source || "console",
+      output: finalOutput,
+    });
   }
 }
 

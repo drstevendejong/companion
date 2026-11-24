@@ -703,6 +703,86 @@ body.mode-api .bridge-only {
   border-color: var(--warning-border);
 }
 
+@keyframes card-arrival-flash {
+  0% {
+    border-color: var(--accent-text);
+    box-shadow: 0 0 0 2px var(--accent-border), 0 0 18px var(--accent-soft);
+  }
+  22% {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent-border), 0 0 10px var(--accent-soft);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@keyframes card-arrival-flash-ok {
+  0% {
+    border-color: var(--success-text);
+    box-shadow: 0 0 0 2px var(--success-border), 0 0 18px var(--success-soft);
+  }
+  22% {
+    border-color: var(--success);
+    box-shadow: 0 0 0 1px var(--success-border), 0 0 10px var(--success-soft);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@keyframes card-arrival-flash-err {
+  0% {
+    border-color: var(--danger-text);
+    box-shadow: 0 0 0 2px var(--danger-border), 0 0 18px var(--danger-soft);
+  }
+  22% {
+    border-color: var(--danger);
+    box-shadow: 0 0 0 1px var(--danger-border), 0 0 10px var(--danger-soft);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@keyframes card-arrival-flash-warn {
+  0% {
+    border-color: var(--warning-text);
+    box-shadow: 0 0 0 2px var(--warning-border), 0 0 18px var(--warning-soft);
+  }
+  22% {
+    border-color: var(--warning);
+    box-shadow: 0 0 0 1px var(--warning-border), 0 0 10px var(--warning-soft);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.msg-card.is-new-arrival {
+  animation: card-arrival-flash 2.6s ease-out;
+}
+
+.msg-card.msg-exec.is-ok.is-new-arrival,
+.msg-card.msg-checkpoint.is-active.is-new-arrival,
+.msg-card.msg-checkpoint.is-committed.is-new-arrival {
+  animation-name: card-arrival-flash-ok;
+}
+
+.msg-card.msg-exec.is-err.is-new-arrival {
+  animation-name: card-arrival-flash-err;
+}
+
+.msg-card.msg-checkpoint.is-restored.is-new-arrival {
+  animation-name: card-arrival-flash-warn;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-card.is-new-arrival {
+    animation-duration: 0.4s;
+  }
+}
+
 .exec-badge.is-committed {
   background: var(--success-soft);
   border: 1px solid var(--success-border);
@@ -895,6 +975,11 @@ body.mode-api .bridge-only {
   display: flex;
   flex-direction: column;
   gap: 3px;
+}
+
+.split-btn-menu.is-left {
+  left: 0;
+  right: auto;
 }
 
 .split-btn-item {
@@ -1390,6 +1475,45 @@ body.mode-api .bridge-only {
   padding: 20px;
 }
 
+.modal-card.modal-wide {
+  width: 720px;
+  max-height: 88vh;
+  overflow-y: auto;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-prompt-textarea {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.ambiguous-path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ambiguous-path-row .meta-line {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.ambiguous-path-row .text-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
 .modal-card h3 {
   margin: 0 0 12px;
   font-size: 16px;
@@ -1454,7 +1578,7 @@ body.mode-api .bridge-only {
   background: var(--accent-soft);
 }
 
-/* Bottom-left theme bar */
+/* Bottom-left settings & theme summary bar */
 .sidebar-footer {
   display: flex;
   align-items: center;
@@ -1469,6 +1593,10 @@ body.mode-api .bridge-only {
 .sidebar-footer .field-label {
   margin-bottom: 0;
   white-space: nowrap;
+}
+
+.sidebar-settings-btn {
+  flex-shrink: 0;
 }
 
 .theme-select {

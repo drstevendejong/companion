@@ -87,11 +87,16 @@ async def run_project_command(
     python_exe = resolve_project_python(root, configured_python)
     argv = _prepare_argv(command, python_exe)
 
+    child_env = os.environ.copy()
+    child_env["PYTHONUNBUFFERED"] = "1"
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+
     started = time.monotonic()
     deadline = started + timeout_seconds
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(root),
+        env=child_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )

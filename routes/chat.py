@@ -4,13 +4,15 @@ routes/chat.py - Human-gated Gemini chat loop and tool approval/denial/edit-rang
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
 import os
+import re
 import shlex
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from google.genai import types
@@ -23,6 +25,7 @@ from models import (
     ChatSendRequest,
     MessageRecord,
     ProjectProfile,
+    RetryScriptRequest,
     SessionInfo,
     SessionUpdate,
     ToolGateDecision,
@@ -40,6 +43,28 @@ from services.gemini_client import (
 from services.quota_parser import analyze_gemini_error, format_gemini_error
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+_STATIC_ERROR_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*\.)?"
+    r"(?:SyntaxError|IndentationError|TabError|ImportError|ModuleNotFoundError|NameError|UnboundLocalError)\s*:",
+    re.MULTILINE,
+)
+
+
+def classify_script_failure(
+    raw_output: str,
+    exit_code: int,
+    script_text: Optional[str] = None,
+) -> str:
+    """Distinguishes static script errors (syntax/import/name) from environment/runtime failures."""
+    if script_text is not None:
+        try:
+            ast.parse(script_text)
+        except (SyntaxError, IndentationError, TabError):
+            return "static"
+    if _STATIC_ERROR_RE.search(raw_output or ""):
+        return "static"
+    return "runtime"
 
 
 def _get_effective_scout_settings(db: Any, gemini: Any) -> Dict[str, Any]:
@@ -187,7 +212,7 @@ def _advance_turn(
         scout_auto = bool(scout_cfg.get("auto_approve"))
 
         history = _messages_to_history(db.list_messages(session.id))
-        turn = gemini.generate_turn(session, project, history, scout_enabled=scout_enabled)
+        turn = gemini.generate_turn(session, project, history, scout_enabled=scout_enabled, db=db)
         usage = turn["usage"]
         db.record_api_usage(session.model, usage)
         updated_session = db.add_session_tokens(session.id, usage) or session
@@ -734,193 +759,271 @@ async def _execute_gate_decision(
             text=json.dumps({"tool_name": tool_name, "call_id": call_id, "response": tool_resp}),
         )
 
-    elif tool_name == "propose_script":
-        try:
-            prepared = prepare_tool_gate_preview(project, tool_name, args)
-            cp = (
-                cp_svc.ensure_active_checkpoint(db, project, session.id)
-                if hasattr(db, "get_active_checkpoint")
-                else None
-            )
-            applied = patch_tools.apply_prepared_patch(
-                project.root_path,
-                project.backup_dir,
-                prepared["prepared_patch"],
-            )
-        except Exception as exc:
-            return _record_gate_error(exc)
-
-        if cp is not None:
-            cp_svc.record_write_in_checkpoint(db, cp, applied["path"], applied["existed_before"])
-
-        patch_rec = db.add_patch_record(
-            project_id=project.id,
-            session_id=session.id,
-            file_path=applied["path"],
-            backup_path=applied["backup_path"],
-            existed_before=applied["existed_before"],
-            summary=gate["preview"].get("summary", "Script written"),
-            diff=applied["diff"],
-        )
-        extra_ui["patch_record"] = patch_rec.model_dump()
-
-        if decision.action in ("write_and_run", "write_run_and_delete"):
-            auto_delete = decision.action == "write_run_and_delete"
-            before_files = (
-                cp_svc.list_project_relative_files(
-                    project.root_path, project.backup_dir, project.ignore_patterns
-                )
-                if cp is not None
-                else set()
-            )
+    elif tool_name in ("propose_inspection_script", "propose_script") or (
+        tool_name == "run_and_delete_script" and isinstance(args.get("content"), str) and args["content"].strip()
+    ):
+        custom_path = str(getattr(decision, "target_path", None) or "").strip()
+        eff_args = {**args, "path": custom_path} if custom_path else args
+        if decision.action == "save_as_file":
             try:
-                run_res = await runner.stream_project_command(
-                    app,
+                prepared = prepare_tool_gate_preview(project, "write_file", eff_args)
+                cp = (
+                    cp_svc.ensure_active_checkpoint(db, project, session.id)
+                    if hasattr(db, "get_active_checkpoint")
+                    else None
+                )
+                applied = patch_tools.apply_prepared_patch(
                     project.root_path,
-                    f"python {shlex.quote(applied['path'])}",
-                    configured_python=project.python_path,
-                    source="gate",
+                    project.backup_dir,
+                    prepared["prepared_patch"],
                 )
             except Exception as exc:
+                return _record_gate_error(exc)
+
+            if cp is not None:
+                cp_svc.record_write_in_checkpoint(db, cp, applied["path"], applied["existed_before"])
+
+            patch_rec = db.add_patch_record(
+                project_id=project.id,
+                session_id=session.id,
+                file_path=applied["path"],
+                backup_path=applied["backup_path"],
+                existed_before=applied["existed_before"],
+                summary=gate["preview"].get("summary", "Save Python code file"),
+                diff=applied["diff"],
+            )
+            tool_resp = {
+                "applied": True,
+                "path": applied["path"],
+                "backup_path": applied["backup_path"],
+                "bytes_written": applied["bytes_written"],
+            }
+            extra_ui["patch_record"] = patch_rec.model_dump()
+            db.resolve_gate(gate_id, "approved", tool_resp)
+            db.add_message(
+                session.id,
+                role="tool_event",
+                text=json.dumps({"tool_name": "write_file", "call_id": call_id, "response": tool_resp}),
+            )
+        else:
+            had_active_cp = (
+                hasattr(db, "get_active_checkpoint")
+                and db.get_active_checkpoint(session.id) is not None
+            )
+            try:
+                prepared = prepare_tool_gate_preview(project, tool_name, eff_args)
+                cp = (
+                    cp_svc.ensure_active_checkpoint(db, project, session.id)
+                    if hasattr(db, "get_active_checkpoint")
+                    else None
+                )
+                applied = patch_tools.apply_prepared_patch(
+                    project.root_path,
+                    project.backup_dir,
+                    prepared["prepared_patch"],
+                )
+            except Exception as exc:
+                return _record_gate_error(exc)
+
+            if cp is not None:
+                cp_svc.record_write_in_checkpoint(db, cp, applied["path"], applied["existed_before"])
+
+            patch_rec = db.add_patch_record(
+                project_id=project.id,
+                session_id=session.id,
+                file_path=applied["path"],
+                backup_path=applied["backup_path"],
+                existed_before=applied["existed_before"],
+                summary=gate["preview"].get("summary", "Script written"),
+                diff=applied["diff"],
+            )
+            extra_ui["patch_record"] = patch_rec.model_dump()
+
+            if decision.action in ("write_and_run", "write_run_and_delete"):
+                auto_delete = decision.action == "write_run_and_delete"
+                before_files = (
+                    cp_svc.list_project_relative_files(
+                        project.root_path, project.backup_dir, project.ignore_patterns
+                    )
+                    if cp is not None
+                    else set()
+                )
+                try:
+                    run_res = await runner.stream_project_command(
+                        app,
+                        project.root_path,
+                        f"python {shlex.quote(applied['path'])}",
+                        configured_python=project.python_path,
+                        source="gate",
+                    )
+                except Exception as exc:
+                    if cp is not None:
+                        after_files = cp_svc.list_project_relative_files(
+                            project.root_path, project.backup_dir, project.ignore_patterns
+                        )
+                        for new_rel in sorted(after_files - before_files):
+                            cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
+                    err_resp = {
+                        "written": True,
+                        "executed": False,
+                        "path": applied["path"],
+                        "target": applied["path"],
+                        "error": f"Failed to execute script '{applied['path']}': {exc}",
+                    }
+                    db.resolve_gate(gate_id, "error", err_resp)
+                    db.add_message(
+                        session.id,
+                        role="tool_event",
+                        text=json.dumps({"tool_name": tool_name, "call_id": call_id, "response": err_resp}),
+                    )
+                    extra_ui["gate_error"] = err_resp["error"]
+                    return extra_ui
+
                 if cp is not None:
                     after_files = cp_svc.list_project_relative_files(
                         project.root_path, project.backup_dir, project.ignore_patterns
                     )
                     for new_rel in sorted(after_files - before_files):
                         cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
-                err_resp = {
+
+                generated_md = bridge_svc.find_recent_markdown_outputs(
+                    project.root_path,
+                    run_res.get("output", ""),
+                    exclude_rel=applied["path"],
+                )
+                run_res["generated_md_files"] = generated_md
+                extra_ui["command_result"] = run_res
+                extra_ui["generated_md_files"] = generated_md
+                raw_out = run_res.get("output") or ""
+                exec_id = run_res.get("exec_id")
+                focus_arg = str(args.get("focus") or "").strip() or None
+                has_traceback = (
+                    "Traceback (most recent call last):" in raw_out
+                    or "\nSyntaxError:" in raw_out
+                    or "\nImportError:" in raw_out
+                    or "\nModuleNotFoundError:" in raw_out
+                )
+                passed = (run_res["exit_code"] == 0) and (not has_traceback)
+                summary_info = await _maybe_summarize_or_triage_output(
+                    gemini=gemini_client,
+                    db=db,
+                    project=project,
+                    scout_cfg=scout_cfg,
+                    command=f"python {applied['path']}",
+                    raw_output=raw_out,
+                    exit_code=run_res["exit_code"],
+                    passed=passed,
+                    focus=focus_arg,
+                    exec_id=exec_id,
+                )
+                if summary_info.get("summary"):
+                    output_preview = ""
+                elif not passed:
+                    output_preview = bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
+                else:
+                    output_preview = bridge_svc.format_command_output_preview(raw_out, max_chars=12000)
+
+                after_files_post: set[str] = set()
+                if cp is not None:
+                    after_files_post = cp_svc.list_project_relative_files(
+                        project.root_path, project.backup_dir, project.ignore_patterns
+                    )
+
+                deleted_after_run = False
+                del_backup_path = None
+                if auto_delete and passed:
+                    try:
+                        del_preview = patch_tools.preview_delete_file(project.root_path, applied["path"])
+                        del_res = patch_tools.apply_delete_file(
+                            project.root_path, project.backup_dir, del_preview
+                        )
+                        deleted_after_run = bool(del_res.get("deleted"))
+                        del_backup_path = del_res.get("backup_path")
+                        del_rec = db.add_patch_record(
+                            project_id=project.id,
+                            session_id=session.id,
+                            file_path=del_res["path"],
+                            backup_path=del_backup_path,
+                            existed_before=True,
+                            summary=f"Auto-deleted temporary script after pass: {del_res['path']}",
+                            diff=del_res["diff"],
+                        )
+                        extra_ui["patch_record"] = del_rec.model_dump()
+                    except Exception:
+                        deleted_after_run = False
+
+                if deleted_after_run and cp is not None and not had_active_cp and not applied["existed_before"]:
+                    latest_cp = db.get_checkpoint(cp.id) if hasattr(db, "get_checkpoint") else cp
+                    other_mods = [p for p in (getattr(latest_cp, "modified_files", None) or []) if p != applied["path"]]
+                    other_created = [p for p in (getattr(latest_cp, "created_files", None) or []) if p != applied["path"]]
+                    extra_new = (after_files_post - before_files) - {applied["path"]}
+                    if not other_mods and not other_created and not extra_new:
+                        cp_svc.discard_checkpoint(db, project, cp.id)
+                        cp = None
+
+                script_src: Optional[str] = None
+                try:
+                    script_abs = fs_tools.resolve_safe_path(project.root_path, applied["path"])
+                    if script_abs.is_file():
+                        script_src = script_abs.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    script_src = None
+                failure_kind = None if passed else classify_script_failure(raw_out, run_res["exit_code"], script_src)
+                still_on_disk = bool(script_src is not None and not deleted_after_run)
+
+                tool_resp = {
+                    "written": True,
+                    "executed": True,
+                    "path": applied["path"],
+                    "exec_id": exec_id,
+                    "exit_code": run_res["exit_code"],
+                    "duration_ms": run_res["duration_ms"],
+                    "passed": passed,
+                    "deleted": deleted_after_run,
+                    "kept_for_patching": bool(auto_delete and not deleted_after_run),
+                    "auto_delete_on_success": bool(auto_delete),
+                    "failure_kind": failure_kind,
+                    "retryable": bool((not passed) and failure_kind == "runtime" and still_on_disk),
+                    "backup_path": del_backup_path,
+                    "output_bytes": len(raw_out.encode("utf-8")),
+                    "output_preview": output_preview,
+                    "ai_summary": summary_info.get("summary"),
+                    "ai_summary_model": summary_info.get("model_used"),
+                    "has_traceback": has_traceback,
+                    "generated_md_files": generated_md if passed else [],
+                    "note": (
+                        f"Auto-deleted '{applied['path']}' after clean run (backed up first). Raw output exec_id={exec_id}."
+                        if deleted_after_run
+                        else (
+                            f"Script failed; kept '{applied['path']}' on disk so you can retry or patch and re-run with run_and_delete_script."
+                            if auto_delete and not passed
+                            else f"Full output buffered as exec_id={exec_id} and shown in Console."
+                        )
+                    ),
+                }
+                if not session.api_enabled and passed and generated_md:
+                    first_md_path = generated_md[0]["path"]
+                    try:
+                        resolved_md = fs_tools.resolve_safe_path(project.root_path, first_md_path)
+                        if resolved_md.is_file():
+                            extra_ui["generated_md_path"] = first_md_path
+                            extra_ui["generated_md_content"] = resolved_md.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+            else:
+                tool_resp = {
                     "written": True,
                     "executed": False,
                     "path": applied["path"],
-                    "target": applied["path"],
-                    "error": f"Failed to execute script '{applied['path']}': {exc}",
+                    "note": "Script written to disk; awaiting user execution.",
                 }
-                db.resolve_gate(gate_id, "error", err_resp)
-                db.add_message(
-                    session.id,
-                    role="tool_event",
-                    text=json.dumps({"tool_name": tool_name, "call_id": call_id, "response": err_resp}),
-                )
-                extra_ui["gate_error"] = err_resp["error"]
-                return extra_ui
 
-            if cp is not None:
-                after_files = cp_svc.list_project_relative_files(
-                    project.root_path, project.backup_dir, project.ignore_patterns
-                )
-                for new_rel in sorted(after_files - before_files):
-                    cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
-
-            generated_md = bridge_svc.find_recent_markdown_outputs(
-                project.root_path,
-                run_res.get("output", ""),
-                exclude_rel=applied["path"],
+            db.resolve_gate(gate_id, "approved", tool_resp)
+            db.add_message(
+                session.id,
+                role="tool_event",
+                text=json.dumps({"tool_name": tool_name, "call_id": call_id, "response": tool_resp}),
             )
-            run_res["generated_md_files"] = generated_md
-            extra_ui["command_result"] = run_res
-            extra_ui["generated_md_files"] = generated_md
-            raw_out = run_res.get("output") or ""
-            exec_id = run_res.get("exec_id")
-            focus_arg = str(args.get("focus") or "").strip() or None
-            has_traceback = (
-                "Traceback (most recent call last):" in raw_out
-                or "\nSyntaxError:" in raw_out
-                or "\nImportError:" in raw_out
-                or "\nModuleNotFoundError:" in raw_out
-            )
-            passed = (run_res["exit_code"] == 0) and (not has_traceback)
-            summary_info = await _maybe_summarize_or_triage_output(
-                gemini=gemini_client,
-                db=db,
-                project=project,
-                scout_cfg=scout_cfg,
-                command=f"python {applied['path']}",
-                raw_output=raw_out,
-                exit_code=run_res["exit_code"],
-                passed=passed,
-                focus=focus_arg,
-                exec_id=exec_id,
-            )
-            if summary_info.get("summary"):
-                output_preview = ""
-            elif not passed:
-                output_preview = bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
-            else:
-                output_preview = bridge_svc.format_command_output_preview(raw_out, max_chars=12000)
-
-            deleted_after_run = False
-            del_backup_path = None
-            if auto_delete and passed:
-                try:
-                    del_preview = patch_tools.preview_delete_file(project.root_path, applied["path"])
-                    del_res = patch_tools.apply_delete_file(
-                        project.root_path, project.backup_dir, del_preview
-                    )
-                    deleted_after_run = bool(del_res.get("deleted"))
-                    del_backup_path = del_res.get("backup_path")
-                    del_rec = db.add_patch_record(
-                        project_id=project.id,
-                        session_id=session.id,
-                        file_path=del_res["path"],
-                        backup_path=del_backup_path,
-                        existed_before=True,
-                        summary=f"Auto-deleted temporary script after pass: {del_res['path']}",
-                        diff=del_res["diff"],
-                    )
-                    extra_ui["patch_record"] = del_rec.model_dump()
-                except Exception:
-                    deleted_after_run = False
-
-            tool_resp = {
-                "written": True,
-                "executed": True,
-                "path": applied["path"],
-                "exec_id": exec_id,
-                "exit_code": run_res["exit_code"],
-                "duration_ms": run_res["duration_ms"],
-                "passed": passed,
-                "deleted": deleted_after_run,
-                "kept_for_patching": bool(auto_delete and not deleted_after_run),
-                "backup_path": del_backup_path,
-                "output_bytes": len(raw_out.encode("utf-8")),
-                "output_preview": output_preview,
-                "ai_summary": summary_info.get("summary"),
-                "ai_summary_model": summary_info.get("model_used"),
-                "has_traceback": has_traceback,
-                "generated_md_files": generated_md if passed else [],
-                "note": (
-                    f"Auto-deleted '{applied['path']}' after clean run (backed up first). Raw output exec_id={exec_id}."
-                    if deleted_after_run
-                    else (
-                        f"Script failed; kept '{applied['path']}' on disk so you can patch and re-run with run_and_delete_script."
-                        if auto_delete and not passed
-                        else f"Full output buffered as exec_id={exec_id} and shown in Console."
-                    )
-                ),
-            }
-            if not session.api_enabled and passed and generated_md:
-                first_md_path = generated_md[0]["path"]
-                try:
-                    resolved_md = fs_tools.resolve_safe_path(project.root_path, first_md_path)
-                    if resolved_md.is_file():
-                        extra_ui["generated_md_path"] = first_md_path
-                        extra_ui["generated_md_content"] = resolved_md.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    pass
-        else:
-            tool_resp = {
-                "written": True,
-                "executed": False,
-                "path": applied["path"],
-                "note": "Script written to disk; awaiting user execution.",
-            }
-
-        db.resolve_gate(gate_id, "approved", tool_resp)
-        db.add_message(
-            session.id,
-            role="tool_event",
-            text=json.dumps({"tool_name": tool_name, "call_id": call_id, "response": tool_resp}),
-        )
 
     elif tool_name in ("run_script", "run_and_delete_script"):
         auto_delete = tool_name == "run_and_delete_script"
@@ -930,7 +1033,9 @@ async def _execute_gate_decision(
                 raise ValueError(f"{tool_name} requires 'path'.")
             target_abs = fs_tools.resolve_safe_path(project.root_path, rel_path)
             if not target_abs.is_file():
-                raise FileNotFoundError(f"Script not found on disk: {rel_path}")
+                raise FileNotFoundError(
+                    f"Script not found on disk: {rel_path}. Emit a fenced ```python block with '# tool: propose_inspection_script' and '# path: {rel_path}' (or include 'content') to create & run a new temporary script; run_and_delete_script without content only re-runs an existing script saved on disk."
+                )
             if target_abs.suffix.lower() != ".py":
                 raise ValueError(f"{tool_name} only supports .py scripts inside project (got '{rel_path}').")
             rel_posix = target_abs.relative_to(Path(project.root_path).resolve()).as_posix()
@@ -1025,7 +1130,16 @@ async def _execute_gate_decision(
                 deleted_after_run = bool(del_res.get("deleted"))
                 del_backup_path = del_res.get("backup_path")
                 if cp is not None:
-                    cp_svc.record_write_in_checkpoint(db, cp, rel_posix, existed_before=True)
+                    latest_cp = db.get_checkpoint(cp.id) if hasattr(db, "get_checkpoint") else cp
+                    orig_created = set(getattr(latest_cp, "created_files", None) or [])
+                    orig_mods = set(getattr(latest_cp, "modified_files", None) or [])
+                    other_mods = orig_mods - {rel_posix}
+                    other_created = orig_created - {rel_posix}
+                    if deleted_after_run and (rel_posix in orig_created) and not other_mods and not other_created:
+                        cp_svc.discard_checkpoint(db, project, cp.id)
+                        cp = None
+                    else:
+                        cp_svc.record_write_in_checkpoint(db, cp, rel_posix, existed_before=True)
                 del_rec = db.add_patch_record(
                     project_id=project.id,
                     session_id=session.id,
@@ -1039,10 +1153,20 @@ async def _execute_gate_decision(
             except Exception:
                 deleted_after_run = False
 
+        script_src: Optional[str] = None
+        try:
+            if target_abs.is_file():
+                script_src = target_abs.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            script_src = None
+        failure_kind = None if passed else classify_script_failure(raw_out, run_res["exit_code"], script_src)
+        still_on_disk = bool(target_abs.is_file() and not deleted_after_run)
+
         tool_resp = {
             "executed": True,
             "path": rel_posix,
             "command": cmd,
+            "args": str(raw_args) if isinstance(raw_args, str) and raw_args.strip() else None,
             "exec_id": exec_id,
             "exit_code": run_res["exit_code"],
             "duration_ms": run_res["duration_ms"],
@@ -1050,6 +1174,9 @@ async def _execute_gate_decision(
             "has_traceback": has_traceback,
             "deleted": deleted_after_run,
             "kept_for_patching": bool(auto_delete and not deleted_after_run),
+            "auto_delete_on_success": bool(auto_delete),
+            "failure_kind": failure_kind,
+            "retryable": bool((not passed) and failure_kind == "runtime" and still_on_disk),
             "backup_path": del_backup_path,
             "output_bytes": len(raw_out.encode("utf-8")),
             "output_preview": output_preview,
@@ -1060,7 +1187,7 @@ async def _execute_gate_decision(
                 f"Auto-deleted '{rel_posix}' after clean run (backed up first). Raw output exec_id={exec_id}."
                 if deleted_after_run
                 else (
-                    f"Script failed; kept '{rel_posix}' on disk so you can patch it and re-run run_and_delete_script."
+                    f"Script failed; kept '{rel_posix}' on disk so you can retry or patch and re-run run_and_delete_script."
                     if auto_delete and not passed
                     else f"Full output buffered as exec_id={exec_id} and shown in Console."
                 )
@@ -1332,6 +1459,292 @@ async def resolve_tool_gates_batch(
     try:
         result = _advance_turn(db, gemini, session, project, app=app)
         result.update(last_extra)
+        return result
+    except Exception as exc:
+        raise _build_gemini_http_exception(gemini, session.model, exc) from exc
+
+
+@router.post("/retry-script")
+async def retry_failed_script(
+    payload: RetryScriptRequest,
+    request: Request,
+) -> Dict[str, Any]:
+    db = request.app.state.db
+    gemini = request.app.state.gemini
+
+    session = db.get_session(payload.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    project = db.get_project(session.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    rel_path = str(payload.path or "").strip()
+    if not rel_path:
+        raise HTTPException(status_code=400, detail="Script path is required.")
+    try:
+        target_abs = fs_tools.resolve_safe_path(project.root_path, rel_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not target_abs.is_file():
+        raise HTTPException(status_code=404, detail=f"Script no longer exists on disk: {rel_path}")
+    if target_abs.suffix.lower() != ".py":
+        raise HTTPException(status_code=400, detail=f"Only .py scripts can be retried (got '{rel_path}').")
+
+    rel_posix = target_abs.relative_to(Path(project.root_path).resolve()).as_posix()
+    script_src = target_abs.read_text(encoding="utf-8", errors="replace")
+    try:
+        ast.parse(script_src)
+    except (SyntaxError, IndentationError, TabError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot retry '{rel_posix}': static syntax error at line {exc.lineno or '?'}. Patch the script instead.",
+        ) from exc
+
+    arg_list: List[str] = []
+    if payload.args and payload.args.strip():
+        arg_list = shlex.split(payload.args.strip(), posix=(os.name != "nt"))
+    cmd = " ".join(["python", shlex.quote(rel_posix), *(shlex.quote(a) for a in arg_list)])
+
+    app = getattr(request, "app", None)
+    if app is not None and hasattr(app, "state"):
+        app.state.event_loop = asyncio.get_running_loop()
+
+    cp = db.get_active_checkpoint(session.id) if hasattr(db, "get_active_checkpoint") else None
+    before_files = (
+        cp_svc.list_project_relative_files(
+            project.root_path, project.backup_dir, project.ignore_patterns
+        )
+        if cp is not None
+        else set()
+    )
+
+    extra_ui: Dict[str, Any] = {}
+    try:
+        run_res = await runner.stream_project_command(
+            app,
+            project.root_path,
+            cmd,
+            configured_python=project.python_path,
+            source="gate",
+        )
+    except Exception as exc:
+        if cp is not None:
+            after_files = cp_svc.list_project_relative_files(
+                project.root_path, project.backup_dir, project.ignore_patterns
+            )
+            for new_rel in sorted(after_files - before_files):
+                cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
+        raise HTTPException(status_code=500, detail=f"Failed to retry '{rel_posix}': {exc}") from exc
+
+    if cp is not None:
+        after_files = cp_svc.list_project_relative_files(
+            project.root_path, project.backup_dir, project.ignore_patterns
+        )
+        for new_rel in sorted(after_files - before_files):
+            cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
+
+    generated_md = bridge_svc.find_recent_markdown_outputs(
+        project.root_path,
+        run_res.get("output", ""),
+        exclude_rel=rel_posix,
+    )
+    run_res["generated_md_files"] = generated_md
+    extra_ui["command_result"] = run_res
+    extra_ui["command_results"] = [run_res]
+    extra_ui["generated_md_files"] = generated_md
+
+    raw_out = run_res.get("output") or ""
+    exec_id = run_res.get("exec_id")
+    has_traceback = (
+        "Traceback (most recent call last):" in raw_out
+        or "\nSyntaxError:" in raw_out
+        or "\nImportError:" in raw_out
+        or "\nModuleNotFoundError:" in raw_out
+    )
+    passed = (run_res["exit_code"] == 0) and (not has_traceback)
+
+    scout_cfg = _get_effective_scout_settings(db, gemini)
+    focus_arg = str(payload.focus or "").strip() or None
+    summary_info = await _maybe_summarize_or_triage_output(
+        gemini=gemini,
+        db=db,
+        project=project,
+        scout_cfg=scout_cfg,
+        command=cmd,
+        raw_output=raw_out,
+        exit_code=run_res["exit_code"],
+        passed=passed,
+        focus=focus_arg,
+        exec_id=exec_id,
+    )
+    if summary_info.get("summary"):
+        output_preview = ""
+    elif not passed:
+        output_preview = bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
+    else:
+        output_preview = bridge_svc.format_command_output_preview(raw_out, max_chars=12000)
+
+    deleted_after_run = False
+    del_backup_path = None
+    if payload.auto_delete and passed and target_abs.is_file():
+        try:
+            del_preview = patch_tools.preview_delete_file(project.root_path, rel_posix)
+            del_res = patch_tools.apply_delete_file(
+                project.root_path, project.backup_dir, del_preview
+            )
+            deleted_after_run = bool(del_res.get("deleted"))
+            del_backup_path = del_res.get("backup_path")
+            if cp is not None:
+                latest_cp = db.get_checkpoint(cp.id) if hasattr(db, "get_checkpoint") else cp
+                orig_created = set(getattr(latest_cp, "created_files", None) or [])
+                orig_mods = set(getattr(latest_cp, "modified_files", None) or [])
+                other_mods = orig_mods - {rel_posix}
+                other_created = orig_created - {rel_posix}
+                if deleted_after_run and (rel_posix in orig_created) and not other_mods and not other_created:
+                    cp_svc.discard_checkpoint(db, project, cp.id)
+                    cp = None
+                else:
+                    cp_svc.record_write_in_checkpoint(db, cp, rel_posix, existed_before=True)
+            del_rec = db.add_patch_record(
+                project_id=project.id,
+                session_id=session.id,
+                file_path=del_res["path"],
+                backup_path=del_backup_path,
+                existed_before=True,
+                summary=f"Auto-deleted temporary script after pass: {del_res['path']}",
+                diff=del_res["diff"],
+            )
+            extra_ui["patch_record"] = del_rec.model_dump()
+        except Exception:
+            deleted_after_run = False
+
+    failure_kind = None if passed else classify_script_failure(raw_out, run_res["exit_code"], script_src)
+    still_on_disk = bool(target_abs.is_file() and not deleted_after_run)
+    event_tool_name = (
+        payload.tool_name
+        if payload.tool_name in ("propose_inspection_script", "propose_script", "run_script", "run_and_delete_script")
+        else ("run_and_delete_script" if payload.auto_delete else "run_script")
+    )
+    tool_resp: Dict[str, Any] = {
+        "executed": True,
+        "path": rel_posix,
+        "command": cmd,
+        "args": payload.args.strip() if payload.args and payload.args.strip() else None,
+        "exec_id": exec_id,
+        "exit_code": run_res["exit_code"],
+        "duration_ms": run_res["duration_ms"],
+        "passed": passed,
+        "has_traceback": has_traceback,
+        "deleted": deleted_after_run,
+        "kept_for_patching": bool(payload.auto_delete and not deleted_after_run),
+        "auto_delete_on_success": bool(payload.auto_delete),
+        "failure_kind": failure_kind,
+        "retryable": bool((not passed) and failure_kind == "runtime" and still_on_disk),
+        "backup_path": del_backup_path,
+        "output_bytes": len(raw_out.encode("utf-8")),
+        "output_preview": output_preview,
+        "ai_summary": summary_info.get("summary"),
+        "ai_summary_model": summary_info.get("model_used"),
+        "generated_md_files": generated_md if passed else [],
+        "note": (
+            f"Auto-deleted '{rel_posix}' after clean retry (backed up first). Raw output exec_id={exec_id}."
+            if deleted_after_run
+            else (
+                f"Script failed on retry; kept '{rel_posix}' on disk."
+                if payload.auto_delete and not passed
+                else f"Full output buffered as exec_id={exec_id} and shown in Console."
+            )
+        ),
+    }
+
+    if not session.api_enabled and passed and generated_md:
+        first_md_path = generated_md[0]["path"]
+        try:
+            resolved_md = fs_tools.resolve_safe_path(project.root_path, first_md_path)
+            if resolved_md.is_file():
+                extra_ui["generated_md_path"] = first_md_path
+                extra_ui["generated_md_content"] = resolved_md.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    existing_msgs = db.list_messages(session.id)
+    replaced_msg_id: Optional[str] = None
+    replaced_call_id: Optional[str] = None
+    replaced_tool_name: Optional[str] = None
+    for msg in reversed(existing_msgs):
+        if msg.role != "tool_event":
+            break
+        try:
+            ev_payload = json.loads(msg.text)
+        except Exception:
+            continue
+        t_name = ev_payload.get("tool_name")
+        t_resp = ev_payload.get("response") or {}
+        if (
+            t_name in ("propose_inspection_script", "propose_script", "run_script", "run_and_delete_script")
+            and t_resp.get("path") == rel_posix
+            and not (t_resp.get("exit_code") == 0 and not t_resp.get("has_traceback") and not t_resp.get("error"))
+        ):
+            replaced_msg_id = msg.id
+            replaced_call_id = ev_payload.get("call_id")
+            replaced_tool_name = t_name
+            break
+
+    if replaced_msg_id and hasattr(db, "update_message_text"):
+        if replaced_tool_name in ("propose_inspection_script", "propose_script"):
+            tool_resp["written"] = True
+        db.update_message_text(
+            replaced_msg_id,
+            json.dumps({
+                "tool_name": replaced_tool_name or event_tool_name,
+                "call_id": replaced_call_id,
+                "response": tool_resp,
+            }),
+        )
+    elif not session.api_enabled:
+        db.add_message(
+            session.id,
+            role="tool_event",
+            text=json.dumps({"tool_name": event_tool_name, "call_id": None, "response": tool_resp}),
+        )
+    else:
+        retry_report = bridge_svc.format_bridge_tool_results(
+            [{"tool_name": event_tool_name, "response": tool_resp}]
+        )
+        db.add_message(
+            session.id,
+            role="user",
+            text=f"User retried `{rel_posix}` cleanly.\n\n{retry_report}",
+        )
+
+    messages = db.list_messages(session.id)
+    checkpoints = db.list_checkpoints(session.id) if hasattr(db, "list_checkpoints") else []
+    remaining = db.list_pending_gates(session.id)
+
+    if remaining or not session.api_enabled:
+        resp_payload: Dict[str, Any] = {
+            "session": db.get_session(session.id),
+            "messages": messages,
+            "pending_gates": remaining,
+            "checkpoints": checkpoints,
+            "telemetry": local_scout.get_telemetry_snapshot(
+                db, gemini, model=getattr(session, "model", None)
+            ),
+            **extra_ui,
+        }
+        if not session.api_enabled and not remaining:
+            resp_payload["bridge_reply_text"] = _maybe_append_scout_notice(
+                db,
+                db.get_session(session.id) or session,
+                bool(scout_cfg.get("enabled")),
+                bridge_svc.format_trailing_tool_events(messages),
+            )
+        return resp_payload
+
+    try:
+        result = _advance_turn(db, gemini, session, project, app=app)
+        result.update(extra_ui)
         return result
     except Exception as exc:
         raise _build_gemini_http_exception(gemini, session.model, exc) from exc

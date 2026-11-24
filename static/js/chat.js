@@ -10,11 +10,130 @@ import {
 } from "./bridge.js";
 import { renderMarkdown } from "./markdown.js";
 import { emit, estimateTokensLocal, getActiveProject, on, state } from "./state.js";
+import { applyGateResponse } from "./tool_gates.js";
 
 const chatStream = document.getElementById("chat-stream");
 const RECENT_COPY_BALLOON_LIMIT = 2;
+const ARRIVAL_FLASH_MS = 2600;
+let pendingScrollRaf = null;
+let chatPinnedToBottom = true;
+let isRenderingChat = false;
+let scoutElapsedTimer = null;
+const seenCardKeysBySession = new Map();
+const arrivalStartedAtByKey = new Map();
+let lastRenderedSessionId = null;
+
+function applyArrivalFlash(card, cardKey, renderCtx) {
+  if (!card || !cardKey || !renderCtx) return;
+  const { sid, seen, isBaseline, now } = renderCtx;
+  const fullKey = `${sid}:${cardKey}`;
+  if (isBaseline) {
+    seen.add(cardKey);
+    return;
+  }
+  if (!seen.has(cardKey)) {
+    seen.add(cardKey);
+    arrivalStartedAtByKey.set(fullKey, now);
+  }
+  const startedAt = arrivalStartedAtByKey.get(fullKey);
+  if (!startedAt) return;
+  const elapsed = now - startedAt;
+  if (elapsed >= ARRIVAL_FLASH_MS) {
+    arrivalStartedAtByKey.delete(fullKey);
+    return;
+  }
+  card.classList.add("is-new-arrival");
+  if (elapsed > 0) {
+    card.style.animationDelay = `-${elapsed}ms`;
+  }
+  card.addEventListener(
+    "animationend",
+    () => {
+      card.classList.remove("is-new-arrival");
+      card.style.animationDelay = "";
+      arrivalStartedAtByKey.delete(fullKey);
+    },
+    { once: true }
+  );
+}
+
+function ensureScoutElapsedTimer() {
+  if (scoutElapsedTimer !== null) return;
+  scoutElapsedTimer = window.setInterval(() => {
+    const run = state.liveScoutRun;
+    if (!run) {
+      clearScoutElapsedTimer();
+      return;
+    }
+    const el = chatStream.querySelector("[data-scout-elapsed]");
+    if (el) {
+      const secs = Math.max(0, Math.floor((Date.now() - Number(run.started_at_ms || Date.now())) / 1000));
+      el.textContent = `${secs}s`;
+    }
+  }, 1000);
+}
+
+function clearScoutElapsedTimer() {
+  if (scoutElapsedTimer !== null) {
+    window.clearInterval(scoutElapsedTimer);
+    scoutElapsedTimer = null;
+  }
+}
+
+function scrollChatToBottom({ deferred = true } = {}) {
+  chatPinnedToBottom = true;
+  chatStream.scrollTop = chatStream.scrollHeight;
+  if (!deferred || typeof requestAnimationFrame !== "function") return;
+  if (pendingScrollRaf !== null) {
+    cancelAnimationFrame(pendingScrollRaf);
+  }
+  pendingScrollRaf = requestAnimationFrame(() => {
+    pendingScrollRaf = null;
+    if (chatPinnedToBottom) {
+      chatStream.scrollTop = chatStream.scrollHeight;
+    }
+  });
+}
+
+function resolveActivityAfterCount(act, messages) {
+  if (act.afterMsgId) {
+    const idIdx = messages.findIndex((m) => m && m.id === act.afterMsgId);
+    if (idIdx >= 0) return idIdx + 1;
+  }
+  const tsStr = act.timestamp || act.anchorTimestamp;
+  const actMs = tsStr ? Date.parse(tsStr) : NaN;
+  if (Number.isFinite(actMs)) {
+    for (let i = 0; i < messages.length; i += 1) {
+      const msgMs = messages[i] && messages[i].created_at ? Date.parse(messages[i].created_at) : NaN;
+      if (Number.isFinite(msgMs) && msgMs > actMs) {
+        return i;
+      }
+    }
+    return messages.length;
+  }
+  if (act.afterMsgId === null) return 0;
+  return act.afterMsgIndex !== undefined ? Number(act.afterMsgIndex) : messages.length;
+}
 
 export function initChat() {
+  chatStream.addEventListener(
+    "scroll",
+    () => {
+      if (isRenderingChat) return;
+      const dist = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight;
+      chatPinnedToBottom = dist < 48;
+    },
+    { passive: true }
+  );
+  if (typeof ResizeObserver === "function") {
+    const ro = new ResizeObserver(() => {
+      if (!isRenderingChat && chatPinnedToBottom) {
+        chatStream.scrollTop = chatStream.scrollHeight;
+      }
+    });
+    ro.observe(chatStream);
+  }
+
   on("chat:loaded", () => renderMessages({ preserveScroll: false }));
   on("chat:refresh-badges", () => renderMessages({ preserveScroll: true }));
   on("chat:live-exec", updateLiveExecPreview);
@@ -30,6 +149,8 @@ export function initChat() {
       if (!state.sessionActivities[state.activeSessionId]) {
         state.sessionActivities[state.activeSessionId] = [];
       }
+      const msgs = state.messages || [];
+      const errNow = new Date().toISOString();
       state.sessionActivities[state.activeSessionId].push({
         id: errKey,
         batchKey: errKey,
@@ -37,8 +158,10 @@ export function initChat() {
         status: "err",
         title: "Companion encountered an error",
         errorText: text,
-        afterMsgIndex: (state.messages || []).length,
-        timestamp: new Date().toISOString(),
+        afterMsgIndex: msgs.length,
+        afterMsgId: msgs.length > 0 ? msgs[msgs.length - 1].id : null,
+        anchorTimestamp: errNow,
+        timestamp: errNow,
       });
       state.lastErrorContext = {
         sessionId: state.activeSessionId,
@@ -71,15 +194,28 @@ export function initChat() {
     `;
     appendTimestampFooter(card, new Date().toISOString());
     chatStream.appendChild(card);
-    chatStream.scrollTop = chatStream.scrollHeight;
+    scrollChatToBottom({ deferred: true });
   });
 }
 
 function renderMessages({ preserveScroll = false } = {}) {
   const prevTop = chatStream.scrollTop;
-  const wasNearBottom = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight < 36;
+  const distFromBottom = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight;
+  const wasNearBottom = distFromBottom < 72 || chatPinnedToBottom;
+  const shouldStickToBottom = !preserveScroll || wasNearBottom;
+  isRenderingChat = true;
+  try {
+    chatStream.innerHTML = "";
+  const sid = state.activeSessionId || "__none__";
+  const isBaseline = sid !== lastRenderedSessionId || !seenCardKeysBySession.has(sid);
+  let seen = seenCardKeysBySession.get(sid);
+  if (!seen) {
+    seen = new Set();
+    seenCardKeysBySession.set(sid, seen);
+  }
+  lastRenderedSessionId = state.activeSessionId || null;
+  const renderCtx = { sid, seen, isBaseline, now: Date.now() };
 
-  chatStream.innerHTML = "";
   const activities = (state.activeSessionId && state.sessionActivities[state.activeSessionId]) || [];
   const checkpoints = (state.checkpoints || []).filter(
     (cp) => !state.activeSessionId || cp.session_id === state.activeSessionId
@@ -123,25 +259,31 @@ function renderMessages({ preserveScroll = false } = {}) {
   const sortedCheckpoints = [...checkpoints].sort(
     (a, b) => Number(a.after_msg_index ?? 0) - Number(b.after_msg_index ?? 0)
   );
-  const sortedActivities = [...activities].sort(
-    (a, b) => Number(a.afterMsgIndex ?? Infinity) - Number(b.afterMsgIndex ?? Infinity)
-  );
+  const sortedActivities = activities
+    .map((act) => ({
+      act,
+      resolvedIndex: resolveActivityAfterCount(act, state.messages),
+    }))
+    .sort((a, b) => {
+      if (a.resolvedIndex !== b.resolvedIndex) return a.resolvedIndex - b.resolvedIndex;
+      return String(a.act.timestamp || "").localeCompare(String(b.act.timestamp || ""));
+    });
   let cpCursor = 0;
   let actCursor = 0;
   const flushInterleavedUpTo = (count) => {
     while (cpCursor < sortedCheckpoints.length) {
       const target = Number(sortedCheckpoints[cpCursor].after_msg_index ?? 0);
       if (target <= count) {
-        renderCheckpointCard(sortedCheckpoints[cpCursor]);
+        renderCheckpointCard(sortedCheckpoints[cpCursor], renderCtx);
         cpCursor += 1;
       } else {
         break;
       }
     }
     while (actCursor < sortedActivities.length) {
-      const target = sortedActivities[actCursor].afterMsgIndex;
-      if (target !== undefined && Number(target) <= count) {
-        renderActivityCard(sortedActivities[actCursor], actCursor === sortedActivities.length - 1);
+      const entry = sortedActivities[actCursor];
+      if (entry.resolvedIndex <= count) {
+        renderActivityCard(entry.act, actCursor === sortedActivities.length - 1, renderCtx);
         actCursor += 1;
       } else {
         break;
@@ -152,11 +294,40 @@ function renderMessages({ preserveScroll = false } = {}) {
   flushInterleavedUpTo(0);
   let renderedMsgCount = 0;
 
+  const latestScriptOutcomeByPath = new Map();
+  for (const msg of state.messages) {
+    if (msg.role !== "tool_event") continue;
+    try {
+      const ev = JSON.parse(msg.text);
+      const resp = ev && ev.response ? ev.response : {};
+      if (
+        resp.path &&
+        ((resp.written && resp.executed) ||
+          ev.tool_name === "run_script" ||
+          ev.tool_name === "run_and_delete_script")
+      ) {
+        const passed = resp.exit_code === 0 && !resp.has_traceback;
+        latestScriptOutcomeByPath.set(resp.path, {
+          passed,
+          deleted: Boolean(resp.deleted),
+        });
+      }
+    } catch {
+      // skip malformed
+    }
+  }
+
   for (const item of items) {
     if (item.kind === "batch") {
       const keepCopyControls = item.batchIndex >= totalBatches - RECENT_COPY_BALLOON_LIMIT;
       const isLatestBatch = item.batchIndex === totalBatches - 1;
-      renderToolBatchCard(item.batch, keepCopyControls, isLatestBatch);
+      renderToolBatchCard(
+        item.batch,
+        keepCopyControls,
+        isLatestBatch,
+        latestScriptOutcomeByPath,
+        renderCtx
+      );
       renderedMsgCount += item.batch.length;
       flushInterleavedUpTo(renderedMsgCount);
       continue;
@@ -165,6 +336,7 @@ function renderMessages({ preserveScroll = false } = {}) {
     const msg = item.msg;
     const card = document.createElement("article");
     card.className = `msg-card ${msg.role === "user" ? "msg-user" : "msg-model"}`;
+    applyArrivalFlash(card, msg.id ? `msg:${msg.id}` : null, renderCtx);
 
     const usageStr = msg.token_usage
       ? `In ${msg.token_usage.input_tokens} · Out ${msg.token_usage.output_tokens} · Think ${msg.token_usage.thinking_tokens}`
@@ -187,6 +359,9 @@ function renderMessages({ preserveScroll = false } = {}) {
           img.className = "thumb-img";
           img.src = att.content;
           img.alt = att.label;
+          if (shouldStickToBottom) {
+            img.addEventListener("load", () => scrollChatToBottom({ deferred: false }), { once: true });
+          }
           attWrap.appendChild(img);
         } else {
           const span = document.createElement("span");
@@ -221,11 +396,11 @@ function renderMessages({ preserveScroll = false } = {}) {
   }
 
   while (cpCursor < sortedCheckpoints.length) {
-    renderCheckpointCard(sortedCheckpoints[cpCursor]);
+    renderCheckpointCard(sortedCheckpoints[cpCursor], renderCtx);
     cpCursor += 1;
   }
   while (actCursor < sortedActivities.length) {
-    renderActivityCard(sortedActivities[actCursor], actCursor === sortedActivities.length - 1);
+    renderActivityCard(sortedActivities[actCursor].act, actCursor === sortedActivities.length - 1, renderCtx);
     actCursor += 1;
   }
 
@@ -246,17 +421,33 @@ function renderMessages({ preserveScroll = false } = {}) {
     chatStream.appendChild(pendingCard);
   }
 
-  if (preserveScroll && !wasNearBottom) {
-    chatStream.scrollTop = prevTop;
-  } else {
-    chatStream.scrollTop = chatStream.scrollHeight;
-  }
   if (!preserveScroll) {
     emit("gates:changed");
   }
+  chatPinnedToBottom = shouldStickToBottom;
+  if (!shouldStickToBottom) {
+    chatStream.scrollTop = prevTop;
+  } else {
+    scrollChatToBottom({ deferred: true });
+  }
+  } finally {
+    isRenderingChat = false;
+  }
 }
 
-function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = false) {
+function isStaticScriptFailureText(text) {
+  return /^(?:[A-Za-z_][A-Za-z0-9_]*\.)?(?:SyntaxError|IndentationError|TabError|ImportError|ModuleNotFoundError|NameError|UnboundLocalError)\s*:/m.test(
+    String(text || "")
+  );
+}
+
+function renderToolBatchCard(
+  rawMessages,
+  keepCopyControls,
+  isLatestBatch = false,
+  latestScriptOutcomeByPath = null,
+  renderCtx = null
+) {
   const events = [];
   for (const m of rawMessages) {
     try {
@@ -321,6 +512,7 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
 
   const card = document.createElement("article");
   card.className = "msg-card msg-companion";
+  applyArrivalFlash(card, batchKey, renderCtx);
 
   let badgeHtml = `<span class="mono tabular">${escapeHtml(sizeStr)} · ~${totalEstTokens.toLocaleString()} tok</span>`;
   let headline = "";
@@ -344,9 +536,13 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
           : "Script run (kept for patching)"
         : lastExec._toolName === "run_script"
           ? "Executed script"
-          : lastExec.deleted
-            ? "Proposed script executed & deleted"
-            : "Proposed script executed";
+          : lastExec._toolName === "propose_inspection_script"
+            ? lastExec.deleted
+              ? "Inspection script executed & deleted"
+              : "Inspection script executed"
+            : lastExec.deleted
+              ? "Proposed script executed & deleted"
+              : "Proposed script executed";
     headline = `${prefix}: ${lastExec.path} (${lastExec.duration_ms ?? 0}ms) · View full output in Console`;
   } else if (testRuns.length > 0 && !hasErrors) {
     const lastTest = testRuns[testRuns.length - 1];
@@ -437,7 +633,24 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
   }
 
   const proj = getActiveProject();
-  if (executedScripts.length > 0 || testRuns.length > 0 || (hasAppliedPatch && proj && proj.post_patch_command)) {
+  const retryableScripts = executedScripts.filter((execResp) => {
+    const ok = execResp.exit_code === 0 && !execResp.has_traceback;
+    if (ok || execResp.deleted || !execResp.path) return false;
+    if (execResp.retryable === false || execResp.failure_kind === "static") return false;
+    if (execResp.retryable !== true && isStaticScriptFailureText(execResp.output_preview)) return false;
+    if (latestScriptOutcomeByPath && latestScriptOutcomeByPath.has(execResp.path)) {
+      const latest = latestScriptOutcomeByPath.get(execResp.path);
+      if (latest.passed || latest.deleted) return false;
+    }
+    return true;
+  });
+
+  if (
+    executedScripts.length > 0 ||
+    testRuns.length > 0 ||
+    retryableScripts.length > 0 ||
+    (hasAppliedPatch && proj && proj.post_patch_command)
+  ) {
     const actRow = document.createElement("div");
     actRow.className = "exec-actions";
     if (executedScripts.length > 0 || testRuns.length > 0) {
@@ -450,6 +663,46 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
         emit("drawer:switch-tab", "terminal");
       });
       actRow.appendChild(openBtn);
+    }
+    for (const failExec of retryableScripts) {
+      const baseName = String(failExec.path).split(/[\\/]/).pop() || failExec.path;
+      const retryBtn = document.createElement("button");
+      retryBtn.type = "button";
+      retryBtn.className = "btn btn-primary btn-xs";
+      retryBtn.disabled = Boolean(state.busy);
+      retryBtn.textContent =
+        retryableScripts.length > 1 ? `Retry ${baseName}` : "Retry Script";
+      retryBtn.title = `Re-run ${failExec.path} after resolving the runtime/environment issue`;
+      retryBtn.addEventListener("click", async () => {
+        if (!state.activeSessionId || state.busy) return;
+        const autoDelete =
+          typeof failExec.auto_delete_on_success === "boolean"
+            ? failExec.auto_delete_on_success
+            : failExec._toolName === "run_and_delete_script" || Boolean(failExec.kept_for_patching);
+        state.busy = true;
+        state.liveExec = null;
+        state.pendingStatusText = `Retrying ${failExec.path}...`;
+        emit("gates:changed");
+        emit("chat:loaded");
+        try {
+          const res = await api.retryScript({
+            session_id: state.activeSessionId,
+            path: failExec.path,
+            args: failExec.args || null,
+            auto_delete: autoDelete,
+            tool_name: failExec._toolName || "run_and_delete_script",
+          });
+          applyGateResponse(res, "retry_script");
+        } catch (err) {
+          state.busy = false;
+          state.pendingStatusText = null;
+          state.liveExec = null;
+          emit("gates:changed");
+          emit("chat:loaded");
+          emit("chat:error", err.message);
+        }
+      });
+      actRow.appendChild(retryBtn);
     }
     if (hasAppliedPatch && testRuns.length === 0 && proj && proj.post_patch_command) {
       const testBtn = document.createElement("button");
@@ -583,11 +836,12 @@ function renderToolBatchCard(rawMessages, keepCopyControls, isLatestBatch = fals
   chatStream.appendChild(card);
 }
 
-function renderActivityCard(act, isLatestActivity = false) {
+function renderActivityCard(act, isLatestActivity = false, renderCtx = null) {
   if (act.kind === "error") {
     const errText = act.errorText || act.title || "Error";
     const card = document.createElement("article");
     card.className = "msg-card msg-companion msg-exec is-err";
+    applyArrivalFlash(card, act.id ? `act:${act.id}` : null, renderCtx);
     card.innerHTML = `
       <div class="msg-header">
         <span class="msg-role">You · Companion</span>
@@ -648,6 +902,7 @@ function renderActivityCard(act, isLatestActivity = false) {
   const card = document.createElement("article");
   const statusCls = act.status === "ok" ? "is-ok" : act.status === "err" ? "is-err" : "";
   card.className = `msg-card msg-exec ${statusCls}`.trim();
+  applyArrivalFlash(card, act.id ? `act:${act.id}:${act.status || "info"}` : null, renderCtx);
   const badgeText = act.status === "ok" ? "Validated (exit 0)" : act.status === "err" ? "Possible errors" : "Running";
   const badgeCls = act.status === "ok" ? "is-ok" : act.status === "err" ? "is-err" : "is-running";
   card.innerHTML = `
@@ -760,7 +1015,7 @@ function renderActivityCard(act, isLatestActivity = false) {
   chatStream.appendChild(card);
 }
 
-function renderCheckpointCard(cp) {
+function renderCheckpointCard(cp, renderCtx = null) {
   const status = cp.status || "active";
   const statusCls = status === "active" ? "is-active" : status === "committed" ? "is-committed" : "is-restored";
   const badgeCls = status === "active" ? "is-ok" : status === "committed" ? "is-committed" : "is-restored";
@@ -789,6 +1044,7 @@ function renderCheckpointCard(cp) {
 
   const card = document.createElement("article");
   card.className = `msg-card msg-checkpoint ${statusCls}`;
+  applyArrivalFlash(card, cp.id ? `cp:${cp.id}` : null, renderCtx);
   card.innerHTML = `
     <div class="msg-header">
       <span class="msg-role">Companion · Savepoint</span>
@@ -1015,7 +1271,7 @@ function formatToolCallSummary(tc) {
   if (name === "write_file") return `write_file(${a.path || ""})`;
   if (name === "delete_file") return `delete_file(${a.path || ""})`;
   if (name === "rename_file") return `rename_file(${a.old_path || ""} -> ${a.new_path || ""})`;
-  if (name === "propose_script") return `propose_script(${a.path || ""})`;
+  if (name === "propose_inspection_script" || name === "propose_script") return `${name}(${a.path || ""})`;
   if (name === "run_script") return `run_script(${a.path || ""}${a.args ? `, ${a.args}` : ""})`;
   if (name === "run_and_delete_script") {
     return `run_and_delete_script(${a.path || ""}${a.args ? `, ${a.args}` : ""})`;
@@ -1038,21 +1294,34 @@ function handleScoutStreamEvent(msg) {
       model: msg.model || "lite",
       max_steps: Number(msg.max_steps || 8),
       max_tokens: Number(msg.max_tokens || 30000),
+      active_step: 0,
+      phase: "Starting Local AI Scout...",
+      started_at_ms: Date.now(),
       steps: [],
       hops: [],
       paused: false,
       stopped: false,
       tokens_used: 0,
     };
+    ensureScoutElapsedTimer();
     emit("chat:refresh-badges");
     return;
   }
   if (!state.liveScoutRun || (msg.run_id && state.liveScoutRun.run_id !== msg.run_id)) {
     return;
   }
-  if (msg.type === "scout_step") {
+  if (msg.type === "scout_phase") {
     if (msg.model) state.liveScoutRun.model = msg.model;
     if (msg.tokens_used !== undefined) state.liveScoutRun.tokens_used = Number(msg.tokens_used || 0);
+    if (msg.active_step !== undefined) state.liveScoutRun.active_step = Number(msg.active_step || 0);
+    if (msg.max_steps) state.liveScoutRun.max_steps = Number(msg.max_steps);
+    if (msg.phase) state.liveScoutRun.phase = String(msg.phase);
+    emit("chat:refresh-badges");
+  } else if (msg.type === "scout_step") {
+    if (msg.model) state.liveScoutRun.model = msg.model;
+    if (msg.tokens_used !== undefined) state.liveScoutRun.tokens_used = Number(msg.tokens_used || 0);
+    if (msg.step !== undefined) state.liveScoutRun.active_step = Number(msg.step || 0);
+    state.liveScoutRun.phase = `${msg.tool || "read"}: ${msg.summary || "done"}`;
     state.liveScoutRun.steps.push({
       step: msg.step,
       max_steps: msg.max_steps || state.liveScoutRun.max_steps,
@@ -1063,6 +1332,7 @@ function handleScoutStreamEvent(msg) {
     emit("chat:refresh-badges");
   } else if (msg.type === "scout_hop") {
     state.liveScoutRun.model = msg.to_model || state.liveScoutRun.model;
+    state.liveScoutRun.phase = `Switched model → ${state.liveScoutRun.model}`;
     state.liveScoutRun.hops.push({
       from_model: msg.from_model,
       to_model: msg.to_model,
@@ -1071,24 +1341,29 @@ function handleScoutStreamEvent(msg) {
     emit("chat:refresh-badges");
   } else if (msg.type === "scout_paused") {
     state.liveScoutRun.paused = Boolean(msg.paused);
+    state.liveScoutRun.phase = state.liveScoutRun.paused ? "Paused by user" : "Resumed";
     emit("chat:refresh-badges");
   } else if (msg.type === "scout_done") {
     state.liveScoutRun = null;
+    clearScoutElapsedTimer();
     emit("chat:refresh-badges");
     emit("telemetry:refresh");
   }
 }
 
 function renderLiveScoutCard(run) {
+  ensureScoutElapsedTimer();
   const card = document.createElement("article");
   card.className = "msg-card scout-live-card";
-  const stepCount = run.steps.length;
+  const highestRecordedStep = run.steps.reduce((acc, s) => Math.max(acc, Number(s.step || 0)), 0);
+  const displayStep = Math.max(highestRecordedStep, Number(run.active_step || 0));
   const statusLabel = run.stopped
     ? "Stopping..."
     : run.paused
       ? "Paused"
-      : `Step ${stepCount}/${run.max_steps}`;
+      : `Step ${displayStep}/${run.max_steps}`;
   const badgeCls = run.paused ? "is-restored" : "is-running";
+  const elapsedSec = Math.max(0, Math.floor((Date.now() - Number(run.started_at_ms || Date.now())) / 1000));
 
   card.innerHTML = `
     <div class="msg-header">
@@ -1096,7 +1371,8 @@ function renderLiveScoutCard(run) {
       <span class="exec-badge ${badgeCls}">${escapeHtml(statusLabel)}</span>
     </div>
     <div class="companion-summary-line">${escapeHtml(run.goal || "Investigating workspace...")}</div>
-    <div class="meta-line mono tabular mt-2">Scope: ${escapeHtml(run.subpath || ".")} · ~${Number(run.tokens_used || 0).toLocaleString()} / ${Number(run.max_tokens || 30000).toLocaleString()} tok</div>
+    <div class="meta-line mono tabular mt-2">Scope: ${escapeHtml(run.subpath || ".")} · ~${Number(run.tokens_used || 0).toLocaleString()} / ${Number(run.max_tokens || 30000).toLocaleString()} tok · <span data-scout-elapsed>${elapsedSec}s</span></div>
+    <div class="meta-line mono mt-1" data-scout-phase>${escapeHtml(run.phase || "Working...")}</div>
   `;
 
   if (run.hops && run.hops.length > 0) {
@@ -1177,19 +1453,24 @@ function formatLivePreviewSlice(rawOutput) {
 function updateLiveExecPreview(payload) {
   const slice = formatLivePreviewSlice(payload && payload.output);
   const targets = Array.from(document.querySelectorAll("[data-live-exec], [data-live-activity]"));
+  const gatesEl = document.getElementById("pending-gates");
 
-  const wasNearBottom = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight < 48;
+  const wasNearBottom = chatStream.scrollHeight - chatStream.scrollTop - chatStream.clientHeight < 72;
   for (const el of targets) {
     if (slice) {
+      const wasHidden = el.classList.contains("hidden");
       el.classList.remove("hidden");
       el.textContent = slice;
       el.scrollTop = el.scrollHeight;
+      if (wasHidden && gatesEl && gatesEl.contains(el) && typeof el.scrollIntoView === "function") {
+        el.scrollIntoView({ block: "nearest" });
+      }
     } else if (payload && payload.type === "start") {
       el.textContent = "";
     }
   }
   if (wasNearBottom) {
-    chatStream.scrollTop = chatStream.scrollHeight;
+    scrollChatToBottom({ deferred: false });
   }
 }
 
