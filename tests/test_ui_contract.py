@@ -108,6 +108,7 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn("resolveActivityAfterCount", chat_js)
         self.assertIn("scrollChatToBottom", chat_js)
         self.assertIn("applyArrivalFlash", chat_js)
+        self.assertIn("gateTrayShowingStatus", chat_js)
         self.assertIn(".msg-card.is-new-arrival", comp_css)
         self.assertIn("chat:live-exec", chat_js)
         self.assertIn("scout_phase", chat_js)
@@ -216,6 +217,7 @@ class TestUiDomContract(unittest.TestCase):
             "btn-save-companion-settings",
         ):
             self.assertIn(f'id="{req_settings_id}"', html)
+        self.assertIn("--flash-accent-ring", tokens_css)
         for theme_id in ("midnight", "darcula", "nordic-slate", "light", "warm-paper", "espresso", "forest-night"):
             self.assertIn(theme_id, theme_js)
             if theme_id != "midnight":

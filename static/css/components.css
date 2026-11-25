@@ -704,13 +704,14 @@ body.mode-api .bridge-only {
 }
 
 @keyframes card-arrival-flash {
-  0% {
-    border-color: var(--accent-text);
-    box-shadow: 0 0 0 2px var(--accent-border), 0 0 18px var(--accent-soft);
+  0%,
+  18% {
+    border-color: var(--flash-accent-border);
+    box-shadow: 0 0 0 2.5px var(--flash-accent-ring), 0 0 24px var(--flash-accent-glow);
   }
-  22% {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent-border), 0 0 10px var(--accent-soft);
+  55% {
+    border-color: var(--accent-text);
+    box-shadow: 0 0 0 1px var(--accent-border), 0 0 12px var(--accent-soft);
   }
   100% {
     box-shadow: 0 0 0 0 transparent;
@@ -718,13 +719,14 @@ body.mode-api .bridge-only {
 }
 
 @keyframes card-arrival-flash-ok {
-  0% {
-    border-color: var(--success-text);
-    box-shadow: 0 0 0 2px var(--success-border), 0 0 18px var(--success-soft);
+  0%,
+  18% {
+    border-color: var(--flash-ok-border);
+    box-shadow: 0 0 0 2.5px var(--flash-ok-ring), 0 0 24px var(--flash-ok-glow);
   }
-  22% {
-    border-color: var(--success);
-    box-shadow: 0 0 0 1px var(--success-border), 0 0 10px var(--success-soft);
+  55% {
+    border-color: var(--success-text);
+    box-shadow: 0 0 0 1px var(--success-border), 0 0 12px var(--success-soft);
   }
   100% {
     box-shadow: 0 0 0 0 transparent;
@@ -732,13 +734,14 @@ body.mode-api .bridge-only {
 }
 
 @keyframes card-arrival-flash-err {
-  0% {
-    border-color: var(--danger-text);
-    box-shadow: 0 0 0 2px var(--danger-border), 0 0 18px var(--danger-soft);
+  0%,
+  18% {
+    border-color: var(--flash-err-border);
+    box-shadow: 0 0 0 2.5px var(--flash-err-ring), 0 0 24px var(--flash-err-glow);
   }
-  22% {
-    border-color: var(--danger);
-    box-shadow: 0 0 0 1px var(--danger-border), 0 0 10px var(--danger-soft);
+  55% {
+    border-color: var(--danger-text);
+    box-shadow: 0 0 0 1px var(--danger-border), 0 0 12px var(--danger-soft);
   }
   100% {
     box-shadow: 0 0 0 0 transparent;
@@ -746,13 +749,14 @@ body.mode-api .bridge-only {
 }
 
 @keyframes card-arrival-flash-warn {
-  0% {
-    border-color: var(--warning-text);
-    box-shadow: 0 0 0 2px var(--warning-border), 0 0 18px var(--warning-soft);
+  0%,
+  18% {
+    border-color: var(--flash-warn-border);
+    box-shadow: 0 0 0 2.5px var(--flash-warn-ring), 0 0 24px var(--flash-warn-glow);
   }
-  22% {
-    border-color: var(--warning);
-    box-shadow: 0 0 0 1px var(--warning-border), 0 0 10px var(--warning-soft);
+  55% {
+    border-color: var(--warning-text);
+    box-shadow: 0 0 0 1px var(--warning-border), 0 0 12px var(--warning-soft);
   }
   100% {
     box-shadow: 0 0 0 0 transparent;
@@ -760,7 +764,7 @@ body.mode-api .bridge-only {
 }
 
 .msg-card.is-new-arrival {
-  animation: card-arrival-flash 2.6s ease-out;
+  animation: card-arrival-flash 3.2s ease-in-out;
 }
 
 .msg-card.msg-exec.is-ok.is-new-arrival,

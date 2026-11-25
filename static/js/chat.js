@@ -14,7 +14,7 @@ import { applyGateResponse } from "./tool_gates.js";
 
 const chatStream = document.getElementById("chat-stream");
 const RECENT_COPY_BALLOON_LIMIT = 2;
-const ARRIVAL_FLASH_MS = 2600;
+const ARRIVAL_FLASH_MS = 3200;
 let pendingScrollRaf = null;
 let chatPinnedToBottom = true;
 let isRenderingChat = false;
@@ -220,12 +220,16 @@ function renderMessages({ preserveScroll = false } = {}) {
   const checkpoints = (state.checkpoints || []).filter(
     (cp) => !state.activeSessionId || cp.session_id === state.activeSessionId
   );
+  const gateTrayShowingStatus =
+    Boolean(state.resolvingGateId) &&
+    (state.pendingGates || []).length > 0 &&
+    !state.gatesHiddenDueToError;
   const hasAnything =
     state.messages.length > 0 ||
     activities.length > 0 ||
     checkpoints.length > 0 ||
     Boolean(state.liveScoutRun) ||
-    Boolean(state.pendingStatusText);
+    Boolean(state.pendingStatusText && !gateTrayShowingStatus);
 
   if (!hasAnything) {
     chatStream.innerHTML = `
@@ -406,7 +410,7 @@ function renderMessages({ preserveScroll = false } = {}) {
 
   if (state.liveScoutRun) {
     renderLiveScoutCard(state.liveScoutRun);
-  } else if (state.pendingStatusText) {
+  } else if (state.pendingStatusText && !gateTrayShowingStatus) {
     const liveSlice = formatLivePreviewSlice(state.liveExec && state.liveExec.output);
     const pendingCard = document.createElement("article");
     pendingCard.className = "msg-card msg-exec";
