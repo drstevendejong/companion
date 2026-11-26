@@ -79,7 +79,7 @@ export function initBridge() {
       closeCopyMenu();
     }
   });
-  copyImgBtn.addEventListener("click", copyNextCdpImage);
+  copyImgBtn.addEventListener("click", copyNextImage);
   clipboardParseBtn.addEventListener("click", () => handleClipboardQuickParse(true));
   closePasteBtn.addEventListener("click", () => setManualPasteOpen(false, false));
 
@@ -508,7 +508,7 @@ function syncImageCopyButton() {
   const allImgs = imgs.length ? imgs : queuedImages;
   if (allImgs.length > 0) {
     copyImgBtn.classList.remove("hidden");
-    copyImgBtn.textContent = allImgs.length > 1 ? `Copy CDP Image (${allImgs.length})` : "Copy CDP Image";
+    copyImgBtn.textContent = allImgs.length > 1 ? `Copy Image (${allImgs.length})` : "Copy Image";
   } else {
     copyImgBtn.classList.add("hidden");
   }
@@ -573,7 +573,7 @@ async function copyPromptBundle(forceIncludeDirectives = null) {
   }
 }
 
-async function copyNextCdpImage() {
+async function copyNextImage() {
   const imgs = (state.attachments || []).filter((a) => a.kind === "image");
   const target = imgs[0] || queuedImages[0];
   if (!target) return;
@@ -642,9 +642,13 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true, opts = {}) {
   let hasErrorOutcome = false;
   state.gatesHiddenDueToError = false;
   state.lastErrorContext = null;
+  state.pendingStartedAtMs = Date.now();
+  state.liveExec = null;
 
   try {
     const res = await api.bridgeParse(state.activeSessionId, raw, autoApproveReads);
+    state.pendingStartedAtMs = null;
+    state.liveExec = null;
     pasteInput.value = "";
     pasteHint.textContent = DEFAULT_PASTE_HINT;
     if (opts.clearPromptOnRun) {
@@ -659,9 +663,24 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true, opts = {}) {
     state.pendingGates = res.pending_gates || [];
     if (Array.isArray(res.checkpoints)) state.checkpoints = res.checkpoints;
 
+    if (res.patch_record) {
+      emit("backups:refresh");
+      emit("git:refresh");
+      emit("tree:refresh");
+    }
+    const cmdResults = Array.isArray(res.command_results)
+      ? res.command_results
+      : res.command_result
+        ? [res.command_result]
+        : [];
+    for (const cr of cmdResults) {
+      emit("terminal:show-result", cr);
+    }
+
     const errorCount = Number(res.error_count || 0);
     const warnings = Array.isArray(res.warnings) ? res.warnings : [];
     const extraWarnings = warnings.slice(errorCount);
+    const proj = getActiveProject();
 
     if (errorCount > 0) {
       hasErrorOutcome = true;
@@ -678,11 +697,21 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true, opts = {}) {
       if (copyPayload) {
         copyOutcome = await tryAutoCopyResult(errBatchKey, copyPayload);
       }
+    } else if (state.pendingGates.length === 0 && res.generated_md_content) {
+      const batchKey = getTrailingToolBatchKey(res.messages);
+      if (proj && res.generated_md_path) {
+        setCachedGeneratedMd(proj.id, res.generated_md_path, res.generated_md_content);
+      }
+      if (batchKey) {
+        copyOutcome = await tryAutoCopyResult(batchKey, res.generated_md_content);
+      }
     } else if (state.pendingGates.length === 0 && res.bridge_reply_text) {
       const batchKey = getTrailingToolBatchKey(res.messages);
       if (batchKey) {
         copyOutcome = await tryAutoCopyResult(batchKey, res.bridge_reply_text);
       }
+    } else if (Array.isArray(res.generated_md_files) && res.generated_md_files.length > 0) {
+      emit("bridge:generated-md", res.generated_md_files);
     }
 
     if (res.telemetry) {
@@ -694,8 +723,13 @@ async function parseRawMarkdown(rawInput, autoApproveReads = true, opts = {}) {
       emit("chat:error", `Bridge parse warnings:\n${extraWarnings.join("\n")}`);
     }
   } catch (err) {
+    state.pendingStartedAtMs = null;
+    state.liveExec = null;
+    emit("chat:loaded");
     emit("chat:error", err.message);
   } finally {
+    state.pendingStartedAtMs = null;
+    state.liveExec = null;
     parseBtn.disabled = false;
     clipboardParseBtn.disabled = false;
     if (detectRunBtn) detectRunBtn.disabled = false;

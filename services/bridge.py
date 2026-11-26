@@ -14,7 +14,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import DEFAULT_IGNORE_PATTERNS
 from models import AttachmentItem, ProjectProfile
@@ -39,15 +39,41 @@ STRICT OUTPUT RULES:
 4) HARD STOP: End your response IMMEDIATELY after the closing ``` (or end of code). Never emit `Output:`, `Wait for output`, `## Local Workspace Tool Results`, or any trailing prose afterward (Companion truncates anything after the code block).
 
 RECOMMENDED ZERO-ESCAPING CODE FORMATS (NO JSON STRING ESCAPING NEEDED):
-A) Surgical Code Edits (`patch_literal`) — emit one or more ```patch blocks with `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`:
+A) Surgical Code Edits inside ```patch — pick whichever form is most token-efficient for the edit:
+1. Tight literal hunk (`patch_literal`) — for small/localized edits, include ONLY 2–4 unchanged boundary lines around the changed lines (never dump a whole 100-line function to change 5 lines; use multiple small hunks in one ```patch block for scattered edits):
 ```patch
 # path: path/to/file.py
 # summary: 1-line reason
 <<<<<<< SEARCH
-exact existing lines (indentation preserved verbatim)
+exact existing boundary lines (indentation preserved verbatim)
 =======
 replacement lines (indentation preserved verbatim)
 >>>>>>> REPLACE
+```
+2. Ellipsis `...` span inside `SEARCH` — to replace/delete a large block without knowing line numbers, emit 2–3 unique start lines, `...` on its own line, and 2–3 unique end lines (deterministic literal matching—NO regex; both start and end anchors must match uniquely):
+```patch
+# path: path/to/file.py
+# summary: Replace large block via unique start/end anchors
+<<<<<<< SEARCH
+def big_func(arg):
+    first_unique_line()
+    ...
+    last_unique_line()
+    return result
+=======
+def big_func(arg):
+    return fast_path(arg)
+>>>>>>> REPLACE
+```
+3. Anchored line-range replacement (`patch_lines`) — when you read line numbers via `read_lines`/`search_code` and want to rewrite/delete a large range without echoing old code:
+```patch
+# path: path/to/file.py
+# lines: 140-295
+# expect_start: def big_func(arg):
+# expect_end: return result
+# summary: Rewrite big_func cleanly
+def big_func(arg):
+    return fast_path(arg)
 ```
 
 B) Temporary Inspection / Verification Scripts (`propose_inspection_script` — NEVER for code edits; auto-deletes cleanly on exit 0 without leaving a savepoint) — state `Inspection script (path.py): ...` in the one-liner and emit a raw ```python block:
@@ -62,9 +88,16 @@ print("diagnostic output")
 C) New Files / Full Rewrites (`write_file`) — state `New file (path/to/file.ext): ...` in the one-liner and emit a fenced block in the target language with top directive comments:
 `# tool: write_file`, `# path: path/to/file.py`, `# summary: 1-line reason` (also supports `// ...` or `<!-- ... -->`).
 
-JSON COMMAND TOOLS (ideal for reads, searches, file ops, tests, and re-running failed scripts):
-- {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block", "new_text": "replacement", "summary": "1-line reason"}
-- {"tool": "patch_lines", "path": "path/to/file", "start_line": 10, "end_line": 20, "new_text": "replacement", "summary": "1-line reason"}
+JSON COMMAND TOOLS (ideal for searches, targeted reads, file ops, tests, and re-running failed scripts):
+- {"tool": "scout_workspace", "goal": "Find root cause of X / trace how Y reaches Z", "subpath": ".", "max_steps": 8} (**PREFER FIRST when Scout is ENABLED** for multi-file bug hunting or unfamiliar call paths — runs in an ephemeral `-lite` loop and returns exact files/lines without bloating main chat context!)
+- {"tool": "extract_headers", "pattern": ".", "include_symbols": true, "max_files": 60} (0-token structural index of file header comments & top-level classes/functions)
+- {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
+- {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120} (preferred for targeted slices once exact file/lines are located)
+- {"tool": "read_file", "path": "path/to/file"} (single small file or full rewrite only — NEVER batch multiple large `read_file` calls to hunt for a bug; use `scout_workspace` when enabled, or `search_code` + `read_lines`)
+- {"tool": "read_command_output", "exec_id": "cmd_...", "start_line": 1, "end_line": 120} (inspect raw stdout/stderr from a buffered command; optional `"pattern"` or `"tail_lines"`, omit `exec_id` for latest)
+- {"tool": "list_tree", "subpath": ".", "max_depth": 3}
+- {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block (or start lines\\n...\\nend lines)", "new_text": "replacement", "summary": "1-line reason"}
+- {"tool": "patch_lines", "path": "path/to/file", "start_line": 10, "end_line": 20, "new_text": "replacement", "expect_start": "optional first-line check", "expect_end": "optional last-line check", "summary": "1-line reason"}
 - {"tool": "write_file", "path": "path/to/file", "content": "full file text", "summary": "1-line reason"}
 - {"tool": "delete_file", "path": "path/to/file", "summary": "1-line reason"} (human-gated delete; auto-backed up first)
 - {"tool": "rename_file", "old_path": "old/path", "new_path": "new/path", "summary": "1-line reason"} (human-gated move/rename; auto-backed up first)
@@ -72,13 +105,11 @@ JSON COMMAND TOOLS (ideal for reads, searches, file ops, tests, and re-running f
 - {"tool": "run_script", "path": "script.py", "summary": "1-line reason"} (human-gated run of a permanent/kept .py script in project Python; optional `"args": "--flag"`)
 - {"tool": "run_and_delete_script", "path": "inspect_tmp.py", "summary": "1-line reason"} (ONLY to re-run a failed temporary script already saved on disk and delete it once it passes; to create+run a new temporary script use `propose_inspection_script`)
 - {"tool": "run_tests", "summary": "1-line reason"} (human-gated full suite — auto-commits savepoint on pass; optional `"fast": true` / `"target": "file"` runs quick check)
-- {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
-- {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120}
-- {"tool": "read_file", "path": "path/to/file"}
-- {"tool": "list_tree", "subpath": ".", "max_depth": 3}
+- {"tool": "update_header", "paths": ["path/to/file1", "path/to/file2"]} (Scout-only: drafts updated top-of-file header comments as human-gated diff patches)
 
 Notes:
-- When you need multiple files/fragments from disk, emit a `propose_inspection_script` (e.g. raw ```python block printing stdout directly; Companion captures stdout and auto-deletes passing temporary scripts without leaving a savepoint). If a temporary script fails and you patch it, call `run_and_delete_script` to re-run and auto-delete once it succeeds.
+- Call `scout_workspace` / `update_header` ONLY when Companion announces `Local AI Scout is NOW ENABLED`.
+- When you need runtime state probing or multi-file mechanical inspection, emit a `propose_inspection_script` (e.g. raw ```python block printing stdout directly; Companion captures stdout and auto-deletes passing temporary scripts without leaving a savepoint). If a temporary inspection script fails and stays on disk, just emit a ```patch targeting it—Companion auto-approves patches/re-runs for already-approved inspection scripts and immediately re-runs & auto-deletes on pass (without needing a follow-up `run_and_delete_script`).
 - Git status, diff viewing, commit message drafting, Commit, and Commit & Push are triggered by the user in Companion's right-drawer Git tab (not via JSON tool calls)."""
 
 
@@ -153,6 +184,8 @@ KNOWN_TOOL_JSON_KEYS = {
     "max_matches",
     "start_line",
     "end_line",
+    "expect_start",
+    "expect_end",
     "old_text",
     "new_text",
     "replace_all",
@@ -258,7 +291,7 @@ def build_prompt_bundle(
     clean_prompt = (prompt or "").strip()
     if image_count > 0:
         sections.append(
-            f"> Note: {image_count} UI screenshot(s) attached locally — use Copy CDP Image to paste image(s) into Playground."
+            f"> Note: {image_count} image(s) attached locally — use Copy Image to paste image(s) into Playground."
         )
 
     if clean_prompt:
@@ -276,6 +309,10 @@ def build_prompt_bundle(
 
     if guardrail_text:
         sections.append(guardrail_text)
+        if scout_enabled is True and not include_directives and not scout_state_notice:
+            sections.append(
+                "> *(Local AI Scout is ON — use `scout_workspace` to locate multi-file bugs instead of batching large `read_file` calls.)*"
+            )
 
     bundle_text = "\n\n".join(s for s in sections if s).strip()
     return {
@@ -867,13 +904,31 @@ def _classify_python_block_intent(
 
 _DIRECTIVE_LINE_RE = re.compile(
     r"^\s*(?:(?:#|//|--)\s*|(?:/\*|<!--)\s*)?"
-    r"(tool|path|file|filename|summary|delete_on_success|replace_all|args|focus)\s*[:=]\s*(.+?)"
+    r"(tool|path|file|filename|lines|line|start_line|end_line|expect_start|expect_end|summary|delete_on_success|replace_all|args|focus)\s*[:=]\s*(.+?)"
     r"(?:\s*(?:\*/|-->))?\s*$",
     re.IGNORECASE,
 )
 _SEARCH_START_RE = re.compile(r"^<{7}\s*(?:SEARCH|ORIGINAL|OLD)?\s*$", re.IGNORECASE)
+_LINE_REPLACE_START_RE = re.compile(r"^<{7}\s*(?:REPLACE(?:MENT)?|NEW)\s*$", re.IGNORECASE)
 _SEARCH_MID_RE = re.compile(r"^={7}\s*$")
-_SEARCH_END_RE = re.compile(r"^>{7}\s*(?:REPLACE|NEW)?\s*$", re.IGNORECASE)
+_SEARCH_END_RE = re.compile(r"^>{7}\s*(?:REPLACE|NEW|END)?\s*$", re.IGNORECASE)
+_LINE_RANGE_RE = re.compile(r"^\s*(\d+)\s*(?:(?:-|\.{2,}|:)\s*(\d+))?\s*$")
+
+
+def _parse_line_range_spec(val: str) -> Optional[Tuple[int, int]]:
+    m = _LINE_RANGE_RE.match(val.strip().strip("`'\"").lstrip("L"))
+    if not m:
+        return None
+    start = int(m.group(1))
+    end = int(m.group(2)) if m.group(2) is not None else start
+    return start, end
+
+
+def _strip_wrapping_backticks(val: str) -> str:
+    s = val.strip()
+    if len(s) >= 2 and s.startswith("`") and s.endswith("`"):
+        return s[1:-1].strip()
+    return s
 
 
 def _parse_bool_directive(val: str) -> Optional[bool]:
@@ -984,15 +1039,12 @@ def _parse_code_block_directives(content: str, heading_hint: str) -> Dict[str, A
 
 def _parse_patch_search_replace_block(content: str, heading_hint: str) -> List[Dict[str, Any]]:
     """
-    Parses a raw ```patch / ```diff / ```companion-patch block containing one or more:
-      # path: path/to/file.py
-      # summary: Optional summary
-      <<<<<<< SEARCH
-      exact old lines
-      =======
-      exact new lines
-      >>>>>>> REPLACE
-    into normalized `patch_literal` actions (zero JSON escaping needed).
+    Parses a raw ```patch / ```diff / ```companion-patch block containing either:
+    1) One or more SEARCH/REPLACE hunks (`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`,
+       with exact lines or unique `start / ... / end` ellipsis anchors), OR
+    2) Line-range replacement hunks (`# lines: 140-295` with optional `# expect_start:` /
+       `# expect_end:`, either as raw replacement body or wrapped in `<<<<<<< REPLACEMENT` / `>>>>>>> END`)
+    into normalized `patch_literal` / `patch_lines` actions (zero JSON escaping needed).
     """
     default_path = ""
     if heading_hint:
@@ -1011,35 +1063,110 @@ def _parse_patch_search_replace_block(content: str, heading_hint: str) -> List[D
     current_path = default_path
     current_summary = ""
     current_replace_all = False
+    current_start_line: Optional[int] = None
+    current_end_line: Optional[int] = None
+    current_expect_start = ""
+    current_expect_end = ""
     actions: List[Dict[str, Any]] = []
 
     state = "meta"
     search_lines: List[str] = []
     replace_lines: List[str] = []
 
+    def _emit_line_patch(new_lines: List[str]) -> None:
+        target_path = current_path.strip()
+        if not target_path or current_start_line is None:
+            return
+        s_line = current_start_line
+        e_line = current_end_line if current_end_line is not None else s_line
+        args: Dict[str, Any] = {
+            "path": target_path,
+            "start_line": s_line,
+            "end_line": e_line,
+            "new_text": "\n".join(new_lines),
+            "summary": current_summary or hint_summary or f"Line patch ({target_path}:{s_line}-{e_line})",
+        }
+        if current_expect_start:
+            args["expect_start"] = current_expect_start
+        if current_expect_end:
+            args["expect_end"] = current_expect_end
+        actions.append({"tool": "patch_lines", "args": args})
+
+    def _reset_hunk_meta() -> None:
+        nonlocal current_summary, current_replace_all, current_start_line, current_end_line, current_expect_start, current_expect_end
+        current_summary = ""
+        current_replace_all = False
+        current_start_line = None
+        current_end_line = None
+        current_expect_start = ""
+        current_expect_end = ""
+
     for ln in content.splitlines():
         if state == "meta":
+            if current_start_line is not None and (_LINE_REPLACE_START_RE.match(ln) or _SEARCH_MID_RE.match(ln)):
+                state = "replace"
+                replace_lines = []
+                continue
             if _SEARCH_START_RE.match(ln):
                 state = "search"
                 search_lines = []
                 replace_lines = []
+                current_start_line = None
+                current_end_line = None
+                current_expect_start = ""
+                current_expect_end = ""
                 continue
             m = _DIRECTIVE_LINE_RE.match(ln)
             if m:
                 key = m.group(1).strip().lower()
-                val = m.group(2).strip().strip("`'\"")
+                raw_val = m.group(2)
+                val = raw_val.strip().strip("`'\"")
                 if key in ("path", "file", "filename") and val:
                     current_path = val.lstrip("/")
+                    continue
+                if key in ("lines", "line"):
+                    parsed_rng = _parse_line_range_spec(raw_val)
+                    if parsed_rng is not None:
+                        current_start_line, current_end_line = parsed_rng
+                        continue
+                elif key == "start_line":
+                    try:
+                        current_start_line = int(val)
+                        continue
+                    except ValueError:
+                        pass
+                elif key == "end_line":
+                    try:
+                        current_end_line = int(val)
+                        continue
+                    except ValueError:
+                        pass
+                elif key == "expect_start":
+                    current_expect_start = _strip_wrapping_backticks(raw_val)
+                    continue
+                elif key == "expect_end":
+                    current_expect_end = _strip_wrapping_backticks(raw_val)
+                    continue
                 elif key == "summary":
                     current_summary = val
+                    continue
                 elif key == "replace_all":
                     b = _parse_bool_directive(val)
                     if b is not None:
                         current_replace_all = b
+                    continue
+            if current_start_line is None:
+                m_bare_file = re.match(r"^\s*(?:#|//)?\s*([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)\s*$", ln)
+                if m_bare_file:
+                    current_path = m_bare_file.group(1).lstrip("/")
+                    continue
+            if not ln.strip():
                 continue
-            m_bare_file = re.match(r"^\s*(?:#|//)?\s*([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_-]+)\s*$", ln)
-            if m_bare_file:
-                current_path = m_bare_file.group(1).lstrip("/")
+            if current_path.strip() and current_start_line is not None:
+                state = "line_body"
+                replace_lines = [ln]
+        elif state == "line_body":
+            replace_lines.append(ln)
         elif state == "search":
             if _SEARCH_MID_RE.match(ln):
                 state = "replace"
@@ -1049,27 +1176,45 @@ def _parse_patch_search_replace_block(content: str, heading_hint: str) -> List[D
             if _SEARCH_END_RE.match(ln):
                 target_path = current_path.strip()
                 if target_path:
-                    args: Dict[str, Any] = {
-                        "path": target_path,
-                        "old_text": "\n".join(search_lines),
-                        "new_text": "\n".join(replace_lines),
-                        "summary": current_summary or hint_summary or f"Surgical patch ({target_path})",
-                    }
-                    if current_replace_all:
-                        args["replace_all"] = True
-                    actions.append({"tool": "patch_literal", "args": args})
+                    if current_start_line is not None:
+                        _emit_line_patch(replace_lines)
+                    else:
+                        args: Dict[str, Any] = {
+                            "path": target_path,
+                            "old_text": "\n".join(search_lines),
+                            "new_text": "\n".join(replace_lines),
+                            "summary": current_summary or hint_summary or f"Surgical patch ({target_path})",
+                        }
+                        if current_replace_all:
+                            args["replace_all"] = True
+                        actions.append({"tool": "patch_literal", "args": args})
                 state = "meta"
                 search_lines = []
                 replace_lines = []
+                _reset_hunk_meta()
             else:
                 replace_lines.append(ln)
+
+    if state == "line_body" and current_path.strip() and current_start_line is not None:
+        _emit_line_patch(replace_lines)
+    elif (
+        state == "meta"
+        and not actions
+        and current_path.strip()
+        and current_start_line is not None
+        and current_end_line is not None
+    ):
+        _emit_line_patch([])
 
     return actions
 
 
 def _extract_unfenced_patch_with_end(text: str) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    """Fallback extractor for unfenced `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks + trailing hallucination cut."""
-    if "<<<<<<<" not in text or "=======" not in text or ">>>>>>>" not in text:
+    """Fallback extractor for unfenced `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` (or line-range replacement) blocks + trailing hallucination cut."""
+    has_markers = "<<<<<<<" in text and ">>>>>>>" in text and (
+        "=======" in text or re.search(r"^\s*(?:#|//|--)?\s*(?:lines?|start_line)\s*[:=]", text, re.IGNORECASE | re.MULTILINE)
+    )
+    if not has_markers:
         return [], None
     lines_keep = text.splitlines(keepends=True)
     lines = [ln.rstrip("\r\n") for ln in lines_keep]
@@ -1082,7 +1227,9 @@ def _extract_unfenced_patch_with_end(text: str) -> Tuple[List[Dict[str, Any]], O
     first_marker_idx = None
     last_end_idx = None
     for idx, ln in enumerate(lines):
-        if first_marker_idx is None and (_SEARCH_START_RE.match(ln) or _DIRECTIVE_LINE_RE.match(ln)):
+        if first_marker_idx is None and (
+            _SEARCH_START_RE.match(ln) or _LINE_REPLACE_START_RE.match(ln) or _DIRECTIVE_LINE_RE.match(ln)
+        ):
             first_marker_idx = idx
         if _SEARCH_END_RE.match(ln):
             last_end_idx = idx
@@ -1630,7 +1777,10 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
                 + "."
             )
         elif resp.get("applied"):
-            blocks.append(f"- **{name}**: Patch applied to `{resp.get('path')}` (backup: `{resp.get('backup_path')}`)")
+            auto_note = " *(auto-approved inspection script patch)*" if resp.get("auto_approved_inspection_script") else ""
+            blocks.append(
+                f"- **{name}**: Patch applied to `{resp.get('path')}` (backup: `{resp.get('backup_path')}`){auto_note}"
+            )
         elif resp.get("renamed"):
             blocks.append(
                 f"- **{name}**: Renamed `{resp.get('old_path')}` → `{resp.get('new_path')}` (backup: `{resp.get('backup_path')}`)"
@@ -1640,10 +1790,11 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
                 del_note = " and deleted temporary script" if resp.get("deleted") else ""
                 eid = resp.get("exec_id")
                 eid_note = f" · `exec_id={eid}`" if eid else ""
-                line = (
-                    f"- **{name}**: Wrote `{resp.get('path')}` and executed"
-                    f"{del_note} (exit code `{resp.get('exit_code')}`{eid_note})."
-                )
+                if resp.get("cancelled"):
+                    status_tail = f"stopped by user (exit code `{resp.get('exit_code')}`{eid_note})"
+                else:
+                    status_tail = f"(exit code `{resp.get('exit_code')}`{eid_note})"
+                line = f"- **{name}**: Wrote `{resp.get('path')}` and executed{del_note} {status_tail}."
                 ai_sum = (resp.get("ai_summary") or "").strip()
                 if ai_sum:
                     line += f"\n> **Scout Summary:** {ai_sum}"
@@ -1656,8 +1807,11 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
         elif name in ("run_script", "run_and_delete_script"):
             cmd = resp.get("command") or resp.get("path") or "script"
             code = resp.get("exit_code", "?")
-            ok = (code == 0) and (not resp.get("has_traceback"))
-            if name == "run_and_delete_script":
+            cancelled = bool(resp.get("cancelled"))
+            ok = (not cancelled) and (code == 0) and (not resp.get("has_traceback"))
+            if cancelled:
+                status_lbl = "STOPPED BY USER (kept on disk)" if name == "run_and_delete_script" else "STOPPED BY USER"
+            elif name == "run_and_delete_script":
                 status_lbl = (
                     "OK — script auto-deleted"
                     if ok and resp.get("deleted")
@@ -1683,8 +1837,9 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
         elif name == "run_tests":
             cmd = resp.get("command", "tests")
             code = resp.get("exit_code", "?")
-            passed = bool(resp.get("passed")) and code == 0 and not resp.get("has_traceback")
-            status_lbl = "PASSED" if passed else "FAILED"
+            cancelled = bool(resp.get("cancelled"))
+            passed = (not cancelled) and bool(resp.get("passed")) and code == 0 and not resp.get("has_traceback")
+            status_lbl = "STOPPED BY USER" if cancelled else ("PASSED" if passed else "FAILED")
             scope_note = ""
             if resp.get("is_full_suite") is False:
                 scope_note = " (quick/targeted check — savepoint stays active)"
@@ -1704,6 +1859,96 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
         else:
             blocks.append(f"### `{name}`\n```json\n{json.dumps(resp, indent=2)}\n```")
     return "\n\n".join(blocks).strip()
+
+
+def normalize_project_rel_path(project_root: str | Path, raw_path: str) -> Optional[str]:
+    """Resolves a relative path safely inside project_root into normalized POSIX form."""
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    try:
+        root = Path(project_root).resolve()
+        target = fs_tools.resolve_safe_path(root, text)
+        return target.relative_to(root).as_posix()
+    except Exception:
+        return None
+
+
+def get_approved_inspection_scripts(
+    messages: Sequence[Any],
+    project_root: str | Path,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns active inspection/temporary scripts already approved & executed in this session
+    that are still present on disk (e.g., failed inspection scripts awaiting patch + rerun).
+    Once an inspection script passes cleanly and is auto-deleted (or manually deleted),
+    it is removed from this map so arbitrary future writes require normal approval.
+    """
+    root = Path(project_root).resolve()
+    tracked: Dict[str, Dict[str, Any]] = {}
+
+    for msg in messages or ():
+        if getattr(msg, "role", None) != "tool_event":
+            continue
+        try:
+            payload = json.loads(getattr(msg, "text", "") or "{}")
+        except Exception:
+            continue
+        tname = payload.get("tool_name")
+        resp = payload.get("response") or {}
+        if not isinstance(resp, dict):
+            continue
+
+        raw_path = str(resp.get("path") or "").strip()
+        rel_posix = normalize_project_rel_path(root, raw_path) if raw_path else None
+
+        if tname == "delete_file" and resp.get("deleted") and rel_posix:
+            tracked.pop(rel_posix, None)
+            continue
+
+        if tname == "rename_file" and resp.get("renamed"):
+            old_rel = normalize_project_rel_path(root, str(resp.get("old_path") or ""))
+            if old_rel:
+                tracked.pop(old_rel, None)
+            continue
+
+        if tname in (
+            "propose_inspection_script",
+            "propose_script",
+            "run_and_delete_script",
+            "run_script",
+        ) and resp.get("executed") and rel_posix:
+            is_inspection = (
+                tname in ("propose_inspection_script", "propose_script", "run_and_delete_script")
+                or bool(resp.get("auto_delete_on_success"))
+                or bool(resp.get("kept_for_patching"))
+                or bool(resp.get("auto_approved_inspection_script"))
+            )
+            if not is_inspection:
+                continue
+            if resp.get("deleted"):
+                tracked.pop(rel_posix, None)
+                continue
+            tracked[rel_posix] = {
+                "path": rel_posix,
+                "auto_delete": bool(
+                    resp.get("auto_delete_on_success")
+                    or tname in ("propose_inspection_script", "propose_script", "run_and_delete_script")
+                    or resp.get("kept_for_patching")
+                ),
+                "args": resp.get("args"),
+                "passed": bool(resp.get("passed")) and not bool(resp.get("cancelled")),
+                "tool_name": tname,
+            }
+
+    active: Dict[str, Dict[str, Any]] = {}
+    for rel_posix, info in tracked.items():
+        try:
+            if (root / rel_posix).is_file():
+                active[rel_posix] = info
+        except OSError:
+            continue
+    return active
 
 
 def find_recent_markdown_outputs(

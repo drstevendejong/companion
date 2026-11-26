@@ -46,18 +46,20 @@ Every tool round-trip re-sends conversation history and burns rate-limit tokens.
 2. DIRECTIVES SELF-CHECK (CRITICAL):
    - When Project Directives are loaded below, audit EVERY planned design, edit, and script against ALL Directives BEFORE proposing patches or scripts. Never emit code that violates Directives and forces a costly redo.
 
-3. BATCHED & SINGLE-SHOT CODE INSPECTION:
-   - Start unfamiliar repo/module exploration with `extract_headers` (0-token file header & top-level symbol index) or `list_tree`.
-   - When Local AI Scout is ENABLED, prefer ONE `scout_workspace` call to trace multi-file call paths or answer investigative questions in a single turn instead of burning 4–8 round-trips. Only call `scout_workspace` / `update_header` when Scout is enabled.
-   - Otherwise, never dribble 1–2 small reads/searches across many turns. Batch all needed `search_code` / `read_lines` / `read_file` calls together in ONE turn.
-   - For heavy mechanical audits or runtime inspection, prefer ONE `propose_inspection_script` (alias `propose_script`) single-shot inspector/probe as a raw ```python block instead of JSON-escaped strings or iterative tool hops.
-   - Prefer `search_code` (supports `is_regex`, `path_glob`, `subpath`, and `start_line`/`end_line`) + targeted `read_lines(path, start_line, end_line)` over full `read_file` unless you truly need the whole file (`read_file` omits line numbers to save tokens).
+3. SCOUT-FIRST & TOKEN-FRUGAL CODE INSPECTION:
+   - Never batch multiple full `read_file` calls (e.g. 20K–50K+ tokens of whole files) just to hunt down a bug—full-file dumps stay pinned in conversation history on every turn.
+   - When Local AI Scout is ENABLED: for any multi-file bug hunt, call-path trace, or unfamiliar module question, call ONE `scout_workspace` first so Scout finds the exact files & line ranges in its own ephemeral `-lite` loop; then read only the exact lines you need to patch via `read_lines`. Only call `scout_workspace` / `update_header` when Scout is enabled.
+   - When Local AI Scout is OFF (or once you already know the exact target file): start with `extract_headers` (0-token file header & top-level symbol index) or `list_tree`, narrow with `search_code` (supports `is_regex`, `path_glob`, `subpath`, and `start_line`/`end_line`), and batch targeted `read_lines(path, start_line, end_line)` calls together in ONE turn. Reserve `read_file` strictly for single small files or a file you are rewriting.
+   - For heavy mechanical audits or runtime state inspection (e.g. probing internal app state), prefer ONE `propose_inspection_script` (alias `propose_script`) single-shot inspector/probe as a raw ```python block instead of JSON-escaped strings or iterative tool hops.
 
 4. SURGICAL PATCHING, FILE OPS, HEADERS & ATOMIC TEST LOOPS:
-   - Prefer raw ```patch `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks (or `patch_literal` with minimal unique context) over `patch_lines` or `write_file`. Only use `write_file` (or a tagged raw code block) for new files or >70% rewrites. If `patch_literal` fails to match, Companion returns line-number and nearest-diff diagnostics for fast self-correction.
+   - Pick the most token-efficient surgical patch mode:
+     * Small/localized edits: tight `<<<<<<< SEARCH` / `>>>>>>> REPLACE` hunks (ONLY 2–4 unchanged boundary lines around changed lines; use multiple small hunks for scattered edits rather than wrapping an entire 100-line function).
+     * Large block rewrite/removal without line numbers: deterministic `...` ellipsis inside `SEARCH` (`2–3 unique start lines` / `...` / `2–3 unique end lines`, no regex; both anchors must match uniquely).
+     * Large block rewrite/removal with known line numbers: raw ```patch `# lines: START-END` with `# expect_start:` & `# expect_end:` boundary lines (or `patch_lines`). Only use `write_file` for new files or >70% rewrites.
    - Keep module header comments informative; when Local AI Scout is enabled, you may call `update_header` after a batch of changes settles so the user can approve refreshed header diffs.
    - Use `delete_file` and `rename_file` directly for human-gated cleanup/moves (both auto-backup first)—never write a throwaway script just to delete or rename files.
-   - Use `propose_inspection_script` (alias `propose_script`) ONLY for temporary inspection/verification/packer scripts—never for permanent code changes (it auto-deletes cleanly on pass without leaving a savepoint; use `patch_literal`/`write_file` for actual code edits). If a temporary script fails, PATCH the existing script and call `run_and_delete_script` to re-run and auto-delete once it passes (or `run_script` for permanent scripts) instead of regenerating it.
+   - Use `propose_inspection_script` (alias `propose_script`) ONLY for temporary inspection/verification/packer scripts—never for permanent code changes (it auto-deletes cleanly on pass without leaving a savepoint; use `patch_literal`/`write_file` for actual code edits). If a temporary script fails and stays on disk, simply PATCH the existing script—Companion auto-approves patches to an already-approved failed inspection script and immediately re-runs & auto-deletes it if it passes (only use `run_script` for permanent scripts, or `run_and_delete_script` to re-run unchanged).
    - Command outputs include an `exec_id`; when oversized output is summarized (or when Scout adds an `ai_summary` via optional `"focus": "..."`), call `read_command_output(exec_id=..., start_line=..., end_line=..., pattern=...)` if you need exact raw lines.
    - Companion automatically saves a reversible project checkpoint before the first permanent write in a batch. Do NOT run tests on intermediate half-finished edits. Use `run_tests` with `fast: true` / `target` for quick single-file checks if desired, and emit full `run_tests` once a coherent batch is complete to verify & auto-commit the savepoint.
    - Git operations (`git status`, `git diff`, commit drafting, Commit / Commit & Push) are handled directly by the user inside Companion's right-drawer Git tab, not via autonomous model tools.
@@ -177,7 +179,7 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
         ),
         types.FunctionDeclaration(
             name="read_file",
-            description="Read an entire file as raw text (no line-number overhead). Use read_lines instead for targeted slices.",
+            description="Read an entire file as raw text (no line-number overhead). Reserve for single small files or full rewrites; use scout_workspace (when enabled) or search_code + read_lines for bug hunting.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
@@ -202,12 +204,12 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
         ),
         types.FunctionDeclaration(
             name="patch_literal",
-            description="Surgical exact-match string replacement in a file. Automatically backed up to project backup/.",
+            description="Surgical exact-match string replacement in a file (keep old_text tight, or use `start lines\\n...\\nend lines` with unique anchors to replace large blocks without echoing the middle). Automatically backed up to project backup/.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
                     "path": types.Schema(type=types.Type.STRING, description="Relative file path"),
-                    "old_text": types.Schema(type=types.Type.STRING, description="Exact existing text block (must match uniquely unless replace_all=true)"),
+                    "old_text": types.Schema(type=types.Type.STRING, description="Exact existing text block (minimal 2–4 boundary lines, or `unique start lines\\n...\\nunique end lines` for large blocks)"),
                     "new_text": types.Schema(type=types.Type.STRING, description="Replacement text"),
                     "replace_all": types.Schema(type=types.Type.BOOLEAN, description="Replace all occurrences if true"),
                     "summary": types.Schema(type=types.Type.STRING, description="Short 1-line summary of change"),
@@ -217,7 +219,7 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
         ),
         types.FunctionDeclaration(
             name="patch_lines",
-            description="Replace an inclusive 1-based line range in a file. Automatically backed up to project backup/.",
+            description="Replace an inclusive 1-based line range in a file (ideal for large rewrites when line numbers are known). Automatically backed up to project backup/.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
@@ -225,6 +227,8 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
                     "start_line": types.Schema(type=types.Type.INTEGER, description="First line to replace (1-based)"),
                     "end_line": types.Schema(type=types.Type.INTEGER, description="Last line to replace (1-based)"),
                     "new_text": types.Schema(type=types.Type.STRING, description="Replacement text"),
+                    "expect_start": types.Schema(type=types.Type.STRING, description="Optional expected content of start_line to catch shifted line numbers"),
+                    "expect_end": types.Schema(type=types.Type.STRING, description="Optional expected content of end_line to catch shifted line numbers"),
                     "summary": types.Schema(type=types.Type.STRING, description="Short 1-line summary of change"),
                 },
                 required=["path", "start_line", "end_line", "new_text"],
@@ -332,7 +336,7 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
             [
                 types.FunctionDeclaration(
                     name="scout_workspace",
-                    description="Delegate an iterative read-only codebase search/trace to the Local AI Scout (uses lightweight -lite model with stateless ephemeral history). Ideal for tracing call paths, finding references across files, or answering investigative questions in one turn.",
+                    description="Delegate an iterative read-only codebase search/trace to the Local AI Scout (ephemeral -lite loop). PREFER FIRST for multi-file bug hunting or unfamiliar call paths so main chat context stays compact.",
                     parameters=types.Schema(
                         type=types.Type.OBJECT,
                         properties={
@@ -372,7 +376,7 @@ def load_system_instruction(
     parts = [get_base_system_prompt(db)]
     if scout_enabled:
         parts.append(
-            "\n[LOCAL AI SCOUT: ENABLED] You have `scout_workspace` (delegated multi-step read-only investigation), `update_header` (human-gated header comment updates), and optional `\"focus\"` on `run_tests`/`run_script`/`run_and_delete_script`/`propose_inspection_script`. Always use `extract_headers` for fast 0-token structural overviews first."
+            "\n[LOCAL AI SCOUT: ENABLED] Prefer `scout_workspace` FIRST for multi-file bug hunting or tracing unfamiliar code instead of batching large `read_file` calls. You also have `update_header` (human-gated header comment updates) and optional `\"focus\"` on `run_tests`/`run_script`/`run_and_delete_script`/`propose_inspection_script`."
         )
     else:
         parts.append(
@@ -600,9 +604,15 @@ def prepare_tool_gate_preview(
             str(args["new_text"]),
             bool(args.get("replace_all", False)),
         )
+        rng = preview.get("resolved_range")
+        title = (
+            f"Surgical Patch: {args['path']} (lines {rng[0]}–{rng[1]} via ...)"
+            if preview.get("used_ellipsis") and isinstance(rng, (list, tuple)) and len(rng) == 2
+            else f"Surgical Patch: {args['path']}"
+        )
         return {
             "category": "patch",
-            "title": f"Surgical Patch: {args['path']}",
+            "title": title,
             "summary": str(args.get("summary", "Literal replacement")),
             "diff": preview["diff"],
             "ast_valid": preview["ast_valid"],
@@ -617,6 +627,8 @@ def prepare_tool_gate_preview(
             int(args["start_line"]),
             int(args["end_line"]),
             str(args["new_text"]),
+            expect_start=args.get("expect_start"),
+            expect_end=args.get("expect_end"),
         )
         return {
             "category": "patch",

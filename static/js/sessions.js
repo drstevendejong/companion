@@ -792,7 +792,6 @@ function openProjectModal(proj) {
   document.getElementById("proj-python").value = (proj && proj.python_path) || "";
   document.getElementById("proj-backup").value = (proj && proj.backup_dir) || "backup";
   document.getElementById("proj-directives").value = (proj && proj.directives_path) || "";
-  document.getElementById("proj-cdp-port").value = (proj && proj.cdp_port) || 9222;
   document.getElementById("proj-post-cmd").value = (proj && proj.post_patch_command) || "";
   document.getElementById("proj-fast-cmd").value = (proj && proj.fast_test_command) || "";
   document.getElementById("proj-ignores").value = proj ? (proj.ignore_patterns || []).join(", ") : "";
@@ -807,7 +806,6 @@ async function handleProjectSave(ev) {
     python_path: document.getElementById("proj-python").value.trim() || null,
     backup_dir: document.getElementById("proj-backup").value.trim() || "backup",
     directives_path: document.getElementById("proj-directives").value.trim() || null,
-    cdp_port: Number(document.getElementById("proj-cdp-port").value) || 9222,
     post_patch_command: document.getElementById("proj-post-cmd").value.trim() || null,
     fast_test_command: document.getElementById("proj-fast-cmd").value.trim() || null,
     ignore_patterns: document

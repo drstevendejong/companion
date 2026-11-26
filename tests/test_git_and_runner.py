@@ -77,6 +77,140 @@ class TestGitAndRunner(unittest.TestCase):
         clean = git_tools.get_git_status(self.root)
         self.assertEqual(clean["changed_files"], [])
 
+    def test_runner_captures_stderr_only_traceback(self) -> None:
+        script = self.root / "stderr_boom.py"
+        script.write_text(
+            "import re\n"
+            "re.compile(None)\n",
+            encoding="utf-8",
+        )
+        chunks: list[str] = []
+
+        async def _on_out(chunk: str) -> None:
+            chunks.append(chunk)
+
+        res = asyncio.run(
+            runner.run_project_command(self.root, "python stderr_boom.py", on_output=_on_out)
+        )
+        self.assertNotEqual(res["exit_code"], 0)
+        self.assertFalse(res["cancelled"])
+        self.assertFalse(res["timed_out"])
+        self.assertIn("TypeError", res["output"])
+        self.assertIn("Traceback", "".join(chunks))
+
+    def test_runner_does_not_hang_on_stdin_read(self) -> None:
+        script = self.root / "reads_stdin.py"
+        script.write_text(
+            "import sys\n"
+            "data = sys.stdin.read()\n"
+            "print(f'STDIN_LEN={len(data)}')\n",
+            encoding="utf-8",
+        )
+        res = asyncio.run(
+            runner.run_project_command(self.root, "python reads_stdin.py", timeout_seconds=5)
+        )
+        self.assertEqual(res["exit_code"], 0)
+        self.assertFalse(res["timed_out"])
+        self.assertIn("STDIN_LEN=0", res["output"])
+
+    def test_runner_cancel_active_runs_stops_sleeping_process(self) -> None:
+        import time
+        from types import SimpleNamespace
+
+        script = self.root / "sleeper.py"
+        script.write_text(
+            "import time\n"
+            "print('STARTED_SLEEP', flush=True)\n"
+            "time.sleep(15)\n"
+            "print('SHOULD_NOT_PRINT', flush=True)\n",
+            encoding="utf-8",
+        )
+        ws_events: list[dict] = []
+
+        class _WS:
+            async def send_text(self, raw: str) -> None:
+                import json
+
+                ws_events.append(json.loads(raw))
+
+        app = SimpleNamespace(state=SimpleNamespace(lifecycle_sockets={_WS()}))
+
+        async def _run_and_cancel() -> dict:
+            task = asyncio.create_task(
+                runner.stream_project_command(
+                    app,
+                    self.root,
+                    "python sleeper.py",
+                    session_id="s-cancel",
+                    gate_id="g-cancel",
+                    source="gate",
+                )
+            )
+            for _ in range(40):
+                if runner.get_active_runs(session_id="s-cancel"):
+                    break
+                await asyncio.sleep(0.05)
+            cancelled_count = runner.cancel_active_runs(session_id="s-cancel")
+            self.assertGreaterEqual(cancelled_count, 1)
+            return await task
+
+        t0 = time.monotonic()
+        res = asyncio.run(_run_and_cancel())
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 4.0)
+        self.assertTrue(res["cancelled"])
+        self.assertEqual(res["exit_code"], -1)
+        self.assertNotIn("SHOULD_NOT_PRINT", res["output"])
+        self.assertTrue(
+            any(ev.get("type") == "exec_done" and ev.get("cancelled") is True for ev in ws_events)
+        )
+
+    def test_runner_dead_websocket_does_not_block(self) -> None:
+        import json
+        import time
+        from types import SimpleNamespace
+
+        script = self.root / "quick.py"
+        script.write_text("print('QUICK_DONE')\n", encoding="utf-8")
+        good_events: list[dict] = []
+
+        class _HangingWS:
+            async def send_text(self, _raw: str) -> None:
+                await asyncio.sleep(15)
+
+        class _BrokenWS:
+            async def send_text(self, _raw: str) -> None:
+                raise RuntimeError("socket closed")
+
+        class _GoodWS:
+            async def send_text(self, raw: str) -> None:
+                good_events.append(json.loads(raw))
+
+        hanging_ws = _HangingWS()
+        broken_ws = _BrokenWS()
+        good_ws = _GoodWS()
+        sockets = {hanging_ws, broken_ws, good_ws}
+        app = SimpleNamespace(state=SimpleNamespace(lifecycle_sockets=sockets))
+
+        t0 = time.monotonic()
+        res = asyncio.run(
+            runner.stream_project_command(
+                app,
+                self.root,
+                "python quick.py",
+                session_id="s-ws",
+                source="gate",
+            )
+        )
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual(res["exit_code"], 0)
+        self.assertIn("QUICK_DONE", res["output"])
+        self.assertNotIn(hanging_ws, sockets)
+        self.assertNotIn(broken_ws, sockets)
+        self.assertIn(good_ws, sockets)
+        self.assertTrue(any(ev.get("type") == "exec_done" for ev in good_events))
+
 
 if __name__ == "__main__":
     unittest.main()

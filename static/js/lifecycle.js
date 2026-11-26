@@ -140,6 +140,8 @@ export function initLifecycle() {
           } else if (
             msg.type === "exec_start" ||
             msg.type === "exec_chunk" ||
+            msg.type === "exec_heartbeat" ||
+            msg.type === "exec_phase" ||
             msg.type === "exec_done"
           ) {
             emit("terminal:stream-event", msg);

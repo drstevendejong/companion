@@ -14,7 +14,7 @@ import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from google.genai import types
 
 from config import OUTPUT_FAILURE_TRIAGE_MIN_CHARS
@@ -103,39 +103,80 @@ async def _maybe_summarize_or_triage_output(
     passed: bool,
     focus: str | None,
     exec_id: str | None,
+    cancelled: bool = False,
+    app: Any = None,
+    session_id: Optional[str] = None,
+    gate_id: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if not scout_cfg.get("enabled") or gemini is None or not raw_output.strip():
+    stripped_output = (raw_output or "").strip()
+    if cancelled or not scout_cfg.get("enabled") or gemini is None or not stripped_output:
         return {}
-    threshold = int(scout_cfg.get("summarize_threshold_chars") or 4_000)
+    threshold = max(500, int(scout_cfg.get("summarize_threshold_chars") or 4_000))
     has_focus = bool((focus or "").strip())
+
+    async def _emit_phase(phase: str, status_text: str) -> None:
+        if app is None:
+            return
+        await runner.broadcast_exec_event(
+            app,
+            {
+                "type": "exec_phase",
+                "run_id": run_id,
+                "session_id": session_id,
+                "gate_id": gate_id,
+                "command": command,
+                "phase": phase,
+                "status_text": status_text,
+            },
+        )
+
     if not passed:
         if not has_focus and len(raw_output) <= OUTPUT_FAILURE_TRIAGE_MIN_CHARS:
             return {}
-        res = await asyncio.to_thread(
-            local_scout.triage_command_failure,
-            gemini,
-            db,
-            project,
-            command=command,
-            raw_output=raw_output,
-            exit_code=exit_code,
-            focus=focus,
-            exec_id=exec_id,
-        )
-        return res or {}
-    if has_focus or len(raw_output) > threshold:
-        res = await asyncio.to_thread(
-            local_scout.summarize_command_output,
-            gemini,
-            db,
-            command=command,
-            raw_output=raw_output,
-            exit_code=exit_code,
-            focus=focus,
-            exec_id=exec_id,
-            threshold_chars=threshold,
-        )
-        return res or {}
+        await _emit_phase("scout_triage", "Scout is triaging command failure...")
+        try:
+            res = await asyncio.wait_for(
+                asyncio.to_thread(
+                    local_scout.triage_command_failure,
+                    gemini,
+                    db,
+                    project,
+                    command=command,
+                    raw_output=raw_output,
+                    exit_code=exit_code,
+                    focus=focus,
+                    exec_id=exec_id,
+                ),
+                timeout=25.0,
+            )
+            return res or {}
+        except Exception:
+            return {}
+        finally:
+            await _emit_phase("done", "")
+    if has_focus or len(stripped_output) > threshold:
+        await _emit_phase("scout_summarize", "Scout is summarizing output...")
+        try:
+            res = await asyncio.wait_for(
+                asyncio.to_thread(
+                    local_scout.summarize_command_output,
+                    gemini,
+                    db,
+                    command=command,
+                    raw_output=raw_output,
+                    exit_code=exit_code,
+                    focus=focus,
+                    exec_id=exec_id,
+                    threshold_chars=threshold,
+                ),
+                timeout=25.0,
+            )
+            return res or {}
+        except Exception:
+            return {}
+        finally:
+            await _emit_phase("done", "")
     return {}
 
 
@@ -196,7 +237,275 @@ def _serialize_tool_response(tool_name: str, result: Dict[str, Any]) -> Dict[str
     return bridge_svc.serialize_tool_response(tool_name, result)
 
 
-def _advance_turn(
+async def execute_approved_script_patch(
+    db: Any,
+    session: SessionInfo,
+    project: ProjectProfile,
+    tool_name: str,
+    args: Dict[str, Any],
+    prepared: Dict[str, Any],
+    summary_fallback: str = "",
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Applies a prepared patch/write to an already-approved inspection script with backup & checkpoint."""
+    cp = (
+        cp_svc.ensure_active_checkpoint(db, project, session.id)
+        if hasattr(db, "get_active_checkpoint")
+        else None
+    )
+    applied = patch_tools.apply_prepared_patch(
+        project.root_path,
+        project.backup_dir,
+        prepared["prepared_patch"],
+    )
+    if cp is not None:
+        cp_svc.record_write_in_checkpoint(
+            db,
+            cp,
+            applied["path"],
+            applied["existed_before"],
+            source_backup_path=applied.get("backup_path"),
+        )
+    patch_rec = (
+        db.add_patch_record(
+            project_id=project.id,
+            session_id=session.id,
+            file_path=applied["path"],
+            backup_path=applied["backup_path"],
+            existed_before=applied["existed_before"],
+            summary=summary_fallback or prepared.get("summary") or tool_name,
+            diff=applied["diff"],
+        )
+        if hasattr(db, "add_patch_record")
+        else None
+    )
+    tool_resp = {
+        "applied": True,
+        "path": applied["path"],
+        "backup_path": applied["backup_path"],
+        "bytes_written": applied["bytes_written"],
+        "auto_approved_inspection_script": True,
+    }
+    extra: Dict[str, Any] = {}
+    if patch_rec is not None:
+        extra["patch_record"] = patch_rec.model_dump()
+    return tool_resp, extra
+
+
+async def execute_existing_script_run(
+    db: Any,
+    session: SessionInfo,
+    project: ProjectProfile,
+    *,
+    rel_posix: str,
+    auto_delete: bool,
+    arg_list: List[str],
+    raw_args_text: Optional[str] = None,
+    focus: Optional[str] = None,
+    app: Any = None,
+    gemini_client: Any = None,
+    scout_cfg: Optional[Dict[str, Any]] = None,
+    gate_id: Optional[str] = None,
+    auto_approved_inspection: bool = False,
+    auto_rerun_after_patch: bool = False,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Executes an on-disk Python script inside project_root, handles output/checkpoints/auto-delete."""
+    cmd = " ".join(["python", shlex.quote(rel_posix), *(shlex.quote(a) for a in arg_list)])
+    target_abs = fs_tools.resolve_safe_path(project.root_path, rel_posix)
+    cp = db.get_active_checkpoint(session.id) if hasattr(db, "get_active_checkpoint") else None
+    before_files = (
+        await asyncio.to_thread(
+            cp_svc.list_project_relative_files,
+            project.root_path,
+            project.backup_dir,
+            project.ignore_patterns,
+        )
+        if cp is not None
+        else set()
+    )
+    extra_ui: Dict[str, Any] = {}
+    try:
+        run_res = await runner.stream_project_command(
+            app,
+            project.root_path,
+            cmd,
+            configured_python=project.python_path,
+            source="gate",
+            gate_id=gate_id,
+            session_id=session.id,
+        )
+    except Exception:
+        if cp is not None:
+            after_files = await asyncio.to_thread(
+                cp_svc.list_project_relative_files,
+                project.root_path,
+                project.backup_dir,
+                project.ignore_patterns,
+            )
+            for new_rel in sorted(after_files - before_files):
+                cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
+        raise
+
+    if cp is not None:
+        after_files = await asyncio.to_thread(
+            cp_svc.list_project_relative_files,
+            project.root_path,
+            project.backup_dir,
+            project.ignore_patterns,
+        )
+        for new_rel in sorted(after_files - before_files):
+            cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
+
+    generated_md = bridge_svc.find_recent_markdown_outputs(
+        project.root_path,
+        run_res.get("output", ""),
+        exclude_rel=rel_posix,
+    )
+    run_res["generated_md_files"] = generated_md
+    extra_ui["command_result"] = run_res
+    extra_ui["generated_md_files"] = generated_md
+
+    raw_out = run_res.get("output") or ""
+    exec_id = run_res.get("exec_id")
+    cancelled = bool(run_res.get("cancelled"))
+    has_traceback = (
+        "Traceback (most recent call last):" in raw_out
+        or "\nSyntaxError:" in raw_out
+        or "\nImportError:" in raw_out
+        or "\nModuleNotFoundError:" in raw_out
+    )
+    passed = (not cancelled) and (run_res["exit_code"] == 0) and (not has_traceback)
+    eff_scout_cfg = scout_cfg if scout_cfg is not None else _get_effective_scout_settings(db, gemini_client)
+    summary_info = await _maybe_summarize_or_triage_output(
+        gemini=gemini_client,
+        db=db,
+        project=project,
+        scout_cfg=eff_scout_cfg,
+        command=cmd,
+        raw_output=raw_out,
+        exit_code=run_res["exit_code"],
+        passed=passed,
+        focus=focus,
+        exec_id=exec_id,
+        cancelled=cancelled,
+        app=app,
+        session_id=session.id,
+        gate_id=gate_id,
+        run_id=run_res.get("run_id"),
+    )
+    if summary_info.get("summary"):
+        output_preview = ""
+    elif not passed:
+        output_preview = bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
+    else:
+        output_preview = bridge_svc.format_command_output_preview(raw_out, max_chars=12000)
+
+    deleted_after_run = False
+    del_backup_path = None
+    if auto_delete and passed and target_abs.is_file():
+        try:
+            del_preview = patch_tools.preview_delete_file(project.root_path, rel_posix)
+            del_res = patch_tools.apply_delete_file(
+                project.root_path, project.backup_dir, del_preview
+            )
+            deleted_after_run = bool(del_res.get("deleted"))
+            del_backup_path = del_res.get("backup_path")
+            if cp is not None:
+                latest_cp = db.get_checkpoint(cp.id) if hasattr(db, "get_checkpoint") else cp
+                orig_created = set(getattr(latest_cp, "created_files", None) or [])
+                orig_mods = set(getattr(latest_cp, "modified_files", None) or [])
+                other_mods = orig_mods - {rel_posix}
+                other_created = orig_created - {rel_posix}
+                if deleted_after_run and (rel_posix in orig_created) and not other_mods and not other_created:
+                    cp_svc.discard_checkpoint(db, project, cp.id)
+                    cp = None
+                else:
+                    cp_svc.record_write_in_checkpoint(
+                        db,
+                        cp,
+                        rel_posix,
+                        existed_before=True,
+                        source_backup_path=del_backup_path,
+                    )
+            if hasattr(db, "add_patch_record"):
+                del_rec = db.add_patch_record(
+                    project_id=project.id,
+                    session_id=session.id,
+                    file_path=del_res["path"],
+                    backup_path=del_backup_path,
+                    existed_before=True,
+                    summary=f"Auto-deleted temporary script after pass: {del_res['path']}",
+                    diff=del_res["diff"],
+                )
+                extra_ui["patch_record"] = del_rec.model_dump()
+        except Exception:
+            deleted_after_run = False
+
+    script_src: Optional[str] = None
+    try:
+        if target_abs.is_file():
+            script_src = target_abs.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        script_src = None
+    failure_kind = (
+        None
+        if passed
+        else ("runtime" if cancelled else classify_script_failure(raw_out, run_res["exit_code"], script_src))
+    )
+    still_on_disk = bool(target_abs.is_file() and not deleted_after_run)
+
+    tool_resp: Dict[str, Any] = {
+        "executed": True,
+        "path": rel_posix,
+        "command": cmd,
+        "args": raw_args_text if raw_args_text else None,
+        "exec_id": exec_id,
+        "exit_code": run_res["exit_code"],
+        "duration_ms": run_res["duration_ms"],
+        "passed": passed,
+        "cancelled": cancelled,
+        "has_traceback": has_traceback,
+        "deleted": deleted_after_run,
+        "kept_for_patching": bool(auto_delete and not deleted_after_run),
+        "auto_delete_on_success": bool(auto_delete),
+        "failure_kind": failure_kind,
+        "retryable": bool((not passed) and failure_kind == "runtime" and still_on_disk),
+        "backup_path": del_backup_path,
+        "output_bytes": len(raw_out.encode("utf-8")),
+        "output_preview": output_preview,
+        "ai_summary": summary_info.get("summary"),
+        "ai_summary_model": summary_info.get("model_used"),
+        "generated_md_files": generated_md if passed else [],
+        "note": (
+            f"Execution of '{rel_posix}' stopped by operator (exec_id={exec_id})."
+            if cancelled
+            else (
+                f"Auto-deleted '{rel_posix}' after clean run (backed up first). Raw output exec_id={exec_id}."
+                if deleted_after_run
+                else (
+                    f"Script failed; kept '{rel_posix}' on disk so you can patch and auto-rerun."
+                    if auto_delete and not passed
+                    else f"Full output buffered as exec_id={exec_id} and shown in Console."
+                )
+            )
+        ),
+    }
+    if auto_approved_inspection:
+        tool_resp["auto_approved_inspection_script"] = True
+    if auto_rerun_after_patch:
+        tool_resp["auto_rerun_after_patch"] = True
+    if not session.api_enabled and passed and generated_md:
+        first_md_path = generated_md[0]["path"]
+        try:
+            resolved_md = fs_tools.resolve_safe_path(project.root_path, first_md_path)
+            if resolved_md.is_file():
+                extra_ui["generated_md_path"] = first_md_path
+                extra_ui["generated_md_content"] = resolved_md.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    return tool_resp, extra_ui
+
+
+async def _advance_turn(
     db: Any,
     gemini: Any,
     session: SessionInfo,
@@ -204,7 +513,7 @@ def _advance_turn(
     max_auto_loops: int = 5,
     app: Any = None,
 ) -> Dict[str, Any]:
-    """Runs Gemini turn(s), auto-executing approved-threshold reads / auto-scout, pausing at gates."""
+    """Runs Gemini turn(s), auto-executing approved-threshold reads, auto-scout, and approved inspection script follow-ups."""
     auto_loops = 0
     while True:
         scout_cfg = _get_effective_scout_settings(db, gemini)
@@ -212,7 +521,9 @@ def _advance_turn(
         scout_auto = bool(scout_cfg.get("auto_approve"))
 
         history = _messages_to_history(db.list_messages(session.id))
-        turn = gemini.generate_turn(session, project, history, scout_enabled=scout_enabled, db=db)
+        turn = await asyncio.to_thread(
+            gemini.generate_turn, session, project, history, scout_enabled=scout_enabled, db=db
+        )
         usage = turn["usage"]
         db.record_api_usage(session.model, usage)
         updated_session = db.add_session_tokens(session.id, usage) or session
@@ -229,9 +540,15 @@ def _advance_turn(
         if not tool_calls:
             break
 
+        approved_scripts = bridge_svc.get_approved_inspection_scripts(
+            db.list_messages(session.id), project.root_path
+        )
         all_auto_approved = True
-        prepared_items: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
-        for tc in tool_calls:
+        prepared_items: List[tuple[Dict[str, Any], Dict[str, Any], bool]] = []
+        last_patch_idx_by_path: Dict[str, int] = {}
+        last_run_idx_by_path: Dict[str, int] = {}
+
+        for idx, tc in enumerate(tool_calls):
             if tc["name"] in SCOUT_TOOLS and not scout_enabled:
                 preview = {
                     "category": "error",
@@ -249,7 +566,42 @@ def _advance_turn(
                         "error": str(exc),
                         "estimated_tokens": 0,
                     }
-            prepared_items.append((tc, preview))
+
+            tc_args = tc.get("args") or {}
+            target_raw = str(tc_args.get("path") or tc_args.get("target") or "").strip()
+            target_rel = (
+                bridge_svc.normalize_project_rel_path(project.root_path, target_raw)
+                if target_raw
+                else None
+            )
+            is_approved_insp = bool(
+                target_rel
+                and target_rel in approved_scripts
+                and preview.get("category") != "error"
+                and tc["name"]
+                in (
+                    "patch_literal",
+                    "patch_lines",
+                    "write_file",
+                    "propose_inspection_script",
+                    "propose_script",
+                    "run_and_delete_script",
+                    "run_script",
+                )
+            )
+            if is_approved_insp and target_rel:
+                if tc["name"] in (
+                    "patch_literal",
+                    "patch_lines",
+                    "write_file",
+                    "propose_inspection_script",
+                    "propose_script",
+                ):
+                    last_patch_idx_by_path[target_rel] = idx
+                elif tc["name"] in ("run_and_delete_script", "run_script"):
+                    last_run_idx_by_path[target_rel] = idx
+
+            prepared_items.append((tc, preview, is_approved_insp))
             is_auto_read = (
                 tc["name"] in READ_ONLY_TOOLS
                 and preview.get("category") == "read"
@@ -262,14 +614,16 @@ def _advance_turn(
                 and scout_auto
                 and preview.get("category") == "scout"
             )
-            if not (is_auto_read or is_auto_scout):
+            if not (is_auto_read or is_auto_scout or is_approved_insp):
                 all_auto_approved = False
 
         if all_auto_approved and auto_loops < max_auto_loops:
             auto_loops += 1
-            for tc, preview in prepared_items:
+            for idx, (tc, preview, is_approved_insp) in enumerate(prepared_items):
+                tc_args = tc.get("args") or {}
                 if tc["name"] == "scout_workspace":
-                    scout_res = local_scout.run_scout_workspace(
+                    scout_res = await asyncio.to_thread(
+                        local_scout.run_scout_workspace,
                         gemini,
                         db,
                         project,
@@ -282,6 +636,83 @@ def _advance_turn(
                         event_loop=getattr(getattr(app, "state", None), "event_loop", None),
                     )
                     compact = _serialize_tool_response("scout_workspace", scout_res)
+                elif is_approved_insp:
+                    rel_posix = bridge_svc.normalize_project_rel_path(
+                        project.root_path,
+                        str(tc_args.get("path") or tc_args.get("target") or ""),
+                    )
+                    script_meta = approved_scripts.get(rel_posix or "") or {}
+                    if tc["name"] in (
+                        "patch_literal",
+                        "patch_lines",
+                        "write_file",
+                        "propose_inspection_script",
+                        "propose_script",
+                    ):
+                        compact, _ui = await execute_approved_script_patch(
+                            db,
+                            updated_session,
+                            project,
+                            tc["name"],
+                            tc_args,
+                            preview,
+                            summary_fallback=str(preview.get("summary") or tc["name"]),
+                        )
+                        if (
+                            rel_posix
+                            and idx == last_patch_idx_by_path.get(rel_posix)
+                            and last_run_idx_by_path.get(rel_posix, -1) <= idx
+                        ):
+                            raw_args = script_meta.get("args")
+                            arg_list = (
+                                shlex.split(str(raw_args), posix=(os.name != "nt"))
+                                if raw_args
+                                else []
+                            )
+                            run_resp, _run_ui = await execute_existing_script_run(
+                                db,
+                                updated_session,
+                                project,
+                                rel_posix=rel_posix,
+                                auto_delete=bool(script_meta.get("auto_delete", True)),
+                                arg_list=arg_list,
+                                raw_args_text=str(raw_args) if raw_args else None,
+                                focus=str(tc_args.get("focus") or "").strip() or None,
+                                app=app,
+                                gemini_client=gemini,
+                                scout_cfg=scout_cfg,
+                                auto_approved_inspection=True,
+                                auto_rerun_after_patch=True,
+                            )
+                            compact["auto_rerun"] = run_resp
+                    else:
+                        raw_args = tc_args.get("args")
+                        if isinstance(raw_args, list):
+                            arg_list = [str(x) for x in raw_args if str(x) != ""]
+                            raw_args_txt = " ".join(arg_list)
+                        elif isinstance(raw_args, str) and raw_args.strip():
+                            arg_list = shlex.split(raw_args.strip(), posix=(os.name != "nt"))
+                            raw_args_txt = raw_args.strip()
+                        else:
+                            arg_list = []
+                            raw_args_txt = None
+                        compact, _run_ui = await execute_existing_script_run(
+                            db,
+                            updated_session,
+                            project,
+                            rel_posix=rel_posix or "",
+                            auto_delete=(
+                                tc["name"] == "run_and_delete_script"
+                                or bool(script_meta.get("auto_delete"))
+                            ),
+                            arg_list=arg_list,
+                            raw_args_text=raw_args_txt,
+                            focus=str(tc_args.get("focus") or "").strip() or None,
+                            app=app,
+                            gemini_client=gemini,
+                            scout_cfg=scout_cfg,
+                            auto_approved_inspection=True,
+                        )
                 else:
                     compact = _serialize_tool_response(tc["name"], preview["prepared_result"])
                 db.add_message(
@@ -296,7 +727,7 @@ def _advance_turn(
             session = updated_session
             continue
 
-        for tc, preview in prepared_items:
+        for tc, preview, _is_approved_insp in prepared_items:
             if preview.get("category") == "error":
                 args = tc.get("args") or {}
                 target_label = str(
@@ -354,7 +785,7 @@ def _build_gemini_http_exception(gemini: Any, model_id: str, exc: Exception) -> 
 
 
 @router.post("/send")
-def send_chat_message(payload: ChatSendRequest, request: Request) -> Dict[str, Any]:
+async def send_chat_message(payload: ChatSendRequest, request: Request) -> Dict[str, Any]:
     db = request.app.state.db
     gemini = request.app.state.gemini
 
@@ -383,10 +814,23 @@ def send_chat_message(payload: ChatSendRequest, request: Request) -> Dict[str, A
         attachments=payload.attachments,
     )
 
+    app = getattr(request, "app", None)
+    if app is not None and hasattr(app, "state"):
+        app.state.event_loop = asyncio.get_running_loop()
     try:
-        return _advance_turn(db, gemini, session, project, app=getattr(request, "app", None))
+        return await _advance_turn(db, gemini, session, project, app=app)
     except Exception as exc:
         raise _build_gemini_http_exception(gemini, session.model, exc) from exc
+
+
+@router.post("/session/{session_id}/cancel-exec")
+def cancel_session_execution(
+    session_id: str,
+    gate_id: str | None = Query(default=None),
+    run_id: str | None = Query(default=None),
+) -> Dict[str, Any]:
+    count = runner.cancel_active_runs(session_id=session_id, gate_id=gate_id, run_id=run_id)
+    return {"ok": True, "session_id": session_id, "cancelled_count": count}
 
 
 @router.post("/scout/{run_id}/pause")
@@ -417,7 +861,7 @@ def stop_scout_run(run_id: str) -> Dict[str, Any]:
 
 
 @router.post("/retry")
-def retry_last_turn(payload: ChatRetryRequest, request: Request) -> Dict[str, Any]:
+async def retry_last_turn(payload: ChatRetryRequest, request: Request) -> Dict[str, Any]:
     db = request.app.state.db
     gemini = request.app.state.gemini
 
@@ -446,8 +890,11 @@ def retry_last_turn(payload: ChatRetryRequest, request: Request) -> Dict[str, An
             detail="Nothing to retry—the latest turn already has a Gemini response.",
         )
 
+    app = getattr(request, "app", None)
+    if app is not None and hasattr(app, "state"):
+        app.state.event_loop = asyncio.get_running_loop()
     try:
-        return _advance_turn(db, gemini, session, project, app=getattr(request, "app", None))
+        return await _advance_turn(db, gemini, session, project, app=app)
     except Exception as exc:
         raise _build_gemini_http_exception(gemini, session.model, exc) from exc
 
@@ -646,7 +1093,13 @@ async def _execute_gate_decision(
             return _record_gate_error(exc)
 
         if cp is not None:
-            cp_svc.record_write_in_checkpoint(db, cp, applied["path"], applied["existed_before"])
+            cp_svc.record_write_in_checkpoint(
+                db,
+                cp,
+                applied["path"],
+                applied["existed_before"],
+                source_backup_path=applied.get("backup_path"),
+            )
 
         patch_rec = db.add_patch_record(
             project_id=project.id,
@@ -688,7 +1141,13 @@ async def _execute_gate_decision(
             return _record_gate_error(exc)
 
         if cp is not None:
-            cp_svc.record_write_in_checkpoint(db, cp, applied["path"], existed_before=True)
+            cp_svc.record_write_in_checkpoint(
+                db,
+                cp,
+                applied["path"],
+                existed_before=True,
+                source_backup_path=applied.get("backup_path"),
+            )
 
         patch_rec = db.add_patch_record(
             project_id=project.id,
@@ -729,9 +1188,19 @@ async def _execute_gate_decision(
             return _record_gate_error(exc)
 
         if cp is not None:
-            cp_svc.record_write_in_checkpoint(db, cp, applied["old_path"], existed_before=True)
             cp_svc.record_write_in_checkpoint(
-                db, cp, applied["new_path"], existed_before=applied["dest_existed_before"]
+                db,
+                cp,
+                applied["old_path"],
+                existed_before=True,
+                source_backup_path=applied.get("backup_path"),
+            )
+            cp_svc.record_write_in_checkpoint(
+                db,
+                cp,
+                applied["new_path"],
+                existed_before=applied["dest_existed_before"],
+                source_backup_path=applied.get("dest_backup_path"),
             )
 
         patch_rec = db.add_patch_record(
@@ -781,7 +1250,13 @@ async def _execute_gate_decision(
                 return _record_gate_error(exc)
 
             if cp is not None:
-                cp_svc.record_write_in_checkpoint(db, cp, applied["path"], applied["existed_before"])
+                cp_svc.record_write_in_checkpoint(
+                    db,
+                    cp,
+                    applied["path"],
+                    applied["existed_before"],
+                    source_backup_path=applied.get("backup_path"),
+                )
 
             patch_rec = db.add_patch_record(
                 project_id=project.id,
@@ -826,7 +1301,13 @@ async def _execute_gate_decision(
                 return _record_gate_error(exc)
 
             if cp is not None:
-                cp_svc.record_write_in_checkpoint(db, cp, applied["path"], applied["existed_before"])
+                cp_svc.record_write_in_checkpoint(
+                    db,
+                    cp,
+                    applied["path"],
+                    applied["existed_before"],
+                    source_backup_path=applied.get("backup_path"),
+                )
 
             patch_rec = db.add_patch_record(
                 project_id=project.id,
@@ -842,8 +1323,11 @@ async def _execute_gate_decision(
             if decision.action in ("write_and_run", "write_run_and_delete"):
                 auto_delete = decision.action == "write_run_and_delete"
                 before_files = (
-                    cp_svc.list_project_relative_files(
-                        project.root_path, project.backup_dir, project.ignore_patterns
+                    await asyncio.to_thread(
+                        cp_svc.list_project_relative_files,
+                        project.root_path,
+                        project.backup_dir,
+                        project.ignore_patterns,
                     )
                     if cp is not None
                     else set()
@@ -855,11 +1339,16 @@ async def _execute_gate_decision(
                         f"python {shlex.quote(applied['path'])}",
                         configured_python=project.python_path,
                         source="gate",
+                        gate_id=gate_id,
+                        session_id=session.id,
                     )
                 except Exception as exc:
                     if cp is not None:
-                        after_files = cp_svc.list_project_relative_files(
-                            project.root_path, project.backup_dir, project.ignore_patterns
+                        after_files = await asyncio.to_thread(
+                            cp_svc.list_project_relative_files,
+                            project.root_path,
+                            project.backup_dir,
+                            project.ignore_patterns,
                         )
                         for new_rel in sorted(after_files - before_files):
                             cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
@@ -880,8 +1369,11 @@ async def _execute_gate_decision(
                     return extra_ui
 
                 if cp is not None:
-                    after_files = cp_svc.list_project_relative_files(
-                        project.root_path, project.backup_dir, project.ignore_patterns
+                    after_files = await asyncio.to_thread(
+                        cp_svc.list_project_relative_files,
+                        project.root_path,
+                        project.backup_dir,
+                        project.ignore_patterns,
                     )
                     for new_rel in sorted(after_files - before_files):
                         cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
@@ -897,13 +1389,14 @@ async def _execute_gate_decision(
                 raw_out = run_res.get("output") or ""
                 exec_id = run_res.get("exec_id")
                 focus_arg = str(args.get("focus") or "").strip() or None
+                cancelled = bool(run_res.get("cancelled"))
                 has_traceback = (
                     "Traceback (most recent call last):" in raw_out
                     or "\nSyntaxError:" in raw_out
                     or "\nImportError:" in raw_out
                     or "\nModuleNotFoundError:" in raw_out
                 )
-                passed = (run_res["exit_code"] == 0) and (not has_traceback)
+                passed = (not cancelled) and (run_res["exit_code"] == 0) and (not has_traceback)
                 summary_info = await _maybe_summarize_or_triage_output(
                     gemini=gemini_client,
                     db=db,
@@ -915,6 +1408,11 @@ async def _execute_gate_decision(
                     passed=passed,
                     focus=focus_arg,
                     exec_id=exec_id,
+                    cancelled=cancelled,
+                    app=app,
+                    session_id=session.id,
+                    gate_id=gate_id,
+                    run_id=run_res.get("run_id"),
                 )
                 if summary_info.get("summary"):
                     output_preview = ""
@@ -925,8 +1423,11 @@ async def _execute_gate_decision(
 
                 after_files_post: set[str] = set()
                 if cp is not None:
-                    after_files_post = cp_svc.list_project_relative_files(
-                        project.root_path, project.backup_dir, project.ignore_patterns
+                    after_files_post = await asyncio.to_thread(
+                        cp_svc.list_project_relative_files,
+                        project.root_path,
+                        project.backup_dir,
+                        project.ignore_patterns,
                     )
 
                 deleted_after_run = False
@@ -968,7 +1469,11 @@ async def _execute_gate_decision(
                         script_src = script_abs.read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     script_src = None
-                failure_kind = None if passed else classify_script_failure(raw_out, run_res["exit_code"], script_src)
+                failure_kind = (
+                    None
+                    if passed
+                    else ("runtime" if cancelled else classify_script_failure(raw_out, run_res["exit_code"], script_src))
+                )
                 still_on_disk = bool(script_src is not None and not deleted_after_run)
 
                 tool_resp = {
@@ -979,6 +1484,7 @@ async def _execute_gate_decision(
                     "exit_code": run_res["exit_code"],
                     "duration_ms": run_res["duration_ms"],
                     "passed": passed,
+                    "cancelled": cancelled,
                     "deleted": deleted_after_run,
                     "kept_for_patching": bool(auto_delete and not deleted_after_run),
                     "auto_delete_on_success": bool(auto_delete),
@@ -992,12 +1498,16 @@ async def _execute_gate_decision(
                     "has_traceback": has_traceback,
                     "generated_md_files": generated_md if passed else [],
                     "note": (
-                        f"Auto-deleted '{applied['path']}' after clean run (backed up first). Raw output exec_id={exec_id}."
-                        if deleted_after_run
+                        f"Execution of '{applied['path']}' stopped by operator (exec_id={exec_id})."
+                        if cancelled
                         else (
-                            f"Script failed; kept '{applied['path']}' on disk so you can retry or patch and re-run with run_and_delete_script."
-                            if auto_delete and not passed
-                            else f"Full output buffered as exec_id={exec_id} and shown in Console."
+                            f"Auto-deleted '{applied['path']}' after clean run (backed up first). Raw output exec_id={exec_id}."
+                            if deleted_after_run
+                            else (
+                                f"Script failed; kept '{applied['path']}' on disk so you can retry or patch and auto-rerun."
+                                if auto_delete and not passed
+                                else f"Full output buffered as exec_id={exec_id} and shown in Console."
+                            )
                         )
                     ),
                 }
@@ -1050,158 +1560,24 @@ async def _execute_gate_decision(
         except Exception as exc:
             return _record_gate_error(exc)
 
-        cp = db.get_active_checkpoint(session.id) if hasattr(db, "get_active_checkpoint") else None
-        before_files = (
-            cp_svc.list_project_relative_files(
-                project.root_path, project.backup_dir, project.ignore_patterns
-            )
-            if cp is not None
-            else set()
-        )
         try:
-            run_res = await runner.stream_project_command(
-                app,
-                project.root_path,
-                cmd,
-                configured_python=project.python_path,
-                source="gate",
+            tool_resp, script_ui = await execute_existing_script_run(
+                db,
+                session,
+                project,
+                rel_posix=rel_posix,
+                auto_delete=auto_delete,
+                arg_list=arg_list,
+                raw_args_text=str(raw_args) if isinstance(raw_args, str) and raw_args.strip() else None,
+                focus=str(args.get("focus") or "").strip() or None,
+                app=app,
+                gemini_client=gemini_client,
+                scout_cfg=scout_cfg,
+                gate_id=gate_id,
             )
+            extra_ui.update(script_ui)
         except Exception as exc:
-            if cp is not None:
-                after_files = cp_svc.list_project_relative_files(
-                    project.root_path, project.backup_dir, project.ignore_patterns
-                )
-                for new_rel in sorted(after_files - before_files):
-                    cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
             return _record_gate_error(exc)
-
-        if cp is not None:
-            after_files = cp_svc.list_project_relative_files(
-                project.root_path, project.backup_dir, project.ignore_patterns
-            )
-            for new_rel in sorted(after_files - before_files):
-                cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
-
-        generated_md = bridge_svc.find_recent_markdown_outputs(
-            project.root_path,
-            run_res.get("output", ""),
-            exclude_rel=rel_posix,
-        )
-        run_res["generated_md_files"] = generated_md
-        extra_ui["command_result"] = run_res
-        extra_ui["generated_md_files"] = generated_md
-        raw_out = run_res.get("output") or ""
-        exec_id = run_res.get("exec_id")
-        focus_arg = str(args.get("focus") or "").strip() or None
-        has_traceback = (
-            "Traceback (most recent call last):" in raw_out
-            or "\nSyntaxError:" in raw_out
-            or "\nImportError:" in raw_out
-            or "\nModuleNotFoundError:" in raw_out
-        )
-        passed = (run_res["exit_code"] == 0) and (not has_traceback)
-        summary_info = await _maybe_summarize_or_triage_output(
-            gemini=gemini_client,
-            db=db,
-            project=project,
-            scout_cfg=scout_cfg,
-            command=cmd,
-            raw_output=raw_out,
-            exit_code=run_res["exit_code"],
-            passed=passed,
-            focus=focus_arg,
-            exec_id=exec_id,
-        )
-        if summary_info.get("summary"):
-            output_preview = ""
-        elif not passed:
-            output_preview = bridge_svc.extract_failure_excerpt(raw_out, max_chars=3500)
-        else:
-            output_preview = bridge_svc.format_command_output_preview(raw_out, max_chars=12000)
-
-        deleted_after_run = False
-        del_backup_path = None
-        if auto_delete and passed and target_abs.is_file():
-            try:
-                del_preview = patch_tools.preview_delete_file(project.root_path, rel_posix)
-                del_res = patch_tools.apply_delete_file(
-                    project.root_path, project.backup_dir, del_preview
-                )
-                deleted_after_run = bool(del_res.get("deleted"))
-                del_backup_path = del_res.get("backup_path")
-                if cp is not None:
-                    latest_cp = db.get_checkpoint(cp.id) if hasattr(db, "get_checkpoint") else cp
-                    orig_created = set(getattr(latest_cp, "created_files", None) or [])
-                    orig_mods = set(getattr(latest_cp, "modified_files", None) or [])
-                    other_mods = orig_mods - {rel_posix}
-                    other_created = orig_created - {rel_posix}
-                    if deleted_after_run and (rel_posix in orig_created) and not other_mods and not other_created:
-                        cp_svc.discard_checkpoint(db, project, cp.id)
-                        cp = None
-                    else:
-                        cp_svc.record_write_in_checkpoint(db, cp, rel_posix, existed_before=True)
-                del_rec = db.add_patch_record(
-                    project_id=project.id,
-                    session_id=session.id,
-                    file_path=del_res["path"],
-                    backup_path=del_backup_path,
-                    existed_before=True,
-                    summary=f"Auto-deleted temporary script after pass: {del_res['path']}",
-                    diff=del_res["diff"],
-                )
-                extra_ui["patch_record"] = del_rec.model_dump()
-            except Exception:
-                deleted_after_run = False
-
-        script_src: Optional[str] = None
-        try:
-            if target_abs.is_file():
-                script_src = target_abs.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            script_src = None
-        failure_kind = None if passed else classify_script_failure(raw_out, run_res["exit_code"], script_src)
-        still_on_disk = bool(target_abs.is_file() and not deleted_after_run)
-
-        tool_resp = {
-            "executed": True,
-            "path": rel_posix,
-            "command": cmd,
-            "args": str(raw_args) if isinstance(raw_args, str) and raw_args.strip() else None,
-            "exec_id": exec_id,
-            "exit_code": run_res["exit_code"],
-            "duration_ms": run_res["duration_ms"],
-            "passed": passed,
-            "has_traceback": has_traceback,
-            "deleted": deleted_after_run,
-            "kept_for_patching": bool(auto_delete and not deleted_after_run),
-            "auto_delete_on_success": bool(auto_delete),
-            "failure_kind": failure_kind,
-            "retryable": bool((not passed) and failure_kind == "runtime" and still_on_disk),
-            "backup_path": del_backup_path,
-            "output_bytes": len(raw_out.encode("utf-8")),
-            "output_preview": output_preview,
-            "ai_summary": summary_info.get("summary"),
-            "ai_summary_model": summary_info.get("model_used"),
-            "generated_md_files": generated_md if passed else [],
-            "note": (
-                f"Auto-deleted '{rel_posix}' after clean run (backed up first). Raw output exec_id={exec_id}."
-                if deleted_after_run
-                else (
-                    f"Script failed; kept '{rel_posix}' on disk so you can retry or patch and re-run run_and_delete_script."
-                    if auto_delete and not passed
-                    else f"Full output buffered as exec_id={exec_id} and shown in Console."
-                )
-            ),
-        }
-        if not session.api_enabled and passed and generated_md:
-            first_md_path = generated_md[0]["path"]
-            try:
-                resolved_md = fs_tools.resolve_safe_path(project.root_path, first_md_path)
-                if resolved_md.is_file():
-                    extra_ui["generated_md_path"] = first_md_path
-                    extra_ui["generated_md_content"] = resolved_md.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
 
         db.resolve_gate(gate_id, "approved", tool_resp)
         db.add_message(
@@ -1227,6 +1603,8 @@ async def _execute_gate_decision(
                 cmd,
                 configured_python=project.python_path,
                 source="gate",
+                gate_id=gate_id,
+                session_id=session.id,
             )
         except Exception as exc:
             return _record_gate_error(exc)
@@ -1235,6 +1613,7 @@ async def _execute_gate_decision(
         raw_out = run_res.get("output") or ""
         exec_id = run_res.get("exec_id")
         focus_arg = str(args.get("focus") or "").strip() or None
+        cancelled = bool(run_res.get("cancelled"))
         has_traceback = (
             "Traceback (most recent call last):" in raw_out
             or "\nSyntaxError:" in raw_out
@@ -1242,7 +1621,7 @@ async def _execute_gate_decision(
             or "\nImportError:" in raw_out
             or "\nModuleNotFoundError:" in raw_out
         )
-        passed = (run_res["exit_code"] == 0) and (not has_traceback)
+        passed = (not cancelled) and (run_res["exit_code"] == 0) and (not has_traceback)
         summary_info = await _maybe_summarize_or_triage_output(
             gemini=gemini_client,
             db=db,
@@ -1254,6 +1633,11 @@ async def _execute_gate_decision(
             passed=passed,
             focus=focus_arg,
             exec_id=exec_id,
+            cancelled=cancelled,
+            app=app,
+            session_id=session.id,
+            gate_id=gate_id,
+            run_id=run_res.get("run_id"),
         )
         committed_cp = None
         if summary_info.get("summary"):
@@ -1279,6 +1663,7 @@ async def _execute_gate_decision(
             "exit_code": run_res["exit_code"],
             "duration_ms": run_res["duration_ms"],
             "passed": passed,
+            "cancelled": cancelled,
             "has_traceback": has_traceback,
             "output_bytes": len(raw_out.encode("utf-8")),
             "output_preview": output_preview,
@@ -1372,7 +1757,7 @@ async def resolve_tool_gate(
         }
 
     try:
-        result = _advance_turn(db, gemini, session, project, app=app)
+        result = await _advance_turn(db, gemini, session, project, app=app)
         result.update(extra_ui)
         return result
     except Exception as exc:
@@ -1457,7 +1842,7 @@ async def resolve_tool_gates_batch(
         }
 
     try:
-        result = _advance_turn(db, gemini, session, project, app=app)
+        result = await _advance_turn(db, gemini, session, project, app=app)
         result.update(last_extra)
         return result
     except Exception as exc:
@@ -1512,8 +1897,11 @@ async def retry_failed_script(
 
     cp = db.get_active_checkpoint(session.id) if hasattr(db, "get_active_checkpoint") else None
     before_files = (
-        cp_svc.list_project_relative_files(
-            project.root_path, project.backup_dir, project.ignore_patterns
+        await asyncio.to_thread(
+            cp_svc.list_project_relative_files,
+            project.root_path,
+            project.backup_dir,
+            project.ignore_patterns,
         )
         if cp is not None
         else set()
@@ -1527,19 +1915,26 @@ async def retry_failed_script(
             cmd,
             configured_python=project.python_path,
             source="gate",
+            session_id=session.id,
         )
     except Exception as exc:
         if cp is not None:
-            after_files = cp_svc.list_project_relative_files(
-                project.root_path, project.backup_dir, project.ignore_patterns
+            after_files = await asyncio.to_thread(
+                cp_svc.list_project_relative_files,
+                project.root_path,
+                project.backup_dir,
+                project.ignore_patterns,
             )
             for new_rel in sorted(after_files - before_files):
                 cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
         raise HTTPException(status_code=500, detail=f"Failed to retry '{rel_posix}': {exc}") from exc
 
     if cp is not None:
-        after_files = cp_svc.list_project_relative_files(
-            project.root_path, project.backup_dir, project.ignore_patterns
+        after_files = await asyncio.to_thread(
+            cp_svc.list_project_relative_files,
+            project.root_path,
+            project.backup_dir,
+            project.ignore_patterns,
         )
         for new_rel in sorted(after_files - before_files):
             cp_svc.record_write_in_checkpoint(db, cp, new_rel, existed_before=False)
@@ -1556,13 +1951,14 @@ async def retry_failed_script(
 
     raw_out = run_res.get("output") or ""
     exec_id = run_res.get("exec_id")
+    cancelled = bool(run_res.get("cancelled"))
     has_traceback = (
         "Traceback (most recent call last):" in raw_out
         or "\nSyntaxError:" in raw_out
         or "\nImportError:" in raw_out
         or "\nModuleNotFoundError:" in raw_out
     )
-    passed = (run_res["exit_code"] == 0) and (not has_traceback)
+    passed = (not cancelled) and (run_res["exit_code"] == 0) and (not has_traceback)
 
     scout_cfg = _get_effective_scout_settings(db, gemini)
     focus_arg = str(payload.focus or "").strip() or None
@@ -1577,6 +1973,10 @@ async def retry_failed_script(
         passed=passed,
         focus=focus_arg,
         exec_id=exec_id,
+        cancelled=cancelled,
+        app=app,
+        session_id=session.id,
+        run_id=run_res.get("run_id"),
     )
     if summary_info.get("summary"):
         output_preview = ""
@@ -1605,7 +2005,13 @@ async def retry_failed_script(
                     cp_svc.discard_checkpoint(db, project, cp.id)
                     cp = None
                 else:
-                    cp_svc.record_write_in_checkpoint(db, cp, rel_posix, existed_before=True)
+                    cp_svc.record_write_in_checkpoint(
+                        db,
+                        cp,
+                        rel_posix,
+                        existed_before=True,
+                        source_backup_path=del_backup_path,
+                    )
             del_rec = db.add_patch_record(
                 project_id=project.id,
                 session_id=session.id,
@@ -1619,7 +2025,11 @@ async def retry_failed_script(
         except Exception:
             deleted_after_run = False
 
-    failure_kind = None if passed else classify_script_failure(raw_out, run_res["exit_code"], script_src)
+    failure_kind = (
+        None
+        if passed
+        else ("runtime" if cancelled else classify_script_failure(raw_out, run_res["exit_code"], script_src))
+    )
     still_on_disk = bool(target_abs.is_file() and not deleted_after_run)
     event_tool_name = (
         payload.tool_name
@@ -1635,6 +2045,7 @@ async def retry_failed_script(
         "exit_code": run_res["exit_code"],
         "duration_ms": run_res["duration_ms"],
         "passed": passed,
+        "cancelled": cancelled,
         "has_traceback": has_traceback,
         "deleted": deleted_after_run,
         "kept_for_patching": bool(payload.auto_delete and not deleted_after_run),
@@ -1648,12 +2059,16 @@ async def retry_failed_script(
         "ai_summary_model": summary_info.get("model_used"),
         "generated_md_files": generated_md if passed else [],
         "note": (
-            f"Auto-deleted '{rel_posix}' after clean retry (backed up first). Raw output exec_id={exec_id}."
-            if deleted_after_run
+            f"Execution of '{rel_posix}' stopped by operator (exec_id={exec_id})."
+            if cancelled
             else (
-                f"Script failed on retry; kept '{rel_posix}' on disk."
-                if payload.auto_delete and not passed
-                else f"Full output buffered as exec_id={exec_id} and shown in Console."
+                f"Auto-deleted '{rel_posix}' after clean retry (backed up first). Raw output exec_id={exec_id}."
+                if deleted_after_run
+                else (
+                    f"Script failed on retry; kept '{rel_posix}' on disk."
+                    if payload.auto_delete and not passed
+                    else f"Full output buffered as exec_id={exec_id} and shown in Console."
+                )
             )
         ),
     }
@@ -1743,7 +2158,7 @@ async def retry_failed_script(
         return resp_payload
 
     try:
-        result = _advance_turn(db, gemini, session, project, app=app)
+        result = await _advance_turn(db, gemini, session, project, app=app)
         result.update(extra_ui)
         return result
     except Exception as exc:

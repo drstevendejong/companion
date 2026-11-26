@@ -141,6 +141,7 @@ def _make_stub_modules():
 
     fastapi_mod.APIRouter = _APIRouter
     fastapi_mod.HTTPException = Exception
+    fastapi_mod.Query = lambda default=None, **_kw: default
     fastapi_mod.Request = object
 
     return {

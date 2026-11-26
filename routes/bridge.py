@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
-from typing import Any, Dict, List
+import shlex
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -17,7 +19,12 @@ from models import (
     BridgeParseRequest,
     SessionUpdate,
 )
-from routes.chat import _get_effective_scout_settings, _maybe_append_scout_notice
+from routes.chat import (
+    _get_effective_scout_settings,
+    _maybe_append_scout_notice,
+    execute_approved_script_patch,
+    execute_existing_script_run,
+)
 from services import bridge as bridge_svc
 from services import fs_tools, local_scout
 from services.gemini_client import READ_ONLY_TOOLS, SCOUT_TOOLS, prepare_tool_gate_preview
@@ -129,10 +136,67 @@ async def parse_bridge_response(payload: BridgeParseRequest, request: Request) -
         tool_calls=tool_calls_trace,
     )
 
+    def _parse_script_args(raw_args: Any) -> tuple[List[str], Optional[str]]:
+        if isinstance(raw_args, list):
+            lst = [str(x) for x in raw_args if str(x) != ""]
+            return lst, (" ".join(lst) if lst else None)
+        if isinstance(raw_args, str) and raw_args.strip():
+            txt = raw_args.strip()
+            return shlex.split(txt, posix=(os.name != "nt")), txt
+        return [], None
+
+    approved_scripts = bridge_svc.get_approved_inspection_scripts(
+        db.list_messages(session.id), project.root_path
+    )
+    last_patch_idx_by_path: Dict[str, int] = {}
+    last_run_idx_by_path: Dict[str, int] = {}
+    for idx, act in enumerate(actions):
+        tname = act["tool"]
+        targs = act["args"]
+        traw = str(targs.get("path") or targs.get("target") or "").strip()
+        trel = bridge_svc.normalize_project_rel_path(project.root_path, traw) if traw else None
+        if not (trel and trel in approved_scripts):
+            continue
+        if tname in (
+            "patch_literal",
+            "patch_lines",
+            "write_file",
+            "propose_inspection_script",
+            "propose_script",
+        ) or (
+            tname == "run_and_delete_script"
+            and isinstance(targs.get("content"), str)
+            and targs["content"].strip()
+        ):
+            last_patch_idx_by_path[trel] = idx
+        elif tname in ("run_and_delete_script", "run_script"):
+            last_run_idx_by_path[trel] = idx
+
     staged = 0
     auto_executed = 0
     error_count = 0
     warnings: List[str] = []
+    command_results: List[Dict[str, Any]] = []
+    last_patch_record: Optional[Dict[str, Any]] = None
+    generated_md_files: List[Dict[str, Any]] = []
+    generated_md_path: Optional[str] = None
+    generated_md_content: Optional[str] = None
+
+    def _collect_run_ui(run_ui: Dict[str, Any]) -> None:
+        nonlocal last_patch_record, generated_md_path, generated_md_content
+        if run_ui.get("command_result"):
+            command_results.append(run_ui["command_result"])
+        if run_ui.get("patch_record"):
+            last_patch_record = run_ui["patch_record"]
+        for md_item in run_ui.get("generated_md_files") or []:
+            if md_item and md_item.get("path") and not any(
+                x.get("path") == md_item["path"] for x in generated_md_files
+            ):
+                generated_md_files.append(md_item)
+        if run_ui.get("generated_md_path") and run_ui.get("generated_md_content") is not None:
+            generated_md_path = run_ui["generated_md_path"]
+            generated_md_content = run_ui["generated_md_content"]
+
     if not actions and re.search(r'"(?:tool|tool_name)"\s*:', payload.raw_markdown or ""):
         warnings.append(
             "Detected tool JSON markers in pasted text, but could not extract valid tool actions "
@@ -184,7 +248,7 @@ async def parse_bridge_response(payload: BridgeParseRequest, request: Request) -
             )
             continue
 
-        # Safety guarantee: never auto-approve writes, patches, or executable scripts
+        # Safety guarantee: never auto-approve arbitrary writes, patches, or unapproved scripts
         if (
             payload.auto_approve_reads
             and tool_name in READ_ONLY_TOOLS
@@ -250,6 +314,255 @@ async def parse_bridge_response(payload: BridgeParseRequest, request: Request) -
                 )
                 continue
 
+        # Auto-approve patches & re-runs for already-approved active inspection scripts
+        target_raw = str(args.get("path") or args.get("target") or "").strip()
+        target_rel = (
+            bridge_svc.normalize_project_rel_path(project.root_path, target_raw)
+            if target_raw
+            else None
+        )
+        if target_rel and target_rel in approved_scripts:
+            script_meta = approved_scripts[target_rel]
+            is_script_patch = tool_name in ("patch_literal", "patch_lines", "write_file")
+            is_script_repropose = tool_name in ("propose_inspection_script", "propose_script") or (
+                tool_name == "run_and_delete_script" and "prepared_patch" in preview
+            )
+            is_script_rerun = tool_name in ("run_and_delete_script", "run_script") and not is_script_repropose
+
+            if is_script_patch:
+                try:
+                    patch_resp, patch_extra = await execute_approved_script_patch(
+                        db,
+                        session,
+                        project,
+                        tool_name,
+                        args,
+                        preview,
+                        summary_fallback=str(preview.get("summary") or tool_name),
+                    )
+                    if patch_extra.get("patch_record"):
+                        last_patch_record = patch_extra["patch_record"]
+                    db.add_message(
+                        session.id,
+                        role="tool_event",
+                        text=json.dumps({
+                            "tool_name": tool_name,
+                            "call_id": f"bridge-{idx}",
+                            "response": patch_resp,
+                        }),
+                    )
+                    auto_executed += 1
+                except Exception as exc:
+                    warnings.append(f"{tool_name}: {exc}")
+                    error_count += 1
+                    db.add_message(
+                        session.id,
+                        role="tool_event",
+                        text=json.dumps({
+                            "tool_name": tool_name,
+                            "call_id": f"bridge-{idx}",
+                            "response": {"error": str(exc), "target": target_label},
+                        }),
+                    )
+                    continue
+
+                if (
+                    idx == last_patch_idx_by_path.get(target_rel)
+                    and last_run_idx_by_path.get(target_rel, -1) <= idx
+                ):
+                    auto_del = bool(script_meta.get("auto_delete", True))
+                    rerun_tool = "run_and_delete_script" if auto_del else "run_script"
+                    raw_args = args.get("args") if args.get("args") is not None else script_meta.get("args")
+                    arg_list, raw_args_txt = _parse_script_args(raw_args)
+                    try:
+                        run_resp, run_ui = await execute_existing_script_run(
+                            db,
+                            session,
+                            project,
+                            rel_posix=target_rel,
+                            auto_delete=auto_del,
+                            arg_list=arg_list,
+                            raw_args_text=raw_args_txt,
+                            focus=str(args.get("focus") or "").strip() or None,
+                            app=app,
+                            gemini_client=gemini,
+                            scout_cfg=scout_cfg,
+                            auto_approved_inspection=True,
+                            auto_rerun_after_patch=True,
+                        )
+                        _collect_run_ui(run_ui)
+                        if run_resp.get("deleted"):
+                            approved_scripts.pop(target_rel, None)
+                        db.add_message(
+                            session.id,
+                            role="tool_event",
+                            text=json.dumps({
+                                "tool_name": rerun_tool,
+                                "call_id": f"bridge-{idx}-rerun",
+                                "response": run_resp,
+                            }),
+                        )
+                    except Exception as exc:
+                        warnings.append(f"{rerun_tool}: {exc}")
+                        error_count += 1
+                        db.add_message(
+                            session.id,
+                            role="tool_event",
+                            text=json.dumps({
+                                "tool_name": rerun_tool,
+                                "call_id": f"bridge-{idx}-rerun",
+                                "response": {"error": str(exc), "target": target_rel},
+                            }),
+                        )
+                continue
+
+            if is_script_repropose:
+                try:
+                    patch_resp, patch_extra = await execute_approved_script_patch(
+                        db,
+                        session,
+                        project,
+                        tool_name,
+                        args,
+                        preview,
+                        summary_fallback=str(preview.get("summary") or tool_name),
+                    )
+                    if patch_extra.get("patch_record"):
+                        last_patch_record = patch_extra["patch_record"]
+                except Exception as exc:
+                    warnings.append(f"{tool_name}: {exc}")
+                    error_count += 1
+                    db.add_message(
+                        session.id,
+                        role="tool_event",
+                        text=json.dumps({
+                            "tool_name": tool_name,
+                            "call_id": f"bridge-{idx}",
+                            "response": {"error": str(exc), "target": target_label},
+                        }),
+                    )
+                    continue
+
+                if last_run_idx_by_path.get(target_rel, -1) <= idx:
+                    auto_del = bool(args.get("delete_on_success", script_meta.get("auto_delete", True)))
+                    raw_args = args.get("args") if args.get("args") is not None else script_meta.get("args")
+                    arg_list, raw_args_txt = _parse_script_args(raw_args)
+                    try:
+                        run_resp, run_ui = await execute_existing_script_run(
+                            db,
+                            session,
+                            project,
+                            rel_posix=target_rel,
+                            auto_delete=auto_del,
+                            arg_list=arg_list,
+                            raw_args_text=raw_args_txt,
+                            focus=str(args.get("focus") or "").strip() or None,
+                            app=app,
+                            gemini_client=gemini,
+                            scout_cfg=scout_cfg,
+                            auto_approved_inspection=True,
+                            auto_rerun_after_patch=True,
+                        )
+                        _collect_run_ui(run_ui)
+                        if run_resp.get("deleted"):
+                            approved_scripts.pop(target_rel, None)
+                        merged_resp = {
+                            **run_resp,
+                            "written": True,
+                            "backup_path": run_resp.get("backup_path") or patch_resp.get("backup_path"),
+                            "bytes_written": patch_resp.get("bytes_written"),
+                        }
+                        db.add_message(
+                            session.id,
+                            role="tool_event",
+                            text=json.dumps({
+                                "tool_name": tool_name,
+                                "call_id": f"bridge-{idx}",
+                                "response": merged_resp,
+                            }),
+                        )
+                        auto_executed += 1
+                    except Exception as exc:
+                        warnings.append(f"{tool_name}: {exc}")
+                        error_count += 1
+                        db.add_message(
+                            session.id,
+                            role="tool_event",
+                            text=json.dumps({
+                                "tool_name": tool_name,
+                                "call_id": f"bridge-{idx}",
+                                "response": {"error": str(exc), "target": target_rel},
+                            }),
+                        )
+                else:
+                    db.add_message(
+                        session.id,
+                        role="tool_event",
+                        text=json.dumps({
+                            "tool_name": tool_name,
+                            "call_id": f"bridge-{idx}",
+                            "response": {
+                                "written": True,
+                                "executed": False,
+                                "path": patch_resp["path"],
+                                "backup_path": patch_resp.get("backup_path"),
+                                "bytes_written": patch_resp.get("bytes_written"),
+                                "auto_approved_inspection_script": True,
+                            },
+                        }),
+                    )
+                    auto_executed += 1
+                continue
+
+            if is_script_rerun:
+                auto_del = (
+                    tool_name == "run_and_delete_script"
+                    or bool(script_meta.get("auto_delete"))
+                )
+                raw_args = args.get("args") if args.get("args") is not None else script_meta.get("args")
+                arg_list, raw_args_txt = _parse_script_args(raw_args)
+                try:
+                    run_resp, run_ui = await execute_existing_script_run(
+                        db,
+                        session,
+                        project,
+                        rel_posix=target_rel,
+                        auto_delete=auto_del,
+                        arg_list=arg_list,
+                        raw_args_text=raw_args_txt,
+                        focus=str(args.get("focus") or "").strip() or None,
+                        app=app,
+                        gemini_client=gemini,
+                        scout_cfg=scout_cfg,
+                        auto_approved_inspection=True,
+                    )
+                    _collect_run_ui(run_ui)
+                    if run_resp.get("deleted"):
+                        approved_scripts.pop(target_rel, None)
+                    db.add_message(
+                        session.id,
+                        role="tool_event",
+                        text=json.dumps({
+                            "tool_name": tool_name,
+                            "call_id": f"bridge-{idx}",
+                            "response": run_resp,
+                        }),
+                    )
+                    auto_executed += 1
+                except Exception as exc:
+                    warnings.append(f"{tool_name}: {exc}")
+                    error_count += 1
+                    db.add_message(
+                        session.id,
+                        role="tool_event",
+                        text=json.dumps({
+                            "tool_name": tool_name,
+                            "call_id": f"bridge-{idx}",
+                            "response": {"error": str(exc), "target": target_rel},
+                        }),
+                    )
+                continue
+
         ui_preview = {
             k: v for k, v in preview.items()
             if k not in ("prepared_result", "prepared_patch")
@@ -291,6 +604,12 @@ async def parse_bridge_response(payload: BridgeParseRequest, request: Request) -
         "bridge_reply_text": bridge_reply_text,
         "error_reply_text": error_reply_text,
         "warnings": warnings,
+        "command_results": command_results,
+        "command_result": command_results[-1] if command_results else None,
+        "patch_record": last_patch_record,
+        "generated_md_files": generated_md_files,
+        "generated_md_path": generated_md_path,
+        "generated_md_content": generated_md_content,
         "telemetry": local_scout.get_telemetry_snapshot(
             db, gemini, model=getattr(session, "model", None)
         ),

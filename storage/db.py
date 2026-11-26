@@ -265,7 +265,6 @@ class CompanionDB:
             backup_dir=row["backup_dir"],
             post_patch_command=row["post_patch_command"],
             fast_test_command=row["fast_test_command"] if "fast_test_command" in row_keys else None,
-            cdp_port=row["cdp_port"],
             ignore_patterns=json.loads(row["ignore_patterns_json"] or "[]"),
             preset_commands=presets,
             created_at=row["created_at"],
@@ -294,10 +293,10 @@ class CompanionDB:
                 """
                 INSERT INTO projects (
                     id, name, root_path, python_path, directives_path,
-                    backup_dir, post_patch_command, fast_test_command, cdp_port,
+                    backup_dir, post_patch_command, fast_test_command,
                     ignore_patterns_json, preset_commands_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -308,7 +307,6 @@ class CompanionDB:
                     data.backup_dir,
                     data.post_patch_command,
                     data.fast_test_command,
-                    data.cdp_port,
                     json.dumps(data.ignore_patterns),
                     json.dumps([p.model_dump() for p in data.preset_commands]),
                     now,
@@ -331,7 +329,7 @@ class CompanionDB:
                 """
                 UPDATE projects SET
                     name = ?, root_path = ?, python_path = ?, directives_path = ?,
-                    backup_dir = ?, post_patch_command = ?, fast_test_command = ?, cdp_port = ?,
+                    backup_dir = ?, post_patch_command = ?, fast_test_command = ?,
                     ignore_patterns_json = ?, preset_commands_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -343,7 +341,6 @@ class CompanionDB:
                     updated.backup_dir,
                     updated.post_patch_command,
                     updated.fast_test_command,
-                    updated.cdp_port,
                     json.dumps(updated.ignore_patterns),
                     json.dumps([p.model_dump() for p in updated.preset_commands]),
                     now,
@@ -1294,9 +1291,10 @@ class CompanionDB:
             else:
                 if norm not in created:
                     created.append(norm)
+            next_count = max(int(row["files_count"] or 0), len(set(mods) | set(created)))
             conn.execute(
-                "UPDATE checkpoints SET modified_files_json = ?, created_files_json = ? WHERE id = ?",
-                (json.dumps(mods), json.dumps(created), checkpoint_id),
+                "UPDATE checkpoints SET modified_files_json = ?, created_files_json = ?, files_count = ? WHERE id = ?",
+                (json.dumps(mods), json.dumps(created), next_count, checkpoint_id),
             )
             updated = conn.execute("SELECT * FROM checkpoints WHERE id = ?", (checkpoint_id,)).fetchone()
         return self._row_to_checkpoint(updated) if updated else None

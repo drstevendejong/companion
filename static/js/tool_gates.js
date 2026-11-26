@@ -5,10 +5,12 @@ import { formatBridgeToolResults, getTrailingToolBatchKey } from "./bridge.js";
 import { emit, getActiveProject, on, state } from "./state.js";
 
 const gatesContainer = document.getElementById("pending-gates");
+let gateElapsedTimer = null;
 
 export function initToolGates() {
   on("chat:loaded", renderPendingGates);
   on("gates:changed", renderPendingGates);
+  on("chat:live-exec", updateGateLiveStatus);
   document.addEventListener("click", (ev) => {
     if (!gatesContainer) return;
     for (const menu of gatesContainer.querySelectorAll(".split-btn-menu:not(.hidden)")) {
@@ -32,9 +34,69 @@ export function initToolGates() {
   });
 }
 
+function formatGateIdleNote() {
+  const exec = state.liveExec;
+  if (!exec) return "waiting for output";
+  if (exec.phaseText) {
+    const phaseStartedAt = Number(exec.phaseStartedAtMs || Date.now());
+    const phaseSec = Math.max(0, Math.floor((Date.now() - phaseStartedAt) / 1000));
+    return exec.phase === "scout_triage" ? `triaging (${phaseSec}s)` : `summarizing (${phaseSec}s)`;
+  }
+  const bytes = Number(exec.bytesReceived || (exec.output ? exec.output.length : 0) || 0);
+  if (bytes <= 0) return "waiting for output";
+  const lastAt = Number(exec.lastOutputAtMs || Date.now());
+  const idleSec = Math.max(0, Math.floor((Date.now() - lastAt) / 1000));
+  return idleSec >= 2 ? `${bytes.toLocaleString()} B · silent ${idleSec}s` : `${bytes.toLocaleString()} B streaming`;
+}
+
+function updateGateLiveStatus() {
+  if (!gatesContainer || !state.resolvingGateId) return;
+  const startedAt = Number(
+    state.pendingStartedAtMs || (state.liveExec && state.liveExec.startedAtMs) || Date.now()
+  );
+  const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  for (const el of gatesContainer.querySelectorAll("[data-gate-elapsed]")) {
+    el.textContent = `${elapsedSec}s`;
+  }
+  const idleNote = ` · ${formatGateIdleNote()}`;
+  for (const el of gatesContainer.querySelectorAll("[data-gate-idle]")) {
+    el.textContent = idleNote;
+  }
+  const phaseText = state.liveExec && state.liveExec.phaseText;
+  for (const el of gatesContainer.querySelectorAll("[data-gate-status]")) {
+    el.textContent = phaseText || el.getAttribute("data-default-status") || el.textContent;
+  }
+  const hideStop = Boolean(state.liveExec && state.liveExec.done && state.liveExec.phaseText);
+  for (const btn of gatesContainer.querySelectorAll("[data-stop-exec]")) {
+    btn.classList.toggle("hidden", hideStop);
+    if (!hideStop && btn.textContent === "Stop Execution") {
+      btn.disabled = false;
+    }
+  }
+}
+
+function ensureGateElapsedTimer() {
+  if (gateElapsedTimer !== null) return;
+  gateElapsedTimer = window.setInterval(() => {
+    if (!state.resolvingGateId) {
+      clearGateElapsedTimer();
+      return;
+    }
+    updateGateLiveStatus();
+  }, 1000);
+}
+
+function clearGateElapsedTimer() {
+  if (gateElapsedTimer !== null) {
+    window.clearInterval(gateElapsedTimer);
+    gateElapsedTimer = null;
+  }
+}
+
 function renderPendingGates() {
   const gates = state.pendingGates || [];
   if (gates.length === 0 || state.gatesHiddenDueToError) {
+    clearGateElapsedTimer();
     gatesContainer.classList.add("hidden");
     gatesContainer.innerHTML = "";
     return;
@@ -332,18 +394,80 @@ function renderPendingGates() {
     );
 
     if (state.resolvingGateId === gate.id || state.resolvingGateId === "__batch__") {
+      ensureGateElapsedTimer();
       const statusRow = document.createElement("div");
-      statusRow.className = "meta-line mono";
-      statusRow.dataset.liveStatus = "gate";
+      statusRow.className = "live-status-row";
+      statusRow.setAttribute("data-live-status", "gate");
+
+      const pulseDot = document.createElement("span");
+      pulseDot.className = "live-pulse-dot";
+      pulseDot.setAttribute("aria-hidden", "true");
+
+      const statusText = document.createElement("span");
+      statusText.className = "meta-line mono";
+      statusText.setAttribute("data-gate-status", "true");
       const remainingAfterThis = Math.max(0, gates.length - 1);
-      if (!state.apiEnabled) {
-        statusRow.textContent = "Executing approved action locally (Bridge mode)...";
+      let defaultStatusText = "";
+      if (state.pendingStatusText) {
+        defaultStatusText = state.pendingStatusText;
+      } else if (!state.apiEnabled) {
+        defaultStatusText = "Executing approved action locally (Bridge mode)...";
       } else {
-        statusRow.textContent =
+        defaultStatusText =
           state.resolvingGateId === "__batch__" || remainingAfterThis === 0
             ? "Executing approved action & waiting for Gemini..."
             : `Executing action (${remainingAfterThis} gate(s) left before Gemini responds)...`;
       }
+      statusText.setAttribute("data-default-status", defaultStatusText);
+      statusText.textContent = (state.liveExec && state.liveExec.phaseText) || defaultStatusText;
+
+      const startedAt = Number(
+        state.pendingStartedAtMs || (state.liveExec && state.liveExec.startedAtMs) || Date.now()
+      );
+      const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      const timerSpan = document.createElement("span");
+      timerSpan.className = "live-status-meta mono tabular";
+      const elapsedEl = document.createElement("span");
+      elapsedEl.setAttribute("data-gate-elapsed", "true");
+      elapsedEl.textContent = `${elapsedSec}s`;
+      const idleEl = document.createElement("span");
+      idleEl.setAttribute("data-gate-idle", "true");
+      idleEl.textContent = ` · ${formatGateIdleNote()}`;
+      timerSpan.append(elapsedEl, idleEl);
+
+      const stopBtn = document.createElement("button");
+      stopBtn.type = "button";
+      stopBtn.className = "btn btn-danger btn-xs btn-stop-exec";
+      stopBtn.setAttribute("data-stop-exec", "true");
+      stopBtn.textContent = "Stop Execution";
+      stopBtn.title = "Terminate the active subprocess immediately";
+      if (state.liveExec && state.liveExec.done && state.liveExec.phaseText) {
+        stopBtn.classList.add("hidden");
+        stopBtn.disabled = true;
+      }
+      stopBtn.addEventListener("click", async () => {
+        stopBtn.disabled = true;
+        stopBtn.textContent = "Stopping...";
+        const abortCtrl = state.activeAbortController;
+        const fallbackTimer = window.setTimeout(() => {
+          if (abortCtrl) abortCtrl.abort();
+        }, 2500);
+        try {
+          if (state.activeSessionId) {
+            await api.cancelExec(
+              state.activeSessionId,
+              state.resolvingGateId === "__batch__" ? null : gate.id,
+              (state.liveExec && state.liveExec.runId) || null
+            );
+          }
+        } catch {
+          if (abortCtrl) abortCtrl.abort();
+        } finally {
+          window.clearTimeout(fallbackTimer);
+        }
+      });
+
+      statusRow.append(pulseDot, statusText, timerSpan, stopBtn);
       card.appendChild(statusRow);
 
       const cmdText = String((state.liveExec && state.liveExec.command) || "");
@@ -355,9 +479,9 @@ function renderPendingGates() {
       if ((isExecutableGate || Boolean(state.liveExec)) && matchesBatch) {
         const liveSlice = formatGateLiveSlice(state.liveExec && state.liveExec.output);
         const livePre = document.createElement("pre");
-        livePre.className = `exec-preview${liveSlice ? "" : " hidden"}`;
+        livePre.className = `exec-preview${liveSlice ? "" : " is-empty"}`;
         livePre.dataset.liveExec = `gate-card-${gate.id}`;
-        livePre.textContent = liveSlice;
+        livePre.textContent = liveSlice || "(Waiting for stdout / stderr output...)";
         card.appendChild(livePre);
       }
     } else {
@@ -373,6 +497,8 @@ function renderPendingGates() {
     if (activeTarget && typeof activeTarget.scrollIntoView === "function") {
       activeTarget.scrollIntoView({ block: "nearest" });
     }
+  } else {
+    clearGateElapsedTimer();
   }
 }
 
@@ -389,6 +515,7 @@ async function decideGate(gateId, body) {
   state.busy = true;
   state.liveExec = null;
   state.resolvingGateId = gateId;
+  state.pendingStartedAtMs = Date.now();
   if (
     gateObj &&
     (gateObj.tool_name === "propose_inspection_script" || gateObj.tool_name === "propose_script") &&
@@ -444,9 +571,11 @@ async function decideGate(gateId, body) {
     if (state.activeAbortController === controller) {
       state.activeAbortController = null;
     }
+    clearGateElapsedTimer();
     state.busy = false;
     state.resolvingGateId = null;
     state.pendingStatusText = null;
+    state.pendingStartedAtMs = null;
     state.liveExec = null;
     emit("gates:changed");
   }
@@ -459,6 +588,7 @@ async function decideBatchGates(decisions, willCallGemini) {
   state.busy = true;
   state.liveExec = null;
   state.resolvingGateId = "__batch__";
+  state.pendingStartedAtMs = Date.now();
   state.pendingStatusText =
     !state.apiEnabled
       ? `Executing ${decisions.length} gates locally...`
@@ -478,17 +608,21 @@ async function decideBatchGates(decisions, willCallGemini) {
     if (state.activeAbortController === controller) {
       state.activeAbortController = null;
     }
+    clearGateElapsedTimer();
     state.busy = false;
     state.resolvingGateId = null;
     state.pendingStatusText = null;
+    state.pendingStartedAtMs = null;
     state.liveExec = null;
     emit("gates:changed");
   }
 }
 
 export function applyGateResponse(res, actionHint) {
+  clearGateElapsedTimer();
   state.busy = false;
   state.pendingStatusText = null;
+  state.pendingStartedAtMs = null;
   state.resolvingGateId = null;
   state.liveScoutRun = null;
   state.liveExec = null;
@@ -607,8 +741,10 @@ function extractTrailingToolEvents(messages) {
 }
 
 async function recoverAfterGateError(err) {
+  clearGateElapsedTimer();
   state.busy = false;
   state.pendingStatusText = null;
+  state.pendingStartedAtMs = null;
   state.resolvingGateId = null;
   state.liveScoutRun = null;
   state.liveExec = null;

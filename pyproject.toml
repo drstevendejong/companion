@@ -1,7 +1,7 @@
 [project]
 name = "gemini-vibe-companion"
 version = "0.1.0"
-description = "Modular local companion for Gemini-assisted coding with human-gated file/patch tools, Chrome CDP (9222), Git commit/push, and project-scoped backups."
+description = "Modular local companion for Gemini-assisted coding with human-gated file/patch tools, Copy-on-Write savepoints, Git commit/push, and project-scoped backups."
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",

@@ -16,6 +16,7 @@ export const state = {
   liveExec: null,
   busy: false,
   pendingStatusText: null,
+  pendingStartedAtMs: null,
   resolvingGateId: null,
   activeAbortController: null,
   sessionActivities: {},

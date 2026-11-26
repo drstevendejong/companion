@@ -69,12 +69,13 @@ async def run_workspace_command(payload: RunCommandRequest, request: Request) ->
             payload.command,
             configured_python=project.python_path,
             source="console",
+            session_id=payload.session_id,
         )
         res["generated_md_files"] = bridge_svc.find_recent_markdown_outputs(
             project.root_path,
             res.get("output", ""),
         )
-        if payload.is_test_run and payload.session_id:
+        if payload.is_test_run and payload.session_id and not res.get("cancelled"):
             raw_out = res.get("output") or ""
             has_traceback = (
                 "Traceback (most recent call last):" in raw_out
@@ -97,6 +98,15 @@ async def run_workspace_command(payload: RunCommandRequest, request: Request) ->
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/cancel-run")
+def cancel_workspace_command(
+    session_id: str | None = Query(default=None),
+    run_id: str | None = Query(default=None),
+) -> Dict[str, Any]:
+    count = runner.cancel_active_runs(session_id=session_id, run_id=run_id)
+    return {"ok": True, "cancelled_count": count}
+
+
 @router.get("/backups", response_model=List[PatchRecord])
 def list_project_backups(
     request: Request,
@@ -109,6 +119,12 @@ def list_project_backups(
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
     patch_tools.prune_backup_directory(project.root_path, project.backup_dir)
+    if hasattr(db, "list_active_checkpoint_dirs"):
+        cp_svc.prune_checkpoints_directory(
+            project.root_path,
+            project.backup_dir,
+            active_snapshot_dirs=set(db.list_active_checkpoint_dirs(project.id)),
+        )
     records = db.list_patch_records(project_id)
     for rec in records:
         if rec.existed_before:

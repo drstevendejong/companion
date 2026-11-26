@@ -92,6 +92,12 @@ export const api = {
       timeoutMs: 300000,
       ...options,
     }),
+  cancelExec: (sessionId, gateId = null, runId = null) =>
+    requestJson(`/api/chat/session/${encodeURIComponent(sessionId)}/cancel-exec`, {
+      method: "POST",
+      body: JSON.stringify({ gate_id: gateId, run_id: runId }),
+      timeoutMs: 10000,
+    }),
 
   // Workspace
   getTree: (projectId, subpath = ".", maxDepth = 0) =>
@@ -104,12 +110,19 @@ export const api = {
     requestJson("/api/workspace/run", {
       method: "POST",
       timeoutMs: 300000,
+      signal: opts.signal,
       body: JSON.stringify({
         project_id: projectId,
         command,
         session_id: opts.sessionId || null,
         is_test_run: Boolean(opts.isTestRun),
       }),
+    }),
+  cancelWorkspaceRun: (sessionId = null, runId = null) =>
+    requestJson("/api/workspace/cancel-run", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId, run_id: runId }),
+      timeoutMs: 10000,
     }),
   restoreCheckpoint: (checkpointId) =>
     requestJson(`/api/workspace/checkpoints/${checkpointId}/restore`, { method: "POST" }),
@@ -132,13 +145,6 @@ export const api = {
       timeoutMs: 120000,
     }),
   gitCommit: (body) => requestJson("/api/git/commit", { method: "POST", body: JSON.stringify(body) }),
-
-  // CDP
-  cdpTabs: (port) => requestJson(`/api/cdp/tabs?cdp_port=${encodeURIComponent(port)}`),
-  cdpScreenshot: (wsUrl, fullPage = false) =>
-    requestJson("/api/cdp/screenshot", { method: "POST", body: JSON.stringify({ ws_url: wsUrl, full_page: fullPage }) }),
-  cdpConsole: (wsUrl) =>
-    requestJson("/api/cdp/console", { method: "POST", body: JSON.stringify({ ws_url: wsUrl }) }),
 
   // Settings (API Key, Telemetry, Local AI Scout, Companion Prompts)
   getCompanionSettings: () => requestJson("/api/settings/companion"),

@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import APP_ROOT, DB_PATH
-from routes import bridge, cdp, chat, git, lifecycle, projects, sessions, settings, workspace
+from routes import bridge, chat, git, lifecycle, projects, sessions, settings, workspace
 from services.gemini_client import GeminiGateway
 from services.lifecycle import LifecycleTracker
 from storage.db import CompanionDB
@@ -63,7 +63,6 @@ def create_app(
     app.include_router(bridge.router)
     app.include_router(workspace.router)
     app.include_router(git.router)
-    app.include_router(cdp.router)
     app.include_router(settings.router)
     app.include_router(lifecycle.router)
 

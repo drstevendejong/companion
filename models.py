@@ -23,7 +23,6 @@ class ProjectCreate(BaseModel):
     backup_dir: str = "backup"
     post_patch_command: Optional[str] = None
     fast_test_command: Optional[str] = None
-    cdp_port: int = 9222
     ignore_patterns: List[str] = Field(default_factory=list)
     preset_commands: List[PresetCommand] = Field(default_factory=list)
 
@@ -36,7 +35,6 @@ class ProjectUpdate(BaseModel):
     backup_dir: Optional[str] = None
     post_patch_command: Optional[str] = None
     fast_test_command: Optional[str] = None
-    cdp_port: Optional[int] = None
     ignore_patterns: Optional[List[str]] = None
     preset_commands: Optional[List[PresetCommand]] = None
 
@@ -50,7 +48,6 @@ class ProjectProfile(BaseModel):
     backup_dir: str = "backup"
     post_patch_command: Optional[str] = None
     fast_test_command: Optional[str] = None
-    cdp_port: int = 9222
     ignore_patterns: List[str] = Field(default_factory=list)
     preset_commands: List[PresetCommand] = Field(default_factory=list)
     created_at: str
@@ -212,12 +209,6 @@ class CompanionSettingsUpdate(BaseModel):
     system_prompt: Optional[str] = None
     bridge_tool_contract: Optional[str] = None
     reset_keys: List[str] = Field(default_factory=list)
-
-
-class CdpTargetRequest(BaseModel):
-    ws_url: str
-    cdp_port: int = 9222
-    full_page: bool = False
 
 
 class PatchRecord(BaseModel):

@@ -138,7 +138,7 @@
       <section id="chat-stream" class="chat-stream">
         <div class="empty-state">
           <h3>Workspace Ready</h3>
-          <p>Select a project profile and start a session to inspect files, review gated diffs, capture Chrome :9222 state, and commit cleanly.</p>
+          <p>Select a project profile and start a session to inspect files, review gated diffs, run tests, and commit cleanly.</p>
         </div>
       </section>
 
@@ -193,20 +193,12 @@
         </div>
 
         <div class="composer-bar">
-          <div class="composer-actions">
-            <div id="cdp-controls-group" class="cdp-controls-group">
-              <select id="cdp-tab-select" class="select-input select-compact hidden" title="Chrome :9222 Target Tab"></select>
-              <button id="btn-cdp-shot" type="button" class="btn btn-secondary btn-xs hidden" title="Capture Chrome screenshot">Screenshot</button>
-              <button id="btn-cdp-console" type="button" class="btn btn-secondary btn-xs hidden" title="Capture Chrome console output">Console</button>
-              <button id="btn-cdp-refresh" type="button" class="btn btn-ghost btn-xs" title="Check Chrome :9222 debug tabs">Chrome &#8635;</button>
-            </div>
-          </div>
           <div class="composer-right">
             <span id="composer-token-est" class="meta-line mono tabular">~0 tok</span>
             <button id="btn-retry-turn" type="button" class="btn btn-secondary hidden api-only" title="Retry unfinished Gemini turn">Retry Turn</button>
             <button id="btn-cancel-req" type="button" class="btn btn-danger hidden api-only" title="Abort waiting on Gemini">Cancel</button>
             <button id="btn-send" class="btn btn-primary api-only">Send</button>
-            <button id="btn-bridge-copy-img" type="button" class="btn btn-secondary hidden bridge-only" title="Copy attached CDP image to clipboard for Ctrl+V into Playground">Copy CDP Image</button>
+            <button id="btn-bridge-copy-img" type="button" class="btn btn-secondary hidden bridge-only" title="Copy attached image to clipboard for Ctrl+V into Playground">Copy Image</button>
             <div id="bridge-copy-split" class="split-btn bridge-only">
               <button id="btn-bridge-copy-bundle" type="button" class="btn btn-secondary split-btn-main" title="Copy prompt &amp; attachments bundle to clipboard for Playground (Ctrl+Enter)">Copy + Directives</button>
               <button id="btn-bridge-copy-menu-toggle" type="button" class="btn btn-secondary split-btn-caret" title="Directives options" aria-haspopup="menu" aria-expanded="false" aria-label="Directives options">&#9662;</button>
@@ -255,7 +247,10 @@
         <div id="preset-buttons" class="preset-row"></div>
         <div class="output-header">
           <span id="terminal-meta" class="meta-line mono tabular">No command run yet</span>
-          <button id="btn-paste-terminal" class="btn btn-secondary btn-sm" disabled>Paste into Prompt</button>
+          <div class="row-gap">
+            <button id="btn-stop-console" type="button" class="btn btn-danger btn-xs hidden" title="Stop running Console command">Stop</button>
+            <button id="btn-paste-terminal" class="btn btn-secondary btn-sm" disabled>Paste into Prompt</button>
+          </div>
         </div>
         <div id="terminal-savepoint-bar" class="terminal-savepoint-bar hidden">
           <span id="terminal-savepoint-label" class="meta-line"></span>
@@ -328,18 +323,10 @@
         </div>
       </div>
 
-      <div class="row-gap mt-2">
-        <div class="col-half">
-          <label class="field-label">Directives .md (Relative)</label>
-          <div class="row-gap">
-            <input id="proj-directives" class="text-input mono" placeholder="Directives_for_Core_Coding.md" />
-            <button id="btn-browse-directives" type="button" class="btn btn-secondary btn-sm">Browse...</button>
-          </div>
-        </div>
-        <div class="col-half">
-          <label class="field-label">Chrome CDP Port</label>
-          <input id="proj-cdp-port" type="number" class="text-input mono tabular" value="9222" />
-        </div>
+      <label class="field-label mt-2">Directives .md (Relative)</label>
+      <div class="row-gap">
+        <input id="proj-directives" class="text-input mono" placeholder="Directives_for_Core_Coding.md" />
+        <button id="btn-browse-directives" type="button" class="btn btn-secondary btn-sm">Browse...</button>
       </div>
 
       <label class="field-label mt-2">Post-Patch Test Command (Optional — Full Suite)</label>

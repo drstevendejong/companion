@@ -479,13 +479,6 @@ body.mode-api .bridge-only {
   gap: 8px;
 }
 
-.cdp-controls-group {
-  display: inline-flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-
 .rate-telemetry-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -856,6 +849,46 @@ body.mode-api .bridge-only {
   color: var(--danger-text);
 }
 
+.live-status-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.live-pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: live-pulse-dot 1.4s ease-in-out infinite;
+}
+
+@keyframes live-pulse-dot {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
+}
+
+.live-status-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.live-status-row .btn-stop-exec {
+  margin-left: auto;
+}
+
 .exec-preview {
   margin: 8px 0 0;
   padding: 8px 10px;
@@ -869,6 +902,11 @@ body.mode-api .bridge-only {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.exec-preview.is-empty {
+  color: var(--text-muted);
+  font-style: italic;
 }
 
 .exec-actions {

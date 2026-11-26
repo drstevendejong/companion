@@ -9,15 +9,41 @@ STRICT OUTPUT RULES:
 4) HARD STOP: End your response IMMEDIATELY after the closing ``` (or end of code). Never emit `Output:`, `Wait for output`, `## Local Workspace Tool Results`, or any trailing prose afterward (Companion truncates anything after the code block).
 
 RECOMMENDED ZERO-ESCAPING CODE FORMATS (NO JSON STRING ESCAPING NEEDED):
-A) Surgical Code Edits (`patch_literal`) — emit one or more ```patch blocks with `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`:
+A) Surgical Code Edits inside ```patch — pick whichever form is most token-efficient for the edit:
+1. Tight literal hunk (`patch_literal`) — for small/localized edits, include ONLY 2–4 unchanged boundary lines around the changed lines (never dump a whole 100-line function to change 5 lines; use multiple small hunks in one ```patch block for scattered edits):
 ```patch
 # path: path/to/file.py
 # summary: 1-line reason
 <<<<<<< SEARCH
-exact existing lines (indentation preserved verbatim)
+exact existing boundary lines (indentation preserved verbatim)
 =======
 replacement lines (indentation preserved verbatim)
 >>>>>>> REPLACE
+```
+2. Ellipsis `...` span inside `SEARCH` — to replace/delete a large block without knowing line numbers, emit 2–3 unique start lines, `...` on its own line, and 2–3 unique end lines (deterministic literal matching—NO regex; both start and end anchors must match uniquely):
+```patch
+# path: path/to/file.py
+# summary: Replace large block via unique start/end anchors
+<<<<<<< SEARCH
+def big_func(arg):
+    first_unique_line()
+    ...
+    last_unique_line()
+    return result
+=======
+def big_func(arg):
+    return fast_path(arg)
+>>>>>>> REPLACE
+```
+3. Anchored line-range replacement (`patch_lines`) — when you read line numbers via `read_lines`/`search_code` and want to rewrite/delete a large range without echoing old code:
+```patch
+# path: path/to/file.py
+# lines: 140-295
+# expect_start: def big_func(arg):
+# expect_end: return result
+# summary: Rewrite big_func cleanly
+def big_func(arg):
+    return fast_path(arg)
 ```
 
 B) Temporary Inspection / Verification Scripts (`propose_inspection_script` — NEVER for code edits; auto-deletes cleanly on exit 0 without leaving a savepoint) — state `Inspection script (path.py): ...` in the one-liner and emit a raw ```python block:
@@ -32,9 +58,16 @@ print("diagnostic output")
 C) New Files / Full Rewrites (`write_file`) — state `New file (path/to/file.ext): ...` in the one-liner and emit a fenced block in the target language with top directive comments:
 `# tool: write_file`, `# path: path/to/file.py`, `# summary: 1-line reason` (also supports `// ...` or `<!-- ... -->`).
 
-JSON COMMAND TOOLS (ideal for reads, searches, file ops, tests, and re-running failed scripts):
-- {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block", "new_text": "replacement", "summary": "1-line reason"} (returns nearest line-number + diff diagnostics if old_text mismatches)
-- {"tool": "patch_lines", "path": "path/to/file", "start_line": 10, "end_line": 20, "new_text": "replacement", "summary": "1-line reason"}
+JSON COMMAND TOOLS (ideal for searches, targeted reads, file ops, tests, and re-running failed scripts):
+- {"tool": "scout_workspace", "goal": "Find root cause of X / trace how Y reaches Z", "subpath": ".", "max_steps": 8} (**PREFER FIRST when Scout is ENABLED** for multi-file bug hunting or unfamiliar call paths — runs in an ephemeral `-lite` loop and returns exact files/lines without bloating main chat context!)
+- {"tool": "extract_headers", "pattern": ".", "include_symbols": true, "max_files": 60} (0-token structural index of file header comments & top-level classes/functions)
+- {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
+- {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120} (preferred for targeted slices once exact file/lines are located)
+- {"tool": "read_file", "path": "path/to/file"} (single small file or full rewrite only — NEVER batch multiple large `read_file` calls to hunt for a bug; use `scout_workspace` when enabled, or `search_code` + `read_lines`)
+- {"tool": "read_command_output", "exec_id": "cmd_...", "start_line": 1, "end_line": 120} (inspect raw stdout/stderr from a buffered command; optional `"pattern"` or `"tail_lines"`, omit `exec_id` for latest)
+- {"tool": "list_tree", "subpath": ".", "max_depth": 3}
+- {"tool": "patch_literal", "path": "path/to/file", "old_text": "exact unique block (or start lines\\n...\\nend lines)", "new_text": "replacement", "summary": "1-line reason"} (returns nearest line-number + diff diagnostics if old_text mismatches)
+- {"tool": "patch_lines", "path": "path/to/file", "start_line": 10, "end_line": 20, "new_text": "replacement", "expect_start": "optional first-line check", "expect_end": "optional last-line check", "summary": "1-line reason"}
 - {"tool": "write_file", "path": "path/to/file", "content": "full file text", "summary": "1-line reason"}
 - {"tool": "delete_file", "path": "path/to/file", "summary": "1-line reason"} (human-gated delete; auto-backed up first)
 - {"tool": "rename_file", "old_path": "old/path", "new_path": "new/path", "summary": "1-line reason"} (human-gated move/rename; auto-backed up first)
@@ -42,18 +75,10 @@ JSON COMMAND TOOLS (ideal for reads, searches, file ops, tests, and re-running f
 - {"tool": "run_script", "path": "script.py", "summary": "1-line reason"} (human-gated run of a permanent/kept .py script in project Python; optional `"args": "--flag"`)
 - {"tool": "run_and_delete_script", "path": "inspect_tmp.py", "summary": "1-line reason"} (ONLY to re-run a failed temporary .py script ALREADY saved on disk and delete it once it passes; to create & run a new temporary script, emit `propose_inspection_script`)
 - {"tool": "run_tests", "summary": "1-line reason"} (human-gated full suite — auto-commits savepoint on pass; optional `"fast": true`, `"target": "path/to/file"`, and `"focus": "question"` when Scout is enabled; never call on broken intermediate steps)
-- {"tool": "extract_headers", "pattern": ".", "include_symbols": true, "max_files": 60} (0-token structural index of file header comments & top-level classes/functions)
-- {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
-- {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120}
-- {"tool": "read_file", "path": "path/to/file"}
-- {"tool": "read_command_output", "exec_id": "cmd_...", "start_line": 1, "end_line": 120} (inspect raw stdout/stderr from a buffered command; optional `"pattern"` or `"tail_lines"`, omit `exec_id` for latest)
-- {"tool": "list_tree", "subpath": ".", "max_depth": 3}
-
-Scout-Only Tools (call ONLY when Companion announces `Local AI Scout is NOW ENABLED`):
-- {"tool": "scout_workspace", "goal": "Trace how X reaches Y", "subpath": ".", "max_steps": 8} (human-gated multi-step read-only investigation via lightweight local AI)
-- {"tool": "update_header", "paths": ["path/to/file1", "path/to/file2"]} (uses Scout to draft updated top-of-file header comments as human-gated diff patches)
+- {"tool": "update_header", "paths": ["path/to/file1", "path/to/file2"]} (Scout-only: drafts updated top-of-file header comments as human-gated diff patches)
 
 Notes:
-- When you need multiple files/fragments or runtime inspection, emit a `propose_inspection_script` (prefer a raw ```python block printing stdout directly; Companion captures stdout on exit 0 as well as errors and auto-deletes passing temporary scripts cleanly). Only call `run_and_delete_script` to re-run a failed temporary script already saved on disk after patching it.
+- Call `scout_workspace` / `update_header` ONLY when Companion announces `Local AI Scout is NOW ENABLED`.
+- When you need runtime state probing or multi-file mechanical inspection, emit a `propose_inspection_script` (prefer a raw ```python block printing stdout directly; Companion captures stdout on exit 0 as well as errors and auto-deletes passing temporary scripts cleanly). If a temporary inspection script fails and stays on disk, just emit a ```patch (or patch JSON) targeting it—Companion auto-approves patches/re-runs for already-approved inspection scripts and immediately re-runs & auto-deletes on pass (so you don't need to follow up with `run_and_delete_script`).
 - Command results include an `exec_id`; if output was summarized, call `read_command_output` to inspect exact raw lines.
 - Git status, diff viewing, commit message drafting, Commit, and Commit & Push are triggered by the user in Companion's right-drawer Git tab (not via JSON tool calls).

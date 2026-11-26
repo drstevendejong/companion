@@ -97,8 +97,9 @@ def create_checkpoint_snapshot(
     active_snapshot_dirs: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Copies all non-ignored project files into a self-contained snapshot directory
-    and writes manifest.json for fast, git-independent full rollback.
+    Initializes a lean Copy-on-Write Savepoint directory and manifest.json.
+    Individual pre-edit files are copied lazily into <snapshot_dir>/files/ only
+    when first modified or deleted, avoiding multi-megabyte full-repo duplicates.
     """
     root = Path(project_root).resolve()
     cp_root = _resolve_checkpoints_root(root, backup_dir_rel)
@@ -108,43 +109,14 @@ def create_checkpoint_snapshot(
     files_dir = snapshot_dir / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
 
-    ignores = _checkpoint_ignores(root, backup_dir_rel, extra_ignores)
-    baseline_files: List[str] = []
-    skipped_large: List[str] = []
-    total_bytes = 0
-
-    for dirpath, dirnames, filenames in os.walk(root):
-        cur = Path(dirpath)
-        rel_dir = cur.relative_to(root).as_posix()
-        dirnames[:] = sorted(
-            d for d in dirnames
-            if not _is_ignored(d, f"{rel_dir}/{d}".lstrip("./"), ignores, is_dir=True)
-        )
-        for fname in sorted(filenames):
-            fpath = cur / fname
-            rel_posix = fpath.relative_to(root).as_posix()
-            if _is_ignored(fname, rel_posix, ignores, is_dir=False):
-                continue
-            try:
-                fsize = fpath.stat().st_size
-            except OSError:
-                continue
-            if fsize > CHECKPOINT_MAX_FILE_BYTES or (total_bytes + fsize) > CHECKPOINT_MAX_SNAPSHOT_BYTES:
-                skipped_large.append(rel_posix)
-                continue
-            dest = files_dir / rel_posix
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(fpath, dest)
-            baseline_files.append(rel_posix)
-            total_bytes += fsize
-
     manifest = {
         "checkpoint_id": checkpoint_id,
+        "mode": "cow",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "baseline_files": baseline_files,
+        "baseline_files": [],
         "modified_files": [],
         "created_files": [],
-        "skipped_large_files": skipped_large,
+        "skipped_large_files": [],
     }
     (snapshot_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -156,8 +128,8 @@ def create_checkpoint_snapshot(
 
     return {
         "snapshot_dir": str(snapshot_dir),
-        "files_count": len(baseline_files),
-        "total_bytes": total_bytes,
+        "files_count": 0,
+        "total_bytes": 0,
     }
 
 
@@ -165,8 +137,13 @@ def record_checkpoint_touch(
     snapshot_dir: str | Path,
     rel_path: str,
     existed_before: bool,
+    source_backup_path: Optional[str | Path] = None,
 ) -> None:
-    """Records a modified or newly created file in manifest.json."""
+    """
+    Records a modified or newly created file in manifest.json.
+    In Copy-on-Write mode, copies the pre-edit file from source_backup_path on its
+    first modification/deletion so full-project restore stays intact at tiny disk cost.
+    """
     snap = Path(snapshot_dir)
     manifest_path = snap / "manifest.json"
     if not manifest_path.is_file():
@@ -177,14 +154,38 @@ def record_checkpoint_touch(
         return
 
     norm = rel_path.replace("\\", "/").lstrip("./")
-    baseline_set = set(manifest.get("baseline_files") or [])
-    if existed_before or norm in baseline_set:
-        mods = manifest.setdefault("modified_files", [])
+    baseline_list: List[str] = manifest.setdefault("baseline_files", [])
+    baseline_set = set(baseline_list)
+    mods: List[str] = manifest.setdefault("modified_files", [])
+    created: List[str] = manifest.setdefault("created_files", [])
+    created_set = set(created)
+
+    if norm in created_set:
+        pass
+    elif existed_before:
+        if norm not in baseline_set:
+            if source_backup_path:
+                src_bkp = Path(source_backup_path)
+                try:
+                    if src_bkp.is_file() and src_bkp.stat().st_size <= CHECKPOINT_MAX_FILE_BYTES:
+                        dest = snap / "files" / norm
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_bkp, dest)
+                        baseline_list.append(norm)
+                        baseline_set.add(norm)
+                    else:
+                        skipped = manifest.setdefault("skipped_large_files", [])
+                        if norm not in skipped:
+                            skipped.append(norm)
+                except OSError:
+                    pass
+            else:
+                baseline_list.append(norm)
+                baseline_set.add(norm)
         if norm not in mods:
             mods.append(norm)
     else:
-        created = manifest.setdefault("created_files", [])
-        if norm not in created:
+        if norm not in created_set:
             created.append(norm)
 
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -356,11 +357,17 @@ def record_write_in_checkpoint(
     checkpoint: Any,
     rel_path: str,
     existed_before: bool,
+    source_backup_path: Optional[str | Path] = None,
 ) -> Any:
     """Records a touched or created file on both the checkpoint manifest and SQLite row."""
     if checkpoint is None:
         return None
-    record_checkpoint_touch(checkpoint.snapshot_dir, rel_path, existed_before)
+    record_checkpoint_touch(
+        checkpoint.snapshot_dir,
+        rel_path,
+        existed_before,
+        source_backup_path=source_backup_path,
+    )
     return db.record_checkpoint_file(checkpoint.id, rel_path, existed_before)
 
 

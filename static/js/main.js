@@ -1,7 +1,6 @@
 // main.js - Bootstrap modular companion frontend
 
 import { initBridge } from "./bridge.js";
-import { initCdp } from "./cdp.js";
 import { initChat } from "./chat.js";
 import { initComposer } from "./composer.js";
 import { initDrawer } from "./drawer.js";
@@ -23,7 +22,6 @@ async function bootstrap() {
   initToolGates();
   initDrawer();
   initGit();
-  initCdp();
   try {
     await initSettings();
   } catch (err) {

@@ -19,6 +19,7 @@ let pendingScrollRaf = null;
 let chatPinnedToBottom = true;
 let isRenderingChat = false;
 let scoutElapsedTimer = null;
+let execElapsedTimer = null;
 const seenCardKeysBySession = new Map();
 const arrivalStartedAtByKey = new Map();
 let lastRenderedSessionId = null;
@@ -77,6 +78,75 @@ function clearScoutElapsedTimer() {
   if (scoutElapsedTimer !== null) {
     window.clearInterval(scoutElapsedTimer);
     scoutElapsedTimer = null;
+  }
+}
+
+function formatChatExecIdleNote() {
+  const exec = state.liveExec;
+  if (!exec) return "waiting for output";
+  if (exec.phaseText) {
+    const phaseStartedAt = Number(exec.phaseStartedAtMs || Date.now());
+    const phaseSec = Math.max(0, Math.floor((Date.now() - phaseStartedAt) / 1000));
+    return exec.phase === "scout_triage" ? `triaging (${phaseSec}s)` : `summarizing (${phaseSec}s)`;
+  }
+  const bytes = Number(exec.bytesReceived || (exec.output ? exec.output.length : 0) || 0);
+  if (bytes <= 0) return "waiting for output";
+  const lastAt = Number(exec.lastOutputAtMs || Date.now());
+  const idleSec = Math.max(0, Math.floor((Date.now() - lastAt) / 1000));
+  return idleSec >= 2 ? `${bytes.toLocaleString()} B · silent ${idleSec}s` : `${bytes.toLocaleString()} B streaming`;
+}
+
+function updateChatExecElapsedDom() {
+  const startedAt = Number(
+    state.pendingStartedAtMs || (state.liveExec && state.liveExec.startedAtMs) || Date.now()
+  );
+  const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  for (const el of chatStream.querySelectorAll("[data-exec-elapsed]")) {
+    el.textContent = `${elapsedSec}s`;
+  }
+  const idleNote = ` · ${formatChatExecIdleNote()}`;
+  for (const el of chatStream.querySelectorAll("[data-exec-idle]")) {
+    el.textContent = idleNote;
+  }
+  const phaseText = state.liveExec && state.liveExec.phaseText;
+  for (const el of chatStream.querySelectorAll("[data-exec-headline]")) {
+    el.textContent = phaseText || el.getAttribute("data-default-headline") || el.textContent;
+  }
+  const badgeText = phaseText
+    ? state.liveExec.phase === "scout_triage"
+      ? "Triaging"
+      : "Summarizing"
+    : "Running";
+  for (const el of chatStream.querySelectorAll("[data-exec-badge]")) {
+    el.textContent = badgeText;
+  }
+  const hideStop = Boolean(state.liveExec && state.liveExec.done && phaseText);
+  for (const btn of chatStream.querySelectorAll("[data-stop-chat-exec]")) {
+    btn.classList.toggle("hidden", hideStop);
+    if (!hideStop && btn.textContent === "Stop Execution") {
+      btn.disabled = false;
+    }
+  }
+}
+
+function ensureExecElapsedTimer() {
+  if (execElapsedTimer !== null) return;
+  execElapsedTimer = window.setInterval(() => {
+    const active = Boolean(
+      state.pendingStatusText || (state.liveExec && (!state.liveExec.done || state.liveExec.phaseText))
+    );
+    if (!active) {
+      clearExecElapsedTimer();
+      return;
+    }
+    updateChatExecElapsedDom();
+  }, 1000);
+}
+
+function clearExecElapsedTimer() {
+  if (execElapsedTimer !== null) {
+    window.clearInterval(execElapsedTimer);
+    execElapsedTimer = null;
   }
 }
 
@@ -224,12 +294,14 @@ function renderMessages({ preserveScroll = false } = {}) {
     Boolean(state.resolvingGateId) &&
     (state.pendingGates || []).length > 0 &&
     !state.gatesHiddenDueToError;
+  const liveExecRunning = Boolean(state.liveExec && (!state.liveExec.done || state.liveExec.phaseText));
+  const showChatRunningCard = Boolean((state.pendingStatusText || liveExecRunning) && !gateTrayShowingStatus);
   const hasAnything =
     state.messages.length > 0 ||
     activities.length > 0 ||
     checkpoints.length > 0 ||
     Boolean(state.liveScoutRun) ||
-    Boolean(state.pendingStatusText && !gateTrayShowingStatus);
+    showChatRunningCard;
 
   if (!hasAnything) {
     chatStream.innerHTML = `
@@ -410,19 +482,84 @@ function renderMessages({ preserveScroll = false } = {}) {
 
   if (state.liveScoutRun) {
     renderLiveScoutCard(state.liveScoutRun);
-  } else if (state.pendingStatusText && !gateTrayShowingStatus) {
+  } else if (showChatRunningCard) {
+    ensureExecElapsedTimer();
     const liveSlice = formatLivePreviewSlice(state.liveExec && state.liveExec.output);
+    const defaultHeadline =
+      state.pendingStatusText ||
+      (state.liveExec && state.liveExec.command
+        ? `Running: ${state.liveExec.command}...`
+        : "Executing action locally...");
+    const phaseText = state.liveExec && state.liveExec.phaseText;
+    const runHeadline = phaseText || defaultHeadline;
+    const badgeText = phaseText
+      ? state.liveExec.phase === "scout_triage"
+        ? "Triaging"
+        : "Summarizing"
+      : "Running";
+    const startedAt = Number(
+      state.pendingStartedAtMs || (state.liveExec && state.liveExec.startedAtMs) || Date.now()
+    );
+    const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+
     const pendingCard = document.createElement("article");
     pendingCard.className = "msg-card msg-exec";
+    pendingCard.dataset.chatRunningCard = "true";
     pendingCard.innerHTML = `
       <div class="msg-header">
         <span class="msg-role">Companion</span>
-        <span class="exec-badge is-running">Running</span>
+        <span class="exec-badge is-running" data-exec-badge="true">${escapeHtml(badgeText)}</span>
       </div>
-      <div class="companion-summary-line">${escapeHtml(state.pendingStatusText)}</div>
-      <pre data-live-exec="gate" class="exec-preview${liveSlice ? "" : " hidden"}">${escapeHtml(liveSlice)}</pre>
+      <div class="companion-summary-line" data-exec-headline="true" data-default-headline="${escapeHtml(defaultHeadline)}">${escapeHtml(runHeadline)}</div>
+      <div class="live-status-row" data-live-status="chat">
+        <span class="live-pulse-dot" aria-hidden="true"></span>
+        <span class="live-status-meta mono tabular">
+          <span data-exec-elapsed>${elapsedSec}s</span><span data-exec-idle> · ${escapeHtml(formatChatExecIdleNote())}</span>
+        </span>
+      </div>
+      <pre data-live-exec="gate" class="exec-preview${liveSlice ? "" : " is-empty"}">${escapeHtml(liveSlice || "(Waiting for stdout / stderr output...)")}</pre>
     `;
+
+    const stopBtn = document.createElement("button");
+    stopBtn.type = "button";
+    stopBtn.className = "btn btn-danger btn-xs btn-stop-exec";
+    stopBtn.setAttribute("data-stop-chat-exec", "true");
+    stopBtn.textContent = "Stop Execution";
+    stopBtn.title = "Terminate the active subprocess immediately";
+    if (state.liveExec && state.liveExec.done && phaseText) {
+      stopBtn.classList.add("hidden");
+      stopBtn.disabled = true;
+    }
+    stopBtn.addEventListener("click", async () => {
+      stopBtn.disabled = true;
+      stopBtn.textContent = "Stopping...";
+      const abortCtrl = state.activeAbortController;
+      const fallbackTimer = window.setTimeout(() => {
+        if (abortCtrl) abortCtrl.abort();
+      }, 2500);
+      try {
+        if (state.liveExec && state.liveExec.source === "console") {
+          await api.cancelWorkspaceRun(state.activeSessionId || null, state.liveExec.runId || null);
+        } else if (state.activeSessionId) {
+          await api.cancelExec(
+            state.activeSessionId,
+            (state.liveExec && state.liveExec.gateId) || null,
+            (state.liveExec && state.liveExec.runId) || null
+          );
+        }
+      } catch {
+        if (abortCtrl) abortCtrl.abort();
+      } finally {
+        window.clearTimeout(fallbackTimer);
+      }
+    });
+    const statusRowEl = pendingCard.querySelector('[data-live-status="chat"]');
+    if (statusRowEl) {
+      statusRowEl.appendChild(stopBtn);
+    }
     chatStream.appendChild(pendingCard);
+  } else {
+    clearExecElapsedTimer();
   }
 
   if (!preserveScroll) {
@@ -523,42 +660,56 @@ function renderToolBatchCard(
 
   if (executedScripts.length > 0 && events.length === executedScripts.length) {
     const lastExec = executedScripts[executedScripts.length - 1];
-    const ok = lastExec.exit_code === 0 && !lastExec.has_traceback;
+    const cancelled = Boolean(lastExec.cancelled);
+    const ok = !cancelled && lastExec.exit_code === 0 && !lastExec.has_traceback;
     card.classList.add("msg-exec", ok ? "is-ok" : "is-err");
-    const badgeLabel = ok
-      ? lastExec.deleted
-        ? "Executed & auto-deleted (exit 0)"
-        : "Executed cleanly (exit 0)"
-      : lastExec.kept_for_patching
-        ? `Failed — script kept for patching (exit ${lastExec.exit_code})`
-        : `Possible errors detected (exit ${lastExec.exit_code})`;
-    badgeHtml = `<span class="exec-badge ${ok ? "is-ok" : "is-err"}">${escapeHtml(badgeLabel)}</span>`;
-    const prefix =
-      lastExec._toolName === "run_and_delete_script"
+    const badgeLabel = cancelled
+      ? `Stopped by user (exit ${lastExec.exit_code ?? -1})`
+      : ok
         ? lastExec.deleted
-          ? "Executed & deleted script"
-          : "Script run (kept for patching)"
+          ? "Executed & auto-deleted (exit 0)"
+          : "Executed cleanly (exit 0)"
+        : lastExec.kept_for_patching
+          ? `Failed — script kept for patching (exit ${lastExec.exit_code})`
+          : `Possible errors detected (exit ${lastExec.exit_code})`;
+    badgeHtml = `<span class="exec-badge ${ok ? "is-ok" : "is-err"}">${escapeHtml(badgeLabel)}</span>`;
+    const autoNote = lastExec.auto_rerun_after_patch
+      ? "Auto-reran "
+      : lastExec.auto_approved_inspection_script
+        ? "Auto-approved "
+        : "";
+    const prefix = cancelled
+      ? "Stopped script"
+      : lastExec._toolName === "run_and_delete_script"
+        ? lastExec.deleted
+          ? `${autoNote}Executed & deleted script`
+          : `${autoNote}Script run (kept for patching)`
         : lastExec._toolName === "run_script"
-          ? "Executed script"
+          ? `${autoNote}Executed script`
           : lastExec._toolName === "propose_inspection_script"
             ? lastExec.deleted
-              ? "Inspection script executed & deleted"
-              : "Inspection script executed"
+              ? `${autoNote}Inspection script executed & deleted`
+              : `${autoNote}Inspection script executed`
             : lastExec.deleted
-              ? "Proposed script executed & deleted"
-              : "Proposed script executed";
+              ? `${autoNote}Proposed script executed & deleted`
+              : `${autoNote}Proposed script executed`;
     headline = `${prefix}: ${lastExec.path} (${lastExec.duration_ms ?? 0}ms) · View full output in Console`;
   } else if (testRuns.length > 0 && !hasErrors) {
     const lastTest = testRuns[testRuns.length - 1];
-    const ok = Boolean(lastTest.passed) && lastTest.exit_code === 0 && !lastTest.has_traceback;
+    const cancelled = Boolean(lastTest.cancelled);
+    const ok = !cancelled && Boolean(lastTest.passed) && lastTest.exit_code === 0 && !lastTest.has_traceback;
     card.classList.add("msg-exec", ok ? "is-ok" : "is-err");
     badgeHtml = `<span class="exec-badge ${ok ? "is-ok" : "is-err"}">${
-      ok ? "Tests passed (exit 0)" : `Tests failed (exit ${lastTest.exit_code ?? "?"})`
+      cancelled
+        ? "Tests stopped by user"
+        : ok
+          ? "Tests passed (exit 0)"
+          : `Tests failed (exit ${lastTest.exit_code ?? "?"})`
     }</span>`;
     const commitNote = lastTest.checkpoint_committed ? " · Savepoint committed ✓" : "";
     headline =
       events.length === testRuns.length
-        ? `Executed tests: ${lastTest.command || "tests"} (${lastTest.duration_ms ?? 0}ms)${commitNote}`
+        ? `${cancelled ? "Stopped tests" : "Executed tests"}: ${lastTest.command || "tests"} (${lastTest.duration_ms ?? 0}ms)${commitNote}`
         : `Executed ${events.length} actions (${countStr})${commitNote}`;
   } else if (hasErrors) {
     card.classList.add("msg-exec", "is-err");
@@ -685,6 +836,7 @@ function renderToolBatchCard(
             : failExec._toolName === "run_and_delete_script" || Boolean(failExec.kept_for_patching);
         state.busy = true;
         state.liveExec = null;
+        state.pendingStartedAtMs = Date.now();
         state.pendingStatusText = `Retrying ${failExec.path}...`;
         emit("gates:changed");
         emit("chat:loaded");
@@ -700,6 +852,7 @@ function renderToolBatchCard(
         } catch (err) {
           state.busy = false;
           state.pendingStatusText = null;
+          state.pendingStartedAtMs = null;
           state.liveExec = null;
           emit("gates:changed");
           emit("chat:loaded");
@@ -926,9 +1079,9 @@ function renderActivityCard(act, isLatestActivity = false, renderCtx = null) {
   } else if (act.status === "running") {
     const liveSlice = formatLivePreviewSlice(state.liveExec && state.liveExec.output);
     const pre = document.createElement("pre");
-    pre.className = `exec-preview${liveSlice ? "" : " hidden"}`;
+    pre.className = `exec-preview${liveSlice ? "" : " is-empty"}`;
     pre.dataset.liveActivity = act.id;
-    pre.textContent = liveSlice;
+    pre.textContent = liveSlice || "(Waiting for stdout / stderr output...)";
     card.appendChild(pre);
   }
 
@@ -1023,9 +1176,12 @@ function renderCheckpointCard(cp, renderCtx = null) {
   const status = cp.status || "active";
   const statusCls = status === "active" ? "is-active" : status === "committed" ? "is-committed" : "is-restored";
   const badgeCls = status === "active" ? "is-ok" : status === "committed" ? "is-committed" : "is-restored";
+  const cpCount = Number(cp.files_count || 0);
   const badgeText =
     status === "active"
-      ? `Saved (${Number(cp.files_count || 0)} files)`
+      ? cpCount > 0
+        ? `Saved (${cpCount} ${cpCount === 1 ? "file" : "files"})`
+        : "Saved"
       : status === "committed"
         ? "Committed"
         : "Restored";
@@ -1219,21 +1375,25 @@ function formatSingleToolDetail(name, resp, bytes) {
   }
   if (resp.written) {
     const delSuffix = resp.deleted ? ", auto-deleted" : "";
-    return `${name}: Wrote ${resp.path}${resp.executed ? ` (exit ${resp.exit_code}${delSuffix})` : ""}`;
+    const statusSuffix = resp.cancelled ? "stopped by user" : `exit ${resp.exit_code}${delSuffix}`;
+    return `${name}: Wrote ${resp.path}${resp.executed ? ` (${statusSuffix})` : ""}`;
   }
   if ((name === "run_script" || name === "run_and_delete_script") && !resp.error) {
-    const statusText = resp.passed
-      ? resp.deleted
-        ? "OK & auto-deleted"
-        : "OK"
-      : resp.kept_for_patching
-        ? "FAILED (kept on disk)"
-        : "FAILED";
+    const statusText = resp.cancelled
+      ? "STOPPED BY USER"
+      : resp.passed
+        ? resp.deleted
+          ? "OK & auto-deleted"
+          : "OK"
+        : resp.kept_for_patching
+          ? "FAILED (kept on disk)"
+          : "FAILED";
     return `${name}(${resp.path || resp.command || "script"}) — ${statusText} (exit ${resp.exit_code ?? "?"})`;
   }
   if (resp.deleted) return `${name}: Deleted ${resp.path}`;
   if (name === "run_tests" && !resp.error) {
-    return `${name}(${resp.command || "tests"}) — ${resp.passed ? "PASSED" : "FAILED"} (exit ${resp.exit_code ?? "?"})`;
+    const statusText = resp.cancelled ? "STOPPED BY USER" : resp.passed ? "PASSED" : "FAILED";
+    return `${name}(${resp.command || "tests"}) — ${statusText} (exit ${resp.exit_code ?? "?"})`;
   }
   if (resp.path) return `${name}(${resp.path})${sz}`;
   if (resp.pattern !== undefined) return `${name}("${resp.pattern}") — ${resp.total_hits ?? 0} hits${sz}`;
@@ -1455,6 +1615,32 @@ function formatLivePreviewSlice(rawOutput) {
 }
 
 function updateLiveExecPreview(payload) {
+  const gateTrayShowingStatus =
+    Boolean(state.resolvingGateId) &&
+    (state.pendingGates || []).length > 0 &&
+    !state.gatesHiddenDueToError;
+  if (
+    payload &&
+    (payload.type === "start" || (payload.type === "phase" && payload.phaseText)) &&
+    !gateTrayShowingStatus &&
+    !chatStream.querySelector("[data-chat-running-card], [data-live-activity]")
+  ) {
+    renderMessages({ preserveScroll: true });
+    return;
+  }
+  if (
+    payload &&
+    payload.type === "phase" &&
+    !payload.phaseText &&
+    !state.pendingStatusText &&
+    (!state.liveExec || state.liveExec.done) &&
+    chatStream.querySelector("[data-chat-running-card]")
+  ) {
+    renderMessages({ preserveScroll: true });
+    return;
+  }
+
+  updateChatExecElapsedDom();
   const slice = formatLivePreviewSlice(payload && payload.output);
   const targets = Array.from(document.querySelectorAll("[data-live-exec], [data-live-activity]"));
   const gatesEl = document.getElementById("pending-gates");
@@ -1463,14 +1649,16 @@ function updateLiveExecPreview(payload) {
   for (const el of targets) {
     if (slice) {
       const wasHidden = el.classList.contains("hidden");
-      el.classList.remove("hidden");
+      el.classList.remove("hidden", "is-empty");
       el.textContent = slice;
       el.scrollTop = el.scrollHeight;
       if (wasHidden && gatesEl && gatesEl.contains(el) && typeof el.scrollIntoView === "function") {
         el.scrollIntoView({ block: "nearest" });
       }
     } else if (payload && payload.type === "start") {
-      el.textContent = "";
+      el.classList.remove("hidden");
+      el.classList.add("is-empty");
+      el.textContent = "(Waiting for stdout / stderr output...)";
     }
   }
   if (wasNearBottom) {

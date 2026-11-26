@@ -198,6 +198,108 @@ class TestPatchTools(unittest.TestCase):
         with self.assertRaises(patch_tools.PatchValidationError):
             patch_tools.preview_rename_file(self.root, "archive/legacy.py", "collision.py", overwrite=False)
 
+    def test_ellipsis_span_search_and_safety_guards(self) -> None:
+        (self.root / "long_mod.py").write_text(
+            "def alpha():\n"
+            "    step_one = 1\n"
+            "    step_two = 2\n"
+            "    step_three = 3\n"
+            "    return step_one + step_three\n\n"
+            "def stub():\n"
+            "    ...\n\n"
+            "def beta():\n"
+            "    return 0\n\n"
+            "def gamma():\n"
+            "    return 0\n",
+            encoding="utf-8",
+        )
+
+        # 1. Valid unique start + unique end anchors replace full span without echoing middle lines
+        prev = patch_tools.preview_literal_patch(
+            self.root,
+            "long_mod.py",
+            "def alpha():\n    step_one = 1\n    ...\n    return step_one + step_three",
+            "def alpha():\n    return 4",
+        )
+        self.assertTrue(prev["used_ellipsis"])
+        self.assertEqual(prev["resolved_range"], (1, 5))
+        self.assertIn("-    step_two = 2", prev["diff"])
+        self.assertIn("+    return 4", prev["diff"])
+
+        # 2. Literal Python Ellipsis (`...`) still matches verbatim when present on disk
+        stub_prev = patch_tools.preview_literal_patch(
+            self.root,
+            "long_mod.py",
+            "def stub():\n    ...",
+            "def stub():\n    return 42",
+        )
+        self.assertFalse(stub_prev["used_ellipsis"])
+        self.assertIn("+    return 42", stub_prev["diff"])
+
+        # 3. Ambiguous end anchor (`return 0` appears twice after `def beta()`) MUST be rejected
+        with self.assertRaises(patch_tools.PatchValidationError) as ctx_ambig:
+            patch_tools.preview_literal_patch(
+                self.root,
+                "long_mod.py",
+                "def beta():\n    ...\n    return 0",
+                "def beta():\n    return 1",
+            )
+        self.assertIn("matched 2 times", str(ctx_ambig.exception))
+        self.assertIn("prevent swallowing unintended code", str(ctx_ambig.exception))
+
+        # 4. Multiple '...' markers in a single SEARCH block or replace_all=True are rejected
+        with self.assertRaises(patch_tools.PatchValidationError):
+            patch_tools.preview_literal_patch(
+                self.root,
+                "long_mod.py",
+                "def alpha():\n    ...\n    step_two = 2\n    ...\n    return step_one + step_three",
+                "def alpha():\n    return 0",
+            )
+        with self.assertRaises(patch_tools.PatchValidationError):
+            patch_tools.preview_literal_patch(
+                self.root,
+                "long_mod.py",
+                "def alpha():\n    ...\n    return step_one + step_three",
+                "def alpha():\n    return 0",
+                replace_all=True,
+            )
+
+    def test_anchored_line_patch_verification(self) -> None:
+        (self.root / "ranged.py").write_text(
+            "# header\n"
+            "def compute(n: int) -> int:\n"
+            "    total = n * 2\n"
+            "    return total\n"
+            "# footer\n",
+            encoding="utf-8",
+        )
+
+        # Matching expect_start and expect_end succeed cleanly
+        ok_prev = patch_tools.preview_line_patch(
+            self.root,
+            "ranged.py",
+            2,
+            4,
+            "def compute(n: int) -> int:\n    return n * 3",
+            expect_start="def compute(n: int) -> int:",
+            expect_end="return total",
+        )
+        self.assertTrue(ok_prev["ast_valid"])
+        self.assertIn("+    return n * 3", ok_prev["diff"])
+
+        # Off-by-one shifted start_line fails immediately with helpful nearby line hint
+        with self.assertRaises(patch_tools.PatchValidationError) as ctx_shift:
+            patch_tools.preview_line_patch(
+                self.root,
+                "ranged.py",
+                3,
+                4,
+                "def compute(n: int) -> int:\n    return n * 3",
+                expect_start="def compute(n: int) -> int:",
+            )
+        self.assertIn("Line-range safety check failed at start_line 3", str(ctx_shift.exception))
+        self.assertIn("Closest matching line(s) nearby: 2", str(ctx_shift.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -969,6 +969,87 @@ class TestLocalScoutLoop(_StubbedScoutTestCase):
                 )
         self.assertEqual(emitted[-1]["type"], "scout_done")
 
+    def test_command_summarization_and_triage_emit_exec_phase(self) -> None:
+        db_path = Path(self.tmp.name) / "exec_phase.db"
+        db = self.db_mod.CompanionDB(db_path)
+        proj = db.create_project(
+            self.models_mod.ProjectCreate(
+                name="PhaseRepo",
+                root_path=str(self.root),
+                post_patch_command='python3 -c "print(\'PASS_LINE \' * 400)"',
+            )
+        )
+        sess = db.create_session(self.models_mod.SessionCreate(project_id=proj.id, title="Bridge", api_enabled=False))
+
+        ws_events: List[Dict[str, Any]] = []
+
+        class _FakeWS:
+            async def send_text(self, payload: str) -> None:
+                ws_events.append(json.loads(payload))
+
+        app = SimpleNamespace(state=SimpleNamespace(db=db, gemini=None, lifecycle_sockets={_FakeWS()}))
+        req = SimpleNamespace(app=app)
+        gw = _FakeGeminiGateway(SimpleNamespace(models=_ScriptedModels([])))
+        app.state.gemini = gw
+
+        # 1. Passing run_tests gate with Scout summarization emits exec_done -> exec_phase(scout_summarize) -> exec_phase(done)
+        gate = db.create_gate(
+            sess.id,
+            "run_tests",
+            {"summary": "Run verbose tests"},
+            {"summary": "Run verbose tests", "command": proj.post_patch_command},
+        )
+        with (
+            patch.object(self.chat_rt, "_get_effective_scout_settings", return_value={"enabled": True, "summarize_threshold_chars": 500}),
+            patch.object(
+                self.local_scout,
+                "summarize_command_output",
+                return_value={"summary": "1 test batch passed cleanly.", "model_used": "gemini-3.1-flash-lite"},
+            ),
+        ):
+            res = asyncio.run(
+                self.chat_rt.resolve_tool_gate(
+                    gate["id"],
+                    SimpleNamespace(action="approve", reason=None),
+                    req,
+                )
+            )
+        self.assertIn("1 test batch passed cleanly.", res["bridge_reply_text"])
+        phase_events = [e for e in ws_events if e.get("type") == "exec_phase"]
+        self.assertEqual([e.get("phase") for e in phase_events], ["scout_summarize", "done"])
+        self.assertIn("Scout is summarizing", phase_events[0]["status_text"])
+        self.assertEqual(phase_events[1]["status_text"], "")
+        event_types = [e.get("type") for e in ws_events]
+        self.assertIn("exec_done", event_types)
+        self.assertLess(event_types.index("exec_done"), event_types.index("exec_phase"))
+
+        # 2. Failed output triage emits exec_phase(scout_triage) -> exec_phase(done) even when triage raises
+        ws_events.clear()
+        with patch.object(self.local_scout, "triage_command_failure", side_effect=RuntimeError("network blip")):
+            triage_res = asyncio.run(
+                self.chat_rt._maybe_summarize_or_triage_output(
+                    gemini=gw,
+                    db=db,
+                    project=proj,
+                    scout_cfg={"enabled": True, "summarize_threshold_chars": 500},
+                    command="pytest",
+                    raw_output="E AssertionError: failed\n" * 80,
+                    exit_code=1,
+                    passed=False,
+                    focus=None,
+                    exec_id="exec-1",
+                    app=app,
+                    session_id=sess.id,
+                    gate_id="g-1",
+                    run_id="r-1",
+                )
+            )
+        self.assertEqual(triage_res, {})
+        triage_phases = [e for e in ws_events if e.get("type") == "exec_phase"]
+        self.assertEqual([e.get("phase") for e in triage_phases], ["scout_triage", "done"])
+        self.assertIn("Scout is triaging", triage_phases[0]["status_text"])
+
+
 
 @unittest.skipUnless(HAS_WEB_DEPS, "fastapi/httpx/google-genai required for HTTP TestClient integration tests")
 class TestScoutApiAndBridgeWorkflow(unittest.TestCase):

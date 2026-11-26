@@ -16,6 +16,7 @@ const fileTreeList = document.getElementById("file-tree-list");
 const fileTreeFilter = document.getElementById("file-tree-filter");
 const customCmdInput = document.getElementById("custom-cmd-input");
 const terminalMeta = document.getElementById("terminal-meta");
+const stopConsoleBtn = document.getElementById("btn-stop-console");
 const terminalOutput = document.getElementById("terminal-output");
 const pasteTermBtn = document.getElementById("btn-paste-terminal");
 const terminalSavepointBar = document.getElementById("terminal-savepoint-bar");
@@ -29,6 +30,7 @@ const expandedDirs = new Set();
 const dirCache = new Map();
 let lastManualCommandPassed = false;
 let lastManualSessionId = null;
+let activeConsoleAbortController = null;
 
 export function initDrawer() {
   tabButtons.forEach((btn) => {
@@ -55,6 +57,27 @@ export function initDrawer() {
   });
 
   postTestsBtn.addEventListener("click", triggerPostPatchTests);
+
+  if (stopConsoleBtn) {
+    stopConsoleBtn.addEventListener("click", async () => {
+      stopConsoleBtn.disabled = true;
+      stopConsoleBtn.textContent = "Stopping...";
+      const abortRef = activeConsoleAbortController;
+      const fallbackTimer = window.setTimeout(() => {
+        if (abortRef) abortRef.abort();
+      }, 2500);
+      try {
+        await api.cancelWorkspaceRun(
+          state.activeSessionId || null,
+          state.liveExec && state.liveExec.source === "console" ? state.liveExec.runId : null
+        );
+      } catch {
+        if (abortRef) abortRef.abort();
+      } finally {
+        window.clearTimeout(fallbackTimer);
+      }
+    });
+  }
 
   pasteTermBtn.addEventListener("click", () => {
     if (!state.lastTerminalOutput) return;
@@ -341,8 +364,15 @@ async function runTerminalCommand(command, opts = {}) {
   syncTerminalSavepointBar();
 
   terminalMeta.textContent = `Running: ${command}...`;
-  terminalOutput.textContent = "";
+  terminalOutput.textContent = "(Waiting for stdout / stderr output...)";
   pasteTermBtn.disabled = true;
+  const abortController = new AbortController();
+  activeConsoleAbortController = abortController;
+  if (stopConsoleBtn) {
+    stopConsoleBtn.classList.remove("hidden");
+    stopConsoleBtn.disabled = false;
+    stopConsoleBtn.textContent = "Stop";
+  }
 
   if (reportInChat) {
     upsertActivity(sid, {
@@ -361,16 +391,18 @@ async function runTerminalCommand(command, opts = {}) {
     const res = await api.runCommand(proj.id, command, {
       sessionId: sid,
       isTestRun,
+      signal: abortController.signal,
     });
     if (Array.isArray(res.checkpoints)) {
       state.checkpoints = res.checkpoints;
     }
     const rawOut = res.output || "";
+    const cancelled = Boolean(res.cancelled);
     const hasTraceback =
       /Traceback \(most recent call last\):|\n(?:SyntaxError|AssertionError|ImportError|ModuleNotFoundError):/i.test(
         rawOut
       );
-    const ok = res.exit_code === 0 && !hasTraceback;
+    const ok = !cancelled && res.exit_code === 0 && !hasTraceback;
     lastManualCommandPassed = Boolean(ok && !res.checkpoint_committed);
     showTerminalResult(res);
     if (!reportInChat && res.checkpoint_committed) {
@@ -378,7 +410,20 @@ async function runTerminalCommand(command, opts = {}) {
       emit("chat:loaded");
     }
     if (reportInChat) {
-      if (ok) {
+      if (cancelled) {
+        const report = buildCommandFailureReport(command, res.exit_code, rawOut);
+        upsertActivity(sid, {
+          id: actId,
+          batchKey: actId,
+          status: "err",
+          title: "Stopped by user (exit -1)",
+          detail: `${command} · ${res.duration_ms}ms · View full output in Console`,
+          preview: report.preview,
+          showConsoleBtn: true,
+          timestamp: new Date().toISOString(),
+        });
+        emit("chat:loaded");
+      } else if (ok) {
         const tailLines = rawOut.split("\n").filter((l) => l.trim()).slice(-6).join("\n").slice(0, 500);
         const commitNote = res.checkpoint_committed ? " · Savepoint committed ✓" : "";
         upsertActivity(sid, {
@@ -451,6 +496,15 @@ async function runTerminalCommand(command, opts = {}) {
       }
       emit("chat:loaded");
     }
+  } finally {
+    if (activeConsoleAbortController === abortController) {
+      activeConsoleAbortController = null;
+    }
+    if (stopConsoleBtn) {
+      stopConsoleBtn.classList.add("hidden");
+      stopConsoleBtn.disabled = false;
+      stopConsoleBtn.textContent = "Stop";
+    }
   }
 }
 
@@ -482,22 +536,37 @@ function upsertActivity(sessionId, entry) {
 
 function handleExecStreamEvent(msg) {
   if (!msg || !msg.type) return;
+  const nowMs = Date.now();
   if (msg.type === "exec_start") {
     state.liveExec = {
       runId: msg.run_id || null,
       command: msg.command || "",
       source: msg.source || "console",
+      gateId: msg.gate_id || null,
+      sessionId: msg.session_id || null,
+      timeoutSeconds: msg.timeout_seconds || null,
+      startedAtMs: nowMs,
+      lastOutputAtMs: nowMs,
+      elapsedMs: 0,
+      idleMs: 0,
+      bytesReceived: 0,
       output: "",
       done: false,
+      phase: null,
+      phaseText: null,
+      phaseStartedAtMs: null,
     };
     terminalMeta.textContent = `Running: ${state.liveExec.command}...`;
-    terminalOutput.textContent = "";
+    terminalOutput.textContent = "(Waiting for stdout / stderr output...)";
     pasteTermBtn.disabled = true;
+    if (stopConsoleBtn && state.liveExec.source === "console") {
+      stopConsoleBtn.classList.remove("hidden");
+      stopConsoleBtn.disabled = false;
+      stopConsoleBtn.textContent = "Stop";
+    }
     emit("chat:live-exec", {
       type: "start",
-      command: state.liveExec.command,
-      source: state.liveExec.source,
-      output: "",
+      ...state.liveExec,
     });
     return;
   }
@@ -507,14 +576,32 @@ function handleExecStreamEvent(msg) {
         runId: msg.run_id || null,
         command: "",
         source: msg.source || "console",
+        gateId: msg.gate_id || null,
+        sessionId: msg.session_id || null,
+        startedAtMs: nowMs,
+        lastOutputAtMs: nowMs,
+        elapsedMs: 0,
+        idleMs: 0,
+        bytesReceived: 0,
         output: "",
         done: false,
+        phase: null,
+        phaseText: null,
+        phaseStartedAtMs: null,
       };
     }
-    state.liveExec.output += String(msg.chunk || "");
+    const chunkStr = String(msg.chunk || "");
+    state.liveExec.output += chunkStr;
     if (state.liveExec.output.length > 45000) {
       state.liveExec.output = state.liveExec.output.slice(-45000);
     }
+    state.liveExec.lastOutputAtMs = nowMs;
+    state.liveExec.idleMs = 0;
+    state.liveExec.bytesReceived = Number(
+      msg.bytes_received !== undefined
+        ? msg.bytes_received
+        : (state.liveExec.bytesReceived || 0) + chunkStr.length
+    );
     terminalOutput.textContent = state.liveExec.output || "(Running...)";
     terminalOutput.scrollTop = terminalOutput.scrollHeight;
     const lineCount = state.liveExec.output.split("\n").length;
@@ -522,22 +609,138 @@ function handleExecStreamEvent(msg) {
     terminalMeta.textContent = `Running${cmdLabel} · ${lineCount} ${lineCount === 1 ? "line" : "lines"} streamed...`;
     emit("chat:live-exec", {
       type: "chunk",
-      command: state.liveExec.command,
-      source: state.liveExec.source,
-      output: state.liveExec.output,
+      ...state.liveExec,
     });
+    return;
+  }
+  if (msg.type === "exec_heartbeat") {
+    if (!state.liveExec || (msg.run_id && state.liveExec.runId && msg.run_id !== state.liveExec.runId)) {
+      state.liveExec = {
+        runId: msg.run_id || null,
+        command: msg.command || "",
+        source: msg.source || "console",
+        gateId: msg.gate_id || null,
+        sessionId: msg.session_id || null,
+        startedAtMs: nowMs - Number(msg.elapsed_ms || 0),
+        lastOutputAtMs: nowMs - Number(msg.idle_ms || 0),
+        elapsedMs: Number(msg.elapsed_ms || 0),
+        idleMs: Number(msg.idle_ms || 0),
+        bytesReceived: Number(msg.bytes_received || 0),
+        output: "",
+        done: false,
+        phase: null,
+        phaseText: null,
+        phaseStartedAtMs: null,
+      };
+    } else {
+      state.liveExec.elapsedMs = Number(msg.elapsed_ms ?? (nowMs - (state.liveExec.startedAtMs || nowMs)));
+      state.liveExec.idleMs = Number(msg.idle_ms ?? (nowMs - (state.liveExec.lastOutputAtMs || nowMs)));
+      if (msg.bytes_received !== undefined) {
+        state.liveExec.bytesReceived = Number(msg.bytes_received);
+      }
+    }
+    if (state.liveExec.source === "console" && !state.liveExec.phaseText) {
+      const elapsedSec = Math.max(0, Math.floor(Number(state.liveExec.elapsedMs || 0) / 1000));
+      const idleSec = Math.max(0, Math.floor(Number(state.liveExec.idleMs || 0) / 1000));
+      const bytes = Number(state.liveExec.bytesReceived || 0);
+      const statusDetail = bytes > 0 ? `${bytes.toLocaleString()} B · silent ${idleSec}s` : "waiting for output";
+      const cmdLabel = state.liveExec.command ? `: ${state.liveExec.command}` : "";
+      terminalMeta.textContent = `Running${cmdLabel} · ${elapsedSec}s (${statusDetail})`;
+    }
+    emit("chat:live-exec", {
+      type: "heartbeat",
+      ...state.liveExec,
+    });
+    return;
+  }
+  if (msg.type === "exec_phase") {
+    const isClearing = msg.phase === "done" || !msg.status_text;
+    if (!state.liveExec) {
+      if (isClearing) {
+        emit("chat:live-exec", { type: "phase", phase: "done", phaseText: null, done: true });
+        return;
+      }
+      state.liveExec = {
+        runId: msg.run_id || null,
+        command: msg.command || "",
+        source: msg.source || "gate",
+        gateId: msg.gate_id || null,
+        sessionId: msg.session_id || null,
+        startedAtMs: nowMs,
+        lastOutputAtMs: nowMs,
+        elapsedMs: 0,
+        idleMs: 0,
+        bytesReceived: Number((state.lastTerminalOutput || "").length || 0),
+        output: state.lastTerminalOutput || "",
+        done: true,
+        phase: null,
+        phaseText: null,
+        phaseStartedAtMs: null,
+      };
+    }
+    state.liveExec.phase = isClearing ? null : (msg.phase || "scout_summarize");
+    state.liveExec.phaseText = isClearing ? null : String(msg.status_text || "");
+    state.liveExec.phaseStartedAtMs = isClearing ? null : nowMs;
+    if (terminalMeta) {
+      const hasExitMeta = state.liveExec.exitCode !== undefined;
+      if (!isClearing) {
+        if (hasExitMeta) {
+          const exitLabel = state.liveExec.cancelled
+            ? "Stopped by user · Exit -1"
+            : `Exit ${state.liveExec.exitCode}`;
+          terminalMeta.textContent = `${exitLabel} · ${state.liveExec.durationMs || 0}ms · ${state.liveExec.phaseText}`;
+        } else {
+          terminalMeta.textContent = state.liveExec.phaseText;
+        }
+      } else if (hasExitMeta && state.liveExec.done) {
+        const exitLabel = state.liveExec.cancelled
+          ? "Stopped by user · Exit -1"
+          : `Exit ${state.liveExec.exitCode}`;
+        terminalMeta.textContent = `${exitLabel} · ${state.liveExec.durationMs || 0}ms · ~${Number(state.liveExec.estimatedTokens || 0).toLocaleString()} tok`;
+      }
+    }
+    const phasePayload = {
+      type: "phase",
+      ...state.liveExec,
+    };
+    if (isClearing && !state.resolvingGateId && !state.pendingStatusText && !state.pendingStartedAtMs && state.liveExec.done) {
+      state.liveExec = null;
+    }
+    emit("chat:live-exec", phasePayload);
     return;
   }
   if (msg.type === "exec_done") {
     const finalOutput =
       typeof msg.output === "string" ? msg.output : state.liveExec ? state.liveExec.output : "";
-    if (state.resolvingGateId || state.pendingStatusText) {
+    if (stopConsoleBtn && (msg.source === "console" || (state.liveExec && state.liveExec.source === "console"))) {
+      stopConsoleBtn.classList.add("hidden");
+      stopConsoleBtn.disabled = false;
+      stopConsoleBtn.textContent = "Stop";
+    }
+    const keepLiveForPostExit =
+      Boolean(state.resolvingGateId || state.pendingStatusText || state.pendingStartedAtMs) ||
+      (msg.source && msg.source !== "console");
+    if (keepLiveForPostExit) {
       state.liveExec = {
         runId: msg.run_id || (state.liveExec && state.liveExec.runId) || null,
         command: msg.command || (state.liveExec && state.liveExec.command) || "",
         source: msg.source || (state.liveExec && state.liveExec.source) || "gate",
+        gateId: msg.gate_id || (state.liveExec && state.liveExec.gateId) || null,
+        sessionId: msg.session_id || (state.liveExec && state.liveExec.sessionId) || null,
+        startedAtMs: (state.liveExec && state.liveExec.startedAtMs) || nowMs,
+        lastOutputAtMs: nowMs,
+        elapsedMs: Number(msg.duration_ms || 0),
+        idleMs: 0,
+        bytesReceived: finalOutput.length,
+        cancelled: Boolean(msg.cancelled),
+        exitCode: msg.exit_code,
+        durationMs: Number(msg.duration_ms || 0),
+        estimatedTokens: Number(msg.estimated_tokens || 0),
         output: finalOutput,
         done: true,
+        phase: null,
+        phaseText: null,
+        phaseStartedAtMs: null,
       };
     } else {
       state.liveExec = null;
@@ -547,6 +750,7 @@ function handleExecStreamEvent(msg) {
       type: "done",
       command: msg.command || "",
       source: msg.source || "console",
+      cancelled: Boolean(msg.cancelled),
       output: finalOutput,
     });
   }
@@ -586,7 +790,10 @@ function syncTerminalSavepointBar() {
     commitCpBtn.className = "btn btn-primary btn-xs";
   } else {
     const n = Number(activeCp.files_count || 0);
-    terminalSavepointLabel.textContent = `Active savepoint (${n} ${n === 1 ? "file" : "files"}) · Commit after manual test pass`;
+    terminalSavepointLabel.textContent =
+      n > 0
+        ? `Active savepoint (${n} ${n === 1 ? "file" : "files"}) · Commit after manual test pass`
+        : "Active savepoint · Commit after manual test pass";
     commitCpBtn.className = "btn btn-secondary btn-xs";
   }
 }
@@ -639,9 +846,10 @@ async function handleTerminalRestoreCheckpoint() {
 }
 
 function showTerminalResult(res, opts = {}) {
-  state.lastTerminalLabel = `${res.command} (exit ${res.exit_code})`;
+  const statusTag = res.cancelled ? "stopped" : `exit ${res.exit_code}`;
+  state.lastTerminalLabel = `${res.command} (${statusTag})`;
   state.lastTerminalOutput = res.output || "";
-  terminalMeta.textContent = `Exit ${res.exit_code} · ${res.duration_ms}ms · ~${(res.estimated_tokens || 0).toLocaleString()} tok`;
+  terminalMeta.textContent = `${res.cancelled ? "Stopped by user · Exit -1" : `Exit ${res.exit_code}`} · ${res.duration_ms}ms · ~${(res.estimated_tokens || 0).toLocaleString()} tok`;
   terminalOutput.textContent = res.output || "(No output)";
   terminalOutput.scrollTop = terminalOutput.scrollHeight;
   pasteTermBtn.disabled = !state.lastTerminalOutput;

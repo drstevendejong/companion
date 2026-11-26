@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import re
 import shutil
 import time
 from datetime import datetime, timezone
@@ -168,6 +169,93 @@ def _build_literal_not_found_diagnostic(
     return base_msg
 
 
+_ELLIPSIS_MARKER_RE = re.compile(
+    r"^\s*(?:\.{3,}|…|\[\s*(?:\.{3,}|…|omitted|snip|rest)\s*\]|\.{3,}\s*(?:\[omitted\]|\(omitted\))\s*\.{0,3}|"
+    r"(?:#|//|--)\s*\.{3,}\s*(?:omitted)?|/\*\s*\.{3,}\s*\*/|<!--\s*\.{3,}\s*-->)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _try_resolve_ellipsis_span(
+    rel_path: str,
+    original: str,
+    norm_old: str,
+    *,
+    replace_all: bool = False,
+    has_crlf_on_disk: bool = False,
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Deterministically resolves a single `start_anchor / ... / end_anchor` SEARCH block
+    without regex. Requires BOTH start_anchor (globally) and end_anchor (after start_anchor)
+    to match uniquely so unrelated code can never be swallowed.
+    Returns (s_pos, e_pos, start_line_no, end_line_no) or None if no ellipsis marker exists.
+    """
+    old_lines = norm_old.splitlines()
+    marker_indices = [i for i, ln in enumerate(old_lines) if _ELLIPSIS_MARKER_RE.match(ln)]
+    if not marker_indices:
+        return None
+    if replace_all:
+        raise PatchValidationError(
+            "Ellipsis '...' anchor matching cannot be used with replace_all=True."
+        )
+    if len(marker_indices) > 1:
+        raise PatchValidationError(
+            f"Only one '...' omission marker is allowed per SEARCH block in '{rel_path}'; "
+            f"split into multiple small SEARCH/REPLACE hunks or use line-range patching."
+        )
+
+    m_idx = marker_indices[0]
+    start_anchor = "\n".join(old_lines[:m_idx])
+    end_anchor = "\n".join(old_lines[m_idx + 1 :])
+    if not start_anchor.strip() or not end_anchor.strip():
+        raise PatchValidationError(
+            f"SEARCH block with '...' in '{rel_path}' must include non-empty literal start lines "
+            f"before '...' and literal end lines after '...'."
+        )
+
+    start_count = original.count(start_anchor)
+    if start_count == 0:
+        diag = _build_literal_not_found_diagnostic(
+            rel_path, original, start_anchor, has_crlf_on_disk=has_crlf_on_disk
+        )
+        raise PatchValidationError(f"SEARCH start anchor (before '...') mismatch: {diag}")
+    if start_count > 1:
+        occ = _find_line_occurrences(original, start_anchor)
+        raise PatchValidationError(
+            f"SEARCH start anchor (before '...') matched {start_count} times in '{rel_path}' "
+            f"(lines {', '.join(str(n) for n in occ[:8])}); add 1–2 more unique lines."
+        )
+
+    s_pos = original.find(start_anchor)
+    after_start = s_pos + len(start_anchor)
+    start_line_no = original[:s_pos].count("\n") + 1
+    after_start_line_base = original[:after_start].count("\n")
+    tail = original[after_start:]
+
+    end_count = tail.count(end_anchor)
+    if end_count == 0:
+        diag = _build_literal_not_found_diagnostic(
+            rel_path, tail, end_anchor, has_crlf_on_disk=has_crlf_on_disk
+        )
+        raise PatchValidationError(
+            f"SEARCH start anchor matched at line {start_line_no}, but end anchor (after '...') "
+            f"was not found afterward. {diag}"
+        )
+    if end_count > 1:
+        tail_occ = _find_line_occurrences(tail, end_anchor)
+        abs_occ = [after_start_line_base + ln for ln in tail_occ]
+        raise PatchValidationError(
+            f"SEARCH end anchor (after '...') matched {end_count} times after line {start_line_no} "
+            f"in '{rel_path}' (lines {', '.join(str(n) for n in abs_occ[:8])}); add 1–2 more unique trailing lines "
+            f"to prevent swallowing unintended code."
+        )
+
+    rel_end_pos = tail.find(end_anchor)
+    e_pos = after_start + rel_end_pos + len(end_anchor)
+    end_line_no = original[: max(s_pos, e_pos - 1)].count("\n") + 1
+    return s_pos, e_pos, start_line_no, end_line_no
+
+
 def preview_literal_patch(
     project_root: str | Path,
     rel_path: str,
@@ -185,11 +273,27 @@ def preview_literal_patch(
     norm_old = old_text.replace("\r\n", "\n").replace("\r", "\n")
     norm_new = new_text.replace("\r\n", "\n").replace("\r", "\n")
     count = original.count(norm_old)
+    used_ellipsis = False
+    resolved_range: Optional[Tuple[int, int]] = None
+
     if count == 0:
-        raise PatchValidationError(
-            _build_literal_not_found_diagnostic(rel_path, original, norm_old, has_crlf_on_disk=has_crlf)
+        span = _try_resolve_ellipsis_span(
+            rel_path,
+            original,
+            norm_old,
+            replace_all=replace_all,
+            has_crlf_on_disk=has_crlf,
         )
-    if count > 1 and not replace_all:
+        if span is None:
+            raise PatchValidationError(
+                _build_literal_not_found_diagnostic(rel_path, original, norm_old, has_crlf_on_disk=has_crlf)
+            )
+        s_pos, e_pos, s_line, e_line = span
+        used_ellipsis = True
+        resolved_range = (s_line, e_line)
+        count = 1
+        modified = original[:s_pos] + norm_new + original[e_pos:]
+    elif count > 1 and not replace_all:
         occ_lines = _find_line_occurrences(original, norm_old)
         occ_note = (
             f" (starting at lines {', '.join(str(n) for n in occ_lines[:8])}"
@@ -201,7 +305,9 @@ def preview_literal_patch(
         raise PatchValidationError(
             f"Target literal block matched {count} times in '{rel_path}'{occ_note}; provide more surrounding context or set replace_all=True."
         )
-    modified = original.replace(norm_old, norm_new) if replace_all else original.replace(norm_old, norm_new, 1)
+    else:
+        modified = original.replace(norm_old, norm_new) if replace_all else original.replace(norm_old, norm_new, 1)
+
     _validate_python_ast(rel_path, modified)
     diff = _make_unified_diff(rel_path, original, modified)
     return {
@@ -212,8 +318,29 @@ def preview_literal_patch(
         "diff": diff,
         "ast_valid": True,
         "occurrences": count,
+        "used_ellipsis": used_ellipsis,
+        "resolved_range": resolved_range,
         "estimated_tokens": estimate_tokens(diff),
     }
+
+
+def _matches_line_anchor(actual_line: str, expected: str) -> bool:
+    exp_norm = " ".join(expected.strip().split())
+    if not exp_norm:
+        return True
+    act_norm = " ".join(actual_line.strip().split())
+    if exp_norm == act_norm:
+        return True
+    return len(exp_norm) >= 6 and (act_norm.startswith(exp_norm) or exp_norm in act_norm)
+
+
+def _nearby_line_hint(lines: List[str], target_line: int, expected: str) -> str:
+    lo = max(0, target_line - 21)
+    hi = min(len(lines), target_line + 20)
+    near_hits = [idx + 1 for idx in range(lo, hi) if _matches_line_anchor(lines[idx], expected)]
+    if near_hits:
+        return f" Closest matching line(s) nearby: {', '.join(str(n) for n in near_hits[:5])}."
+    return ""
 
 
 def preview_line_patch(
@@ -222,6 +349,8 @@ def preview_line_patch(
     start_line: int,
     end_line: int,
     new_text: str,
+    expect_start: Optional[str] = None,
+    expect_end: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Computes line-range replacement diff and AST validity without touching disk."""
     fpath = resolve_safe_path(project_root, rel_path)
@@ -234,6 +363,37 @@ def preview_line_patch(
         raise PatchValidationError(
             f"Invalid line range {start_line}-{end_line} for '{rel_path}' ({total} lines)."
         )
+
+    exp_start_clean = str(expect_start or "").strip()
+    if exp_start_clean:
+        if start_line > total:
+            raise PatchValidationError(
+                f"Line-range safety check failed at start_line {start_line} of '{rel_path}' "
+                f"(file only has {total} lines; expected '{exp_start_clean}')."
+            )
+        actual_start = lines[start_line - 1].rstrip("\r\n")
+        if not _matches_line_anchor(actual_start, exp_start_clean):
+            hint = _nearby_line_hint(lines, start_line, exp_start_clean)
+            raise PatchValidationError(
+                f"Line-range safety check failed at start_line {start_line} of '{rel_path}': "
+                f"expected '{exp_start_clean}', actual line {start_line} is '{actual_start.strip()}'.{hint}"
+            )
+
+    exp_end_clean = str(expect_end or "").strip()
+    if exp_end_clean:
+        if end_line > total:
+            raise PatchValidationError(
+                f"Line-range safety check failed at end_line {end_line} of '{rel_path}' "
+                f"(file only has {total} lines; expected '{exp_end_clean}')."
+            )
+        actual_end = lines[end_line - 1].rstrip("\r\n")
+        if not _matches_line_anchor(actual_end, exp_end_clean):
+            hint = _nearby_line_hint(lines, end_line, exp_end_clean)
+            raise PatchValidationError(
+                f"Line-range safety check failed at end_line {end_line} of '{rel_path}': "
+                f"expected '{exp_end_clean}', actual line {end_line} is '{actual_end.strip()}'.{hint}"
+            )
+
     replacement_lines = new_text.splitlines(keepends=True)
     if new_text and not new_text.endswith("\n") and end_line <= total and lines[end_line - 1].endswith("\n"):
         replacement_lines[-1] = replacement_lines[-1] + "\n"
@@ -534,8 +694,7 @@ def apply_rename_file(
 
     backup_path = _backup_target_file(root, backup_dir_rel, old_path)
     dest_existed = dst.is_file()
-    if dest_existed:
-        _backup_target_file(root, backup_dir_rel, new_path)
+    dest_backup_path = _backup_target_file(root, backup_dir_rel, new_path) if dest_existed else None
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
@@ -546,6 +705,7 @@ def apply_rename_file(
         "existed_before": True,
         "dest_existed_before": dest_existed,
         "backup_path": backup_path,
+        "dest_backup_path": dest_backup_path,
         "diff": preview["diff"],
         "renamed": True,
     }

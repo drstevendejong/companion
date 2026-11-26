@@ -174,16 +174,33 @@ class TestUiDomContract(unittest.TestCase):
             "scout-stats-line",
             "btn-scout-details",
             "ai-details-popover",
-            "cdp-controls-group",
         ):
             self.assertIn(f'id="{panel_id}"', html)
+        for removed_cdp_id in (
+            "cdp-controls-group",
+            "cdp-tab-select",
+            "btn-cdp-shot",
+            "btn-cdp-console",
+            "btn-cdp-refresh",
+            "proj-cdp-port",
+        ):
+            self.assertNotIn(f'id="{removed_cdp_id}"', html)
+        for removed_cdp_file in (
+            COMPANION_ROOT / "routes" / "cdp.py",
+            COMPANION_ROOT / "services" / "cdp_bridge.py",
+            COMPANION_ROOT / "static" / "js" / "cdp.js",
+        ):
+            self.assertFalse(removed_cdp_file.exists(), f"Removed CDP file still exists: {removed_cdp_file}")
+        self.assertIn("Copy Image", html)
+        self.assertIn("Copy Image", bridge_js)
+        self.assertNotIn("Copy CDP Image", html)
+        self.assertNotIn("Copy CDP Image", bridge_js)
         api_block = html.split('id="api-sidebar-block"', 1)[1].split('id="bridge-sidebar-block"', 1)[0]
         self.assertNotIn('id="scout-telemetry-block"', api_block)
-        # Ensure Run Tests moved into Console tab and Directives + CDP controls moved out of topbar
+        # Ensure Run Tests moved into Console tab and Directives moved out of topbar
         topbar = html.split('class="topbar"', 1)[1].split("</header>", 1)[0]
         self.assertNotIn('id="btn-bridge-directives-pill"', topbar)
         self.assertNotIn('id="bridge-copy-split"', topbar)
-        self.assertNotIn('id="cdp-tab-select"', topbar)
         self.assertNotIn('id="btn-scout-toggle"', topbar)
         tab_terminal = html.split('id="tab-terminal"', 1)[1].split('id="tab-git"', 1)[0]
         self.assertIn('id="btn-run-post-tests"', tab_terminal)
@@ -193,6 +210,41 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn(".ambiguous-path-row", comp_css)
         self.assertIn("renderScoutTelemetry", sessions_js)
         self.assertIn("toggleDetailsPopover", sessions_js)
+        sys_prompt = (COMPANION_ROOT / "static" / "prompts" / "system_prompt.txt").read_text(encoding="utf-8")
+        bridge_contract = (COMPANION_ROOT / "static" / "prompts" / "bridge_tool_contract.txt").read_text(encoding="utf-8")
+        self.assertIn("SCOUT-FIRST", sys_prompt)
+        self.assertIn("scout_workspace", sys_prompt)
+        self.assertIn("# lines: START-END", sys_prompt)
+        self.assertIn("PREFER FIRST when Scout is ENABLED", bridge_contract)
+        self.assertIn("# expect_start:", bridge_contract)
+        self.assertIn("Ellipsis `...` span", bridge_contract)
+
+        state_js = (COMPANION_ROOT / "static" / "js" / "state.js").read_text(encoding="utf-8")
+        self.assertIn("btn-stop-console", tab_terminal)
+        self.assertIn("btn-stop-console", drawer_js)
+        self.assertIn("cancelExec", api_js)
+        self.assertIn("cancelWorkspaceRun", api_js)
+        self.assertIn("pendingStartedAtMs", state_js)
+        self.assertIn("pendingStartedAtMs", gates_js)
+        self.assertIn("pendingStartedAtMs", chat_js)
+        self.assertIn("pendingStartedAtMs", bridge_js)
+        self.assertIn("data-stop-exec", gates_js)
+        self.assertIn("data-stop-chat-exec", chat_js)
+        self.assertIn("(Waiting for stdout / stderr output...)", gates_js)
+        self.assertIn("(Waiting for stdout / stderr output...)", chat_js)
+        self.assertIn("exec_heartbeat", drawer_js)
+        self.assertIn("exec_heartbeat", lifecycle_js)
+        self.assertIn("exec_phase", lifecycle_js)
+        self.assertIn("exec_phase", drawer_js)
+        self.assertIn("phaseText", drawer_js)
+        self.assertIn("phaseText", gates_js)
+        self.assertIn("data-gate-status", gates_js)
+        self.assertIn("phaseText", chat_js)
+        self.assertIn("data-exec-headline", chat_js)
+        self.assertIn("data-exec-badge", chat_js)
+        self.assertIn(".live-pulse-dot", comp_css)
+        self.assertIn(".live-status-row", comp_css)
+        self.assertIn(".exec-preview.is-empty", comp_css)
 
     def test_theme_selector_and_css_tokens(self) -> None:
         html = (COMPANION_ROOT / "static" / "index.html").read_text(encoding="utf-8")

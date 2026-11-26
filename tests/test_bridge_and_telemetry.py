@@ -4,6 +4,7 @@ generated .md output discovery) and SQLite RPM/TPM/RPD rate telemetry + Pacific 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sqlite3
 import sys
 import tempfile
@@ -169,7 +170,8 @@ class TestPlaygroundBridge(unittest.TestCase):
             self.assertIn("AT MOST ONE", b1["bundle_text"])
             self.assertIn("ONCE ONLY", b1["bundle_text"])
             self.assertIn("Rule 1: Keep it clean.", b1["bundle_text"])
-            self.assertIn("Copy CDP Image", b1["bundle_text"])
+            self.assertIn("Copy Image", b1["bundle_text"])
+            self.assertNotIn("Copy CDP Image", b1["bundle_text"])
             self.assertEqual(b1["image_count"], 1)
 
             b2 = bridge.build_prompt_bundle(proj, "Follow-up prompt", [], include_directives=False)
@@ -300,7 +302,6 @@ class TestPlaygroundBridge(unittest.TestCase):
                             directives_path=None,
                             backup_dir="backup",
                             post_patch_command=None,
-                            cdp_port=9222,
                             ignore_patterns=[],
                             preset_commands=[],
                         )
@@ -538,7 +539,6 @@ class TestPlaygroundBridge(unittest.TestCase):
                             directives_path=None,
                             backup_dir="backup",
                             post_patch_command=None,
-                            cdp_port=9222,
                             ignore_patterns=[],
                             preset_commands=[],
                         )
@@ -665,17 +665,62 @@ class TestPlaygroundBridge(unittest.TestCase):
 
 
 class TestRateTelemetryAndAppMode(unittest.TestCase):
-    def test_rpm_tpm_decay_and_pacific_midnight_rpd_reset(self) -> None:
+    _cls_saved_mods: dict[str, Any] = {}
+    _cls_ctx: Any = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
         has_pydantic = importlib.util.find_spec("pydantic") is not None
-        ctx = patch.dict(sys.modules, {}, clear=False) if has_pydantic else _load_bridge_with_stubs()
-        saved_mods = {k: sys.modules.get(k) for k in ("models", "storage.db")}
+        target_keys = (
+            "models",
+            "storage.db",
+            "services.checkpoints",
+            "services.bridge",
+            "services.runner",
+            "services.gemini_client",
+            "routes.chat",
+            "routes.workspace",
+            "routes.bridge",
+            "fastapi",
+        )
+        cls._cls_saved_mods = {k: sys.modules.get(k) for k in target_keys}
+        cls._cls_ctx = patch.dict(sys.modules, {}, clear=False) if has_pydantic else _load_bridge_with_stubs()
+        cls._cls_ctx.__enter__()
+        fastapi_mod = pytypes.ModuleType("fastapi")
+        fastapi_mod.APIRouter = lambda **_kw: SimpleNamespace(
+            post=lambda *_a, **_k: (lambda fn: fn),
+            get=lambda *_a, **_k: (lambda fn: fn),
+        )
+        fastapi_mod.HTTPException = Exception
+        fastapi_mod.Query = lambda default=None, **_kw: default
+        fastapi_mod.Request = object
+        for k in target_keys:
+            if k != "fastapi":
+                sys.modules.pop(k, None)
+        sys.modules["fastapi"] = fastapi_mod
+
+    @classmethod
+    def tearDownClass(cls) -> None:
         try:
-            with ctx:
-                if not has_pydantic:
-                    sys.modules.pop("models", None)
-                    sys.modules.pop("storage.db", None)
-                from models import TokenStats
-                from storage.db import CompanionDB
+            for k, orig in cls._cls_saved_mods.items():
+                if orig is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = orig
+            cls._cls_saved_mods.clear()
+        finally:
+            if cls._cls_ctx is not None:
+                cls._cls_ctx.__exit__(None, None, None)
+                cls._cls_ctx = None
+            super().tearDownClass()
+
+    def test_rpm_tpm_decay_and_pacific_midnight_rpd_reset(self) -> None:
+        from models import TokenStats
+        from storage.db import CompanionDB
+
+        if True:
+            if True:
 
                 with tempfile.TemporaryDirectory() as tmp:
                     db_path = Path(tmp) / "telemetry.db"
@@ -754,63 +799,25 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                     self.assertEqual(snap2["rpm"], 0)
                     self.assertEqual(snap2["tpm"], 0)
                     self.assertEqual(snap2["rpd"], 0)
-        finally:
-            for k, orig in saved_mods.items():
-                if orig is None:
-                    sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = orig
+        if False:
+            pass
 
     def test_atomic_checkpoints_and_gated_run_tests(self) -> None:
         import asyncio
+        from models import ProjectCreate, SessionCreate
+        from routes import chat as route_chat
+        from routes import workspace as route_workspace
+        from storage.db import CompanionDB
 
-        has_pydantic = importlib.util.find_spec("pydantic") is not None
-        ctx = patch.dict(sys.modules, {}, clear=False) if has_pydantic else _load_bridge_with_stubs()
-        saved_mods = {
-            k: sys.modules.get(k)
-            for k in (
-                "models",
-                "storage.db",
-                "services.checkpoints",
-                "services.bridge",
-                "services.gemini_client",
-                "routes.chat",
-                "routes.workspace",
-                "fastapi",
-            )
-        }
-        try:
-            with ctx:
-                fastapi_mod = pytypes.ModuleType("fastapi")
-                fastapi_mod.APIRouter = lambda **_kw: SimpleNamespace(
-                    post=lambda *_a, **_k: (lambda fn: fn),
-                    get=lambda *_a, **_k: (lambda fn: fn),
-                )
-                fastapi_mod.HTTPException = Exception
-                fastapi_mod.Query = lambda default=None, **_kw: default
-                fastapi_mod.Request = object
-
-                for k in (
-                    "models",
-                    "storage.db",
-                    "services.checkpoints",
-                    "services.bridge",
-                    "services.gemini_client",
-                    "routes.chat",
-                    "routes.workspace",
-                ):
-                    sys.modules.pop(k, None)
-
-                with patch.dict(sys.modules, {"fastapi": fastapi_mod}, clear=False):
-                    from models import ProjectCreate, SessionCreate
-                    from routes import chat as route_chat
-                    from routes import workspace as route_workspace
-                    from storage.db import CompanionDB
+        if True:
+            if True:
+                if True:
 
                     with tempfile.TemporaryDirectory() as tmp:
                         root = Path(tmp) / "proj"
                         root.mkdir()
                         (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+                        (root / "untouched.py").write_text("KEEP_ME = 123\n", encoding="utf-8")
 
                         db = CompanionDB(Path(tmp) / "companion.db")
                         proj = db.create_project(
@@ -820,7 +827,6 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                                 python_path=None,
                                 directives_path=None,
                                 backup_dir="backup",
-                                cdp_port=9222,
                                 ignore_patterns=[],
                                 preset_commands=[],
                                 post_patch_command='python3 -c "import app; assert app.VALUE == 2"',
@@ -881,6 +887,9 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                         self.assertEqual(cp1.after_msg_index, expected_anchor)
                         self.assertIn("app.py", cp1.modified_files)
                         self.assertIn("extra.py", cp1.created_files)
+                        # CoW Savepoint: untouched files are NOT copied, modified files ARE captured
+                        self.assertFalse((Path(cp1.snapshot_dir) / "files" / "untouched.py").exists())
+                        self.assertTrue((Path(cp1.snapshot_dir) / "files" / "app.py").is_file())
                         self.assertIn("FAILED", res1["bridge_reply_text"])
 
                         # Test Restore rollback: reverts app.py to VALUE = 1 and removes extra.py!
@@ -926,6 +935,7 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                         self.assertTrue(res2.get("checkpoint_committed"))
                         self.assertEqual(len(res2["checkpoints"]), 2)
                         self.assertEqual(res2["checkpoints"][1].status, "committed")
+                        self.assertFalse(Path(res2["checkpoints"][1].snapshot_dir).exists())
                         self.assertIn("PASSED", res2["bridge_reply_text"])
 
                         # Batch 3: manual Commit Anyway on active checkpoint
@@ -945,62 +955,20 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                         comm_res = route_workspace.commit_project_checkpoint(cp3.id, req)
                         self.assertEqual(comm_res["checkpoint"].status, "committed")
 
-                        # Cleanup saved modules before returning
-        finally:
-            for k, orig in saved_mods.items():
-                if orig is None:
-                    sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = orig
+        if False:
+            pass
 
     def test_gated_delete_rename_and_fast_target_run_tests(self) -> None:
         import asyncio
+        from models import ProjectCreate, SessionCreate
+        from routes import chat as route_chat
+        from routes import workspace as route_workspace
+        from services import bridge, runner
+        from storage.db import CompanionDB
 
-        has_pydantic = importlib.util.find_spec("pydantic") is not None
-        ctx = patch.dict(sys.modules, {}, clear=False) if has_pydantic else _load_bridge_with_stubs()
-        saved_mods = {
-            k: sys.modules.get(k)
-            for k in (
-                "models",
-                "storage.db",
-                "services.checkpoints",
-                "services.bridge",
-                "services.runner",
-                "services.gemini_client",
-                "routes.chat",
-                "routes.workspace",
-                "fastapi",
-            )
-        }
-        try:
-            with ctx:
-                fastapi_mod = pytypes.ModuleType("fastapi")
-                fastapi_mod.APIRouter = lambda **_kw: SimpleNamespace(
-                    post=lambda *_a, **_k: (lambda fn: fn),
-                    get=lambda *_a, **_k: (lambda fn: fn),
-                )
-                fastapi_mod.HTTPException = Exception
-                fastapi_mod.Query = lambda default=None, **_kw: default
-                fastapi_mod.Request = object
-
-                for k in (
-                    "models",
-                    "storage.db",
-                    "services.checkpoints",
-                    "services.bridge",
-                    "services.runner",
-                    "services.gemini_client",
-                    "routes.chat",
-                    "routes.workspace",
-                ):
-                    sys.modules.pop(k, None)
-
-                with patch.dict(sys.modules, {"fastapi": fastapi_mod}, clear=False):
-                    from models import ProjectCreate, SessionCreate
-                    from routes import chat as route_chat
-                    from routes import workspace as route_workspace
-                    from services import bridge, runner
-                    from storage.db import CompanionDB
+        if True:
+            if True:
+                if True:
 
                     with tempfile.TemporaryDirectory() as tmp:
                         root = Path(tmp) / "proj"
@@ -1018,7 +986,6 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                                 python_path=None,
                                 directives_path=None,
                                 backup_dir="backup",
-                                cdp_port=9222,
                                 ignore_patterns=[],
                                 preset_commands=[],
                                 post_patch_command='python3 -c "print(\'full-ok\')"',
@@ -1136,59 +1103,20 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                         self.assertTrue((root / "obsolete.txt").is_file())
                         self.assertEqual((root / "obsolete.txt").read_text(encoding="utf-8"), "remove me\n")
                         self.assertFalse((root / "new_mod.py").exists())
-        finally:
-            for k, orig in saved_mods.items():
-                if orig is None:
-                    sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = orig
+        if False:
+            pass
 
     def test_propose_script_exit0_output_run_script_and_live_streaming(self) -> None:
         import asyncio
         import json as _json
+        from models import ProjectCreate, SessionCreate
+        from routes import chat as route_chat
+        from services import bridge, gemini_client
+        from storage.db import CompanionDB
 
-        has_pydantic = importlib.util.find_spec("pydantic") is not None
-        ctx = patch.dict(sys.modules, {}, clear=False) if has_pydantic else _load_bridge_with_stubs()
-        saved_mods = {
-            k: sys.modules.get(k)
-            for k in (
-                "models",
-                "storage.db",
-                "services.checkpoints",
-                "services.bridge",
-                "services.runner",
-                "services.gemini_client",
-                "routes.chat",
-                "fastapi",
-            )
-        }
-        try:
-            with ctx:
-                fastapi_mod = pytypes.ModuleType("fastapi")
-                fastapi_mod.APIRouter = lambda **_kw: SimpleNamespace(
-                    post=lambda *_a, **_k: (lambda fn: fn),
-                    get=lambda *_a, **_k: (lambda fn: fn),
-                )
-                fastapi_mod.HTTPException = Exception
-                fastapi_mod.Query = lambda default=None, **_kw: default
-                fastapi_mod.Request = object
-
-                for k in (
-                    "models",
-                    "storage.db",
-                    "services.checkpoints",
-                    "services.bridge",
-                    "services.runner",
-                    "services.gemini_client",
-                    "routes.chat",
-                ):
-                    sys.modules.pop(k, None)
-
-                with patch.dict(sys.modules, {"fastapi": fastapi_mod}, clear=False):
-                    from models import ProjectCreate, SessionCreate
-                    from routes import chat as route_chat
-                    from services import bridge, gemini_client
-                    from storage.db import CompanionDB
+        if True:
+            if True:
+                if True:
 
                     with tempfile.TemporaryDirectory() as tmp:
                         root = Path(tmp) / "proj"
@@ -1201,7 +1129,6 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                                 python_path=sys.executable,
                                 directives_path=None,
                                 backup_dir="backup",
-                                cdp_port=9222,
                                 ignore_patterns=[],
                                 preset_commands=[],
                             )
@@ -1369,7 +1296,8 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                         self.assertNotEqual(msgs_after[0].role, "tool_event")
                         stats = db.cleanup_database(force_vacuum=True)
                         self.assertTrue(stats["vacuumed"])
-                        self.assertLess(stats["db_bytes_after"], 200_000)
+                        self.assertLess(stats["db_bytes_after"], 250_000)
+                        self.assertLess(stats["db_bytes_after"], stats["db_bytes_before"] // 4)
 
                         # 6. Clean propose_inspection_script discards temporary empty Savepoint; run_and_delete_script errors clearly or accepts inline content
                         sess_insp = db.create_session(
@@ -1418,12 +1346,8 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                         self.assertFalse((root / "check_genai_schema.py").exists())
                         self.assertIn("SCHEMA_INLINE_OK", res_inline["bridge_reply_text"])
                         self.assertEqual(db.list_checkpoints(sess_insp.id), [])
-        finally:
-            for k, orig in saved_mods.items():
-                if orig is None:
-                    sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = orig
+        if False:
+            pass
 
     def test_parses_raw_patch_and_tagged_inspection_scripts_without_json(self) -> None:
         with _load_bridge_with_stubs():
@@ -1601,50 +1525,71 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
             self.assertEqual(p_unpatch["actions"][0]["args"]["new_text"], "DEBUG = True")
             self.assertNotIn("Applied cleanly", p_unpatch["prose_text"])
 
+            # 6. Raw ```patch with # lines: START-END + # expect_start / # expect_end (no <<< markers)
+            raw_line_patch = (
+                "Patching (core/client.py): Rewrite retry loop cleanly\n"
+                "```patch\n"
+                "# path: core/client.py\n"
+                "# lines: 140-295\n"
+                "# expect_start: def send_retry(payload):\n"
+                "# expect_end: return finalize(resp)\n"
+                "# summary: Rewrite retry loop\n"
+                "def send_retry(payload):\n"
+                "    return fast_send(payload)\n"
+                "```\n"
+                "Output:\nDone!\n"
+            )
+            p_line = bridge.parse_playground_markdown(raw_line_patch)
+            self.assertEqual(len(p_line["actions"]), 1)
+            self.assertEqual(p_line["actions"][0]["tool"], "patch_lines")
+            la = p_line["actions"][0]["args"]
+            self.assertEqual(la["path"], "core/client.py")
+            self.assertEqual(la["start_line"], 140)
+            self.assertEqual(la["end_line"], 295)
+            self.assertEqual(la["expect_start"], "def send_retry(payload):")
+            self.assertEqual(la["expect_end"], "return finalize(resp)")
+            self.assertIn("return fast_send(payload)", la["new_text"])
+            self.assertNotIn("Done!", p_line["prose_text"])
+
+            # 7. Multi-hunk ```patch with <<< REPLACEMENT ... >>> END line-range hunk + ellipsis SEARCH hunk
+            multi_patch = (
+                "```patch\n"
+                "# path: core/client.py\n"
+                "# lines: 10-25\n"
+                "# expect_start: OLD_HEADER = 1\n"
+                "# summary: Update header block\n"
+                "<<<<<<< REPLACEMENT\n"
+                "NEW_HEADER = 2\n"
+                ">>>>>>> END\n"
+                "# summary: Simplify big_func via ellipsis\n"
+                "<<<<<<< SEARCH\n"
+                "def big_func():\n"
+                "    ...\n"
+                "    return legacy_val\n"
+                "=======\n"
+                "def big_func():\n"
+                "    return new_val\n"
+                ">>>>>>> REPLACE\n"
+                "```\n"
+            )
+            p_multi = bridge.parse_playground_markdown(multi_patch)
+            self.assertEqual([a["tool"] for a in p_multi["actions"]], ["patch_lines", "patch_literal"])
+            self.assertEqual(p_multi["actions"][0]["args"]["start_line"], 10)
+            self.assertEqual(p_multi["actions"][0]["args"]["end_line"], 25)
+            self.assertEqual(p_multi["actions"][0]["args"]["new_text"], "NEW_HEADER = 2")
+            self.assertIn("...", p_multi["actions"][1]["args"]["old_text"])
+
     def test_every_prompt_guardrail_and_ambiguous_gate_save_vs_inspect(self) -> None:
         import asyncio
         import json as _json
+        from models import ProjectCreate, SessionCreate
+        from routes import chat as route_chat
+        from services import bridge as bridge_svc
+        from storage.db import CompanionDB
 
-        has_pydantic = importlib.util.find_spec("pydantic") is not None
-        ctx = patch.dict(sys.modules, {}, clear=False) if has_pydantic else _load_bridge_with_stubs()
-        saved_mods = {
-            k: sys.modules.get(k)
-            for k in (
-                "models",
-                "storage.db",
-                "services.checkpoints",
-                "services.bridge",
-                "services.gemini_client",
-                "routes.chat",
-                "fastapi",
-            )
-        }
-        try:
-            with ctx:
-                fastapi_mod = pytypes.ModuleType("fastapi")
-                fastapi_mod.APIRouter = lambda **_kw: SimpleNamespace(
-                    post=lambda *_a, **_k: (lambda fn: fn),
-                    get=lambda *_a, **_k: (lambda fn: fn),
-                )
-                fastapi_mod.HTTPException = Exception
-                fastapi_mod.Query = lambda default=None, **_kw: default
-                fastapi_mod.Request = object
-
-                for k in (
-                    "models",
-                    "storage.db",
-                    "services.checkpoints",
-                    "services.bridge",
-                    "services.gemini_client",
-                    "routes.chat",
-                ):
-                    sys.modules.pop(k, None)
-
-                with patch.dict(sys.modules, {"fastapi": fastapi_mod}, clear=False), tempfile.TemporaryDirectory() as tmp:
-                    from models import ProjectCreate, SessionCreate
-                    from routes import chat as route_chat
-                    from services import bridge as bridge_svc
-                    from storage.db import CompanionDB
+        if True:
+            if True:
+                with tempfile.TemporaryDirectory() as tmp:
 
                     root = Path(tmp) / "proj"
                     root.mkdir()
@@ -1656,7 +1601,6 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                             python_path=None,
                             directives_path=None,
                             backup_dir="backup",
-                            cdp_port=9222,
                             ignore_patterns=[],
                             preset_commands=[],
                         )
@@ -1669,6 +1613,17 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                     b_default = bridge_svc.build_prompt_bundle(proj, "Next step", [], include_directives=False, db=db)
                     self.assertIn("[BRIDGE REMINDER]", b_default["bundle_text"])
                     self.assertIn("Next step", b_default["bundle_text"])
+                    self.assertNotIn("Local AI Scout is ON", b_default["bundle_text"])
+
+                    # Follow-up Scout nudge included when scout_enabled=True and omitted when False
+                    b_scout_on = bridge_svc.build_prompt_bundle(
+                        proj, "Next step", [], include_directives=False, scout_enabled=True, db=db
+                    )
+                    self.assertIn("Local AI Scout is ON", b_scout_on["bundle_text"])
+                    b_scout_off = bridge_svc.build_prompt_bundle(
+                        proj, "Next step", [], include_directives=False, scout_enabled=False, db=db
+                    )
+                    self.assertNotIn("Local AI Scout is ON", b_scout_off["bundle_text"])
 
                     # Empty guardrail in DB disables appending it
                     db.set_setting("prompt_bridge_guardrail", "")
@@ -1725,12 +1680,178 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
                     self.assertTrue(run_ev["response"]["executed"])
                     self.assertTrue(run_ev["response"]["deleted"])
                     self.assertIn("RUN_OK", run_ev["response"]["output_preview"])
-        finally:
-            for k, orig in saved_mods.items():
-                if orig is None:
-                    sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = orig
+        if False:
+            pass
+
+    def test_inspection_script_auto_approve_patch_and_rerun_loop(self) -> None:
+        import asyncio
+        import json as _json
+        from models import BridgeParseRequest, ProjectCreate, SessionCreate
+        from routes import bridge as route_bridge
+        from routes import chat as route_chat
+        from services import bridge as bridge_svc
+        from storage.db import CompanionDB
+
+        if True:
+            if True:
+                with tempfile.TemporaryDirectory() as tmp:
+
+                    root = Path(tmp) / "proj"
+                    root.mkdir()
+                    app_file = root / "app.py"
+                    app_file.write_text("VALUE = 1\n", encoding="utf-8")
+
+                    db = CompanionDB(Path(tmp) / "companion.db")
+                    proj = db.create_project(
+                        ProjectCreate(
+                            name="InspLoopProj",
+                            root_path=str(root),
+                            python_path=sys.executable,
+                            directives_path=None,
+                            backup_dir="backup",
+                            ignore_patterns=[],
+                            preset_commands=[],
+                        )
+                    )
+                    sess = db.create_session(
+                        SessionCreate(project_id=proj.id, title="InspLoop", api_enabled=False)
+                    )
+                    req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=db, gemini=None)))
+
+                    # 1. Stage failing inspection script & approve once via write_run_and_delete
+                    g1 = db.create_gate(
+                        sess.id,
+                        "propose_inspection_script",
+                        {
+                            "path": "inspect_probe.py",
+                            "content": "import sys\nsys.stderr.write('TypeError: boom\\n')\nsys.exit(1)\n",
+                            "summary": "Probe country converter",
+                        },
+                        {"summary": "Probe country converter", "delete_on_success": True},
+                    )
+                    db.add_message(sess.id, role="model", text="Running initial probe")
+                    res1 = asyncio.run(
+                        route_chat.resolve_tool_gate(
+                            g1["id"], SimpleNamespace(action="write_run_and_delete", reason=None), req
+                        )
+                    )
+                    self.assertTrue((root / "inspect_probe.py").is_file())
+                    self.assertIn("TypeError: boom", res1["bridge_reply_text"])
+
+                    # 2. Paste ONLY a raw ```patch fixing inspect_probe.py -> auto-approves, auto-reruns, passes & deletes
+                    patch_md = (
+                        "Step 1/1 — Patching (inspect_probe.py): Print result cleanly\n"
+                        "```patch\n"
+                        "# path: inspect_probe.py\n"
+                        "<<<<<<< SEARCH\n"
+                        "import sys\n"
+                        "sys.stderr.write('TypeError: boom\\n')\n"
+                        "sys.exit(1)\n"
+                        "=======\n"
+                        "print('PROBE_FIXED_77')\n"
+                        ">>>>>>> REPLACE\n"
+                        "```\n"
+                    )
+                    res2 = asyncio.run(
+                        route_bridge.parse_bridge_response(
+                            BridgeParseRequest(session_id=sess.id, raw_markdown=patch_md, auto_approve_reads=True),
+                            req,
+                        )
+                    )
+                    self.assertEqual(res2["pending_gates"], [])
+                    self.assertGreaterEqual(res2["auto_executed_count"], 1)
+                    self.assertFalse((root / "inspect_probe.py").exists())
+                    self.assertIn("auto-approved inspection script patch", res2["bridge_reply_text"])
+                    self.assertIn("PROBE_FIXED_77", res2["bridge_reply_text"])
+
+                    # 3. Safety boundary: non-inspection file (app.py) MUST still create a pending gate,
+                    #    and deleted inspect_probe.py is no longer auto-approved.
+                    safety_md = (
+                        "```patch\n"
+                        "# path: app.py\n"
+                        "<<<<<<< SEARCH\n"
+                        "VALUE = 1\n"
+                        "=======\n"
+                        "VALUE = 2\n"
+                        ">>>>>>> REPLACE\n"
+                        "```\n"
+                    )
+                    res3 = asyncio.run(
+                        route_bridge.parse_bridge_response(
+                            BridgeParseRequest(session_id=sess.id, raw_markdown=safety_md, auto_approve_reads=True),
+                            req,
+                        )
+                    )
+                    self.assertEqual(len(res3["pending_gates"]), 1)
+                    self.assertEqual(res3["pending_gates"][0]["tool_name"], "patch_literal")
+                    self.assertEqual(app_file.read_text(encoding="utf-8"), "VALUE = 1\n")
+
+                    # Clear pending gate on app.py cleanly so next batch starts fresh
+                    asyncio.run(
+                        route_chat.resolve_tool_gate(
+                            res3["pending_gates"][0]["id"],
+                            SimpleNamespace(action="deny", reason="keep untouched"),
+                            req,
+                        )
+                    )
+
+                    # 4. Duplicate-run prevention: patch_literal + run_and_delete_script in one turn runs ONCE
+                    sess2 = db.create_session(
+                        SessionCreate(project_id=proj.id, title="NoDoubleRun", api_enabled=False)
+                    )
+                    g2 = db.create_gate(
+                        sess2.id,
+                        "propose_inspection_script",
+                        {
+                            "path": "inspect_once.py",
+                            "content": "import sys\nsys.exit(1)\n",
+                            "summary": "Check once",
+                        },
+                        {"summary": "Check once", "delete_on_success": True},
+                    )
+                    asyncio.run(
+                        route_chat.resolve_tool_gate(
+                            g2["id"], SimpleNamespace(action="write_run_and_delete", reason=None), req
+                        )
+                    )
+                    both_json = (
+                        "Patching and re-running inspect_once.py:\n"
+                        "```json\n"
+                        "[\n"
+                        '  {"tool": "patch_literal", "path": "inspect_once.py", "old_text": "import sys\\nsys.exit(1)", "new_text": "print(\'RAN_EXACTLY_ONCE\')"},\n'
+                        '  {"tool": "run_and_delete_script", "path": "inspect_once.py"}\n'
+                        "]\n"
+                        "```\n"
+                    )
+                    res4 = asyncio.run(
+                        route_bridge.parse_bridge_response(
+                            BridgeParseRequest(session_id=sess2.id, raw_markdown=both_json, auto_approve_reads=True),
+                            req,
+                        )
+                    )
+                    self.assertEqual(res4["pending_gates"], [])
+                    self.assertFalse((root / "inspect_once.py").exists())
+                    self.assertEqual(res4["bridge_reply_text"].count("RAN_EXACTLY_ONCE"), 1)
+
+                    # 5. Stopped-by-user bridge formatting check
+                    stopped_md = bridge_svc.format_bridge_tool_results(
+                        [
+                            {
+                                "tool_name": "run_script",
+                                "response": {
+                                    "command": "python hang.py",
+                                    "exec_id": "exec-stop",
+                                    "exit_code": -1,
+                                    "duration_ms": 2100,
+                                    "passed": False,
+                                    "cancelled": True,
+                                    "output_bytes": 0,
+                                    "output_preview": "",
+                                },
+                            }
+                        ]
+                    )
+                    self.assertIn("STOPPED BY USER", stopped_md)
 
 
 if __name__ == "__main__":
