@@ -75,7 +75,7 @@ def _get_effective_scout_settings(db: Any, gemini: Any) -> Dict[str, Any]:
         "enabled": False,
         "configured_enabled": False,
         "auto_approve": False,
-        "max_tokens": 30_000,
+        "max_tokens": 40_000,
         "summarize_threshold_chars": 4_000,
     }
 
@@ -104,6 +104,8 @@ async def _maybe_summarize_or_triage_output(
     focus: str | None,
     exec_id: str | None,
     cancelled: bool = False,
+    command_kind: str = "command",
+    goal: str | None = None,
     app: Any = None,
     session_id: Optional[str] = None,
     gate_id: Optional[str] = None,
@@ -155,7 +157,19 @@ async def _maybe_summarize_or_triage_output(
             return {}
         finally:
             await _emit_phase("done", "")
-    if has_focus or len(stripped_output) > threshold:
+
+    # Inspection/custom scripts already pass up to 12,000 chars directly in output_preview;
+    # summarizing short/medium script stdout loses exact data and forces a read_command_output round-trip.
+    if command_kind == "script":
+        effective_threshold = max(12_000, threshold)
+        should_summarize = len(stripped_output) > effective_threshold
+    else:
+        effective_threshold = threshold
+        should_summarize = (len(stripped_output) > effective_threshold) or (
+            has_focus and len(stripped_output) > 1_200
+        )
+
+    if should_summarize:
         await _emit_phase("scout_summarize", "Scout is summarizing output...")
         try:
             res = await asyncio.wait_for(
@@ -168,7 +182,9 @@ async def _maybe_summarize_or_triage_output(
                     exit_code=exit_code,
                     focus=focus,
                     exec_id=exec_id,
-                    threshold_chars=threshold,
+                    threshold_chars=effective_threshold,
+                    command_kind=command_kind,
+                    goal=goal,
                 ),
                 timeout=25.0,
             )
@@ -387,6 +403,8 @@ async def execute_existing_script_run(
         focus=focus,
         exec_id=exec_id,
         cancelled=cancelled,
+        command_kind="script",
+        goal=focus,
         app=app,
         session_id=session.id,
         gate_id=gate_id,
@@ -630,8 +648,8 @@ async def _advance_turn(
                         session_id=session.id,
                         goal=str(preview.get("goal") or ""),
                         subpath=str(preview.get("subpath") or "."),
-                        max_steps=int(preview.get("max_steps") or 8),
-                        max_tokens=int(scout_cfg.get("max_tokens") or 30_000),
+                        max_steps=int(preview.get("max_steps") or 10),
+                        max_tokens=int(scout_cfg.get("max_tokens") or 40_000),
                         app=app,
                         event_loop=getattr(getattr(app, "state", None), "event_loop", None),
                     )
@@ -980,7 +998,7 @@ async def _execute_gate_decision(
 
         goal = str(args.get("goal") or args.get("prompt") or "").strip()
         subpath = str(args.get("subpath") or ".").strip() or "."
-        max_steps = max(1, min(12, int(args.get("max_steps") or 8)))
+        max_steps = max(1, min(16, int(args.get("max_steps") or 10)))
         try:
             loop = asyncio.get_running_loop()
             scout_res = await asyncio.to_thread(
@@ -992,7 +1010,7 @@ async def _execute_gate_decision(
                 goal=goal,
                 subpath=subpath,
                 max_steps=max_steps,
-                max_tokens=int(scout_cfg.get("max_tokens") or 30_000),
+                max_tokens=int(scout_cfg.get("max_tokens") or 40_000),
                 app=app,
                 event_loop=loop,
             )
@@ -1409,6 +1427,8 @@ async def _execute_gate_decision(
                     focus=focus_arg,
                     exec_id=exec_id,
                     cancelled=cancelled,
+                    command_kind="script",
+                    goal=str(args.get("summary") or (gate.get("preview") or {}).get("summary") or "").strip() or None,
                     app=app,
                     session_id=session.id,
                     gate_id=gate_id,
@@ -1634,6 +1654,8 @@ async def _execute_gate_decision(
             focus=focus_arg,
             exec_id=exec_id,
             cancelled=cancelled,
+            command_kind="tests",
+            goal=str(args.get("summary") or "").strip() or None,
             app=app,
             session_id=session.id,
             gate_id=gate_id,
@@ -1974,6 +1996,8 @@ async def retry_failed_script(
         focus=focus_arg,
         exec_id=exec_id,
         cancelled=cancelled,
+        command_kind="script",
+        goal=focus_arg,
         app=app,
         session_id=session.id,
         run_id=run_res.get("run_id"),

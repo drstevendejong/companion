@@ -22,10 +22,11 @@ from services import fs_tools
 from services.token_utils import estimate_tokens
 
 DEFAULT_BRIDGE_GUARDRAIL = (
-    "> **[BRIDGE REMINDER]** Add a 1-line summary right before your block stating intent + target path "
+    "> **[BRIDGE REMINDER]** Batch all related file patches/edits in ONE reply (switch `# path:` inside one ```patch block "
+    "or emit consecutive ```patch / `write_file` blocks). Add a 1-line summary right before each block/action stating intent + target path "
     "(`Inspection script (path.py): ...`, `New file (path.ext): ...`, or `Patching (path.ext): ...`). "
     "Emit raw ```patch or ```python (never compress Python inside JSON). "
-    "HARD STOP immediately after closing ``` (or end of code)—zero trailing prose or fake output."
+    "HARD STOP immediately after your final closing ``` (or end of code)—zero trailing prose or fake output."
 )
 
 _FALLBACK_BRIDGE_TOOL_CONTRACT = """--- COMPANION BRIDGE TOOL CONTRACT ---
@@ -34,20 +35,27 @@ STRICT OUTPUT RULES:
    - `Step 2/4 — Inspection script (inspect_tmp.py): Check database schema fields`
    - `Step 2/4 — New file (utils/helper.py): Create helper module`
    - `Step 2/4 — Patching (core/client.py): Fix retry timeout`
-2) Prefer RAW fenced ```patch blocks for edits and RAW fenced ```python (or target-language) blocks for scripts and new files—never compress Python indentation inside JSON strings! When using JSON commands, emit AT MOST ONE ```json command block per message (batch multiple JSON actions inside ONE JSON array `[...]`).
+2) Prefer RAW fenced ```patch blocks for edits and RAW fenced ```python (or target-language) blocks for scripts and new files—never compress Python indentation inside JSON strings! **Batch multi-file changes in ONE reply**: either switch `# path: next/file.ext` before each hunk inside one ```patch block, or emit consecutive ```patch / tagged `write_file` blocks in the same reply. (For JSON commands, emit AT MOST ONE ```json array `[...]`.)
 3) Generate all output ONCE ONLY—never repeat, duplicate, or echo prose, code, or JSON blocks in the same reply.
-4) HARD STOP: End your response IMMEDIATELY after the closing ``` (or end of code). Never emit `Output:`, `Wait for output`, `## Local Workspace Tool Results`, or any trailing prose afterward (Companion truncates anything after the code block).
+4) HARD STOP: End your response IMMEDIATELY after your **final** closing ``` (or end of code). Never emit `Output:`, `Wait for output`, `## Local Workspace Tool Results`, or any trailing prose afterward (Companion collects all patch/code blocks in your reply and only truncates trailing text after your final block).
 
 RECOMMENDED ZERO-ESCAPING CODE FORMATS (NO JSON STRING ESCAPING NEEDED):
-A) Surgical Code Edits inside ```patch — pick whichever form is most token-efficient for the edit:
-1. Tight literal hunk (`patch_literal`) — for small/localized edits, include ONLY 2–4 unchanged boundary lines around the changed lines (never dump a whole 100-line function to change 5 lines; use multiple small hunks in one ```patch block for scattered edits):
+A) Surgical Code Edits inside ```patch — pick whichever form is most token-efficient for the edit (batch ALL files you already have context for in ONE reply—switch `# path:` inside one ```patch block or emit consecutive ```patch blocks rather than patching 1 file per turn):
+1. Tight literal hunk (`patch_literal`) — for small/localized edits, include ONLY 2–4 unchanged boundary lines around the changed lines (never dump a whole 100-line function to change 5 lines; use multiple hunks and/or `# path:` headers in one ```patch block for multi-spot / multi-file edits):
 ```patch
-# path: path/to/file.py
-# summary: 1-line reason
+# path: path/to/file_a.py
+# summary: 1-line reason for file_a
 <<<<<<< SEARCH
 exact existing boundary lines (indentation preserved verbatim)
 =======
 replacement lines (indentation preserved verbatim)
+>>>>>>> REPLACE
+# path: path/to/file_b.js
+# summary: 1-line reason for file_b
+<<<<<<< SEARCH
+existing lines in file_b
+=======
+updated lines in file_b
 >>>>>>> REPLACE
 ```
 2. Ellipsis `...` span inside `SEARCH` — to replace/delete a large block without knowing line numbers, emit 2–3 unique start lines, `...` on its own line, and 2–3 unique end lines (deterministic literal matching—NO regex; both start and end anchors must match uniquely):
@@ -89,7 +97,7 @@ C) New Files / Full Rewrites (`write_file`) — state `New file (path/to/file.ex
 `# tool: write_file`, `# path: path/to/file.py`, `# summary: 1-line reason` (also supports `// ...` or `<!-- ... -->`).
 
 JSON COMMAND TOOLS (ideal for searches, targeted reads, file ops, tests, and re-running failed scripts):
-- {"tool": "scout_workspace", "goal": "Find root cause of X / trace how Y reaches Z", "subpath": ".", "max_steps": 8} (**PREFER FIRST when Scout is ENABLED** for multi-file bug hunting or unfamiliar call paths — runs in an ephemeral `-lite` loop and returns exact files/lines without bloating main chat context!)
+- {"tool": "scout_workspace", "goal": "Trace how X is wired end-to-end and return verbatim patch-ready snippets + path:line citations", "subpath": ".", "max_steps": 10} (**PREFER FIRST when Scout is ENABLED** for any bug hunt, wiring trace, or unfamiliar component — runs in an ephemeral `-lite` loop and returns verbatim snippets/citations so you avoid multi-turn inspection!)
 - {"tool": "extract_headers", "pattern": ".", "include_symbols": true, "max_files": 60} (0-token structural index of file header comments & top-level classes/functions)
 - {"tool": "search_code", "pattern": "needle", "ignore_case": true, "is_regex": false} (supports `is_regex: true` + optional `"subpath"`, `"path_glob"`, `"start_line"`, `"end_line"`)
 - {"tool": "read_lines", "path": "path/to/file", "start_line": 1, "end_line": 120} (preferred for targeted slices once exact file/lines are located)
@@ -224,9 +232,9 @@ def build_scout_state_notice(enabled: bool) -> str:
     if enabled:
         return (
             "> **[COMPANION NOTICE] Local AI Scout is NOW ENABLED.** "
-            "You may call `{\"tool\": \"scout_workspace\", \"goal\": \"...\", \"subpath\": \".\", \"max_steps\": 8}` "
-            "for multi-step read-only codebase traces, `{\"tool\": \"update_header\", \"paths\": [\"...\"]}` "
-            "for human-gated comment header updates, or add `\"focus\": \"question\"` to `run_tests`/`run_script`/`run_and_delete_script`/`propose_inspection_script`."
+            "Delegate codebase exploration, wiring traces, and bug hunts to `{\"tool\": \"scout_workspace\", \"goal\": \"...\", \"subpath\": \".\", \"max_steps\": 10}` "
+            "(ask for verbatim code slices so you don't need follow-up `read_lines` turns), `{\"tool\": \"update_header\", \"paths\": [\"...\"]}` "
+            "for human-gated comment header updates, or add `\"focus\": \"question\"` to `run_tests` when Scout is enabled."
         )
     return (
         "> **[COMPANION NOTICE] Local AI Scout is NOW OFF.** "
@@ -311,7 +319,7 @@ def build_prompt_bundle(
         sections.append(guardrail_text)
         if scout_enabled is True and not include_directives and not scout_state_notice:
             sections.append(
-                "> *(Local AI Scout is ON — use `scout_workspace` to locate multi-file bugs instead of batching large `read_file` calls.)*"
+                "> *(Local AI Scout is ON — offload codebase/wiring exploration to `scout_workspace` (ask for verbatim snippets) instead of iterative `read_lines`/`read_file` or static inspection scripts.)*"
             )
 
     bundle_text = "\n\n".join(s for s in sections if s).strip()
@@ -1797,10 +1805,13 @@ def format_bridge_tool_results(tool_events: List[Dict[str, Any]]) -> str:
                 line = f"- **{name}**: Wrote `{resp.get('path')}` and executed{del_note} {status_tail}."
                 ai_sum = (resp.get("ai_summary") or "").strip()
                 if ai_sum:
-                    line += f"\n> **Scout Summary:** {ai_sum}"
+                    quoted = "\n> ".join(ai_sum.splitlines())
+                    line += f"\n> **Scout Summary:** {quoted}"
                 preview = (resp.get("output_preview") or "").strip()
                 if preview:
                     line += f"\n```text\n{preview}\n```"
+                elif ai_sum and eid:
+                    line += f"\n*(Raw output omitted to save tokens — call `read_command_output` with `exec_id={eid}` if exact lines are needed.)*"
                 blocks.append(line)
             else:
                 blocks.append(f"- **{name}**: Wrote `{resp.get('path')}` to disk.")

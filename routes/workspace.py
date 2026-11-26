@@ -11,7 +11,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from models import PatchRecord, RunCommandRequest
 from services import bridge as bridge_svc
 from services import checkpoints as cp_svc
-from services import fs_tools, patch_tools, runner
+from services import fs_tools, output_buffer, patch_tools, runner
+from services.token_utils import estimate_tokens
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
 
@@ -105,6 +106,32 @@ def cancel_workspace_command(
 ) -> Dict[str, Any]:
     count = runner.cancel_active_runs(session_id=session_id, run_id=run_id)
     return {"ok": True, "cancelled_count": count}
+
+
+@router.get("/command-output")
+def get_buffered_command_output(
+    exec_id: str | None = Query(default=None),
+) -> Dict[str, Any]:
+    try:
+        entry = output_buffer.get_command_output_entry(exec_id)
+    except KeyError as exc:
+        return {
+            "found": False,
+            "exec_id": (exec_id or "").strip() or "latest",
+            "error": str(exc.args[0] if exc.args else exc),
+        }
+    out = str(entry.get("output") or "")
+    return {
+        "found": True,
+        "exec_id": entry["exec_id"],
+        "command": entry["command"],
+        "exit_code": entry["exit_code"],
+        "duration_ms": entry["duration_ms"],
+        "output": out,
+        "total_lines": entry["total_lines"],
+        "char_count": entry["char_count"],
+        "estimated_tokens": estimate_tokens(out),
+    }
 
 
 @router.get("/backups", response_model=List[PatchRecord])

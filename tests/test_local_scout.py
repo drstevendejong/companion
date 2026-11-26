@@ -51,6 +51,7 @@ _TARGET_MODS: tuple[str, ...] = (
     "routes.chat",
     "routes.bridge",
     "routes.git",
+    "routes.workspace",
 )
 
 
@@ -64,6 +65,7 @@ def setUpModule() -> None:
             "routes.settings",
             "routes.bridge",
             "routes.chat",
+            "routes.workspace",
         ):
             _MODULE_STUBS[name] = importlib.import_module(name)
         return
@@ -186,7 +188,7 @@ def setUpModule() -> None:
     fastapi_mod = pytypes.ModuleType("fastapi")
     fastapi_mod.APIRouter = _APIRouter
     fastapi_mod.HTTPException = _HTTPException
-    fastapi_mod.Query = lambda default=None: default
+    fastapi_mod.Query = lambda default=None, **_kw: default
     fastapi_mod.Request = object
 
     stubs = {
@@ -210,6 +212,7 @@ def setUpModule() -> None:
         "routes.settings",
         "routes.bridge",
         "routes.chat",
+        "routes.workspace",
     ):
         _MODULE_STUBS[name] = importlib.import_module(name)
 
@@ -236,6 +239,7 @@ class _StubbedScoutTestCase(unittest.TestCase):
         cls.settings_rt = _MODULE_STUBS["routes.settings"]
         cls.bridge_rt = _MODULE_STUBS["routes.bridge"]
         cls.chat_rt = _MODULE_STUBS["routes.chat"]
+        cls.workspace_rt = _MODULE_STUBS["routes.workspace"]
 
 
 def _make_response(
@@ -1048,6 +1052,97 @@ class TestLocalScoutLoop(_StubbedScoutTestCase):
         triage_phases = [e for e in ws_events if e.get("type") == "exec_phase"]
         self.assertEqual([e.get("phase") for e in triage_phases], ["scout_triage", "done"])
         self.assertIn("Scout is triaging", triage_phases[0]["status_text"])
+
+    def test_inspection_script_passes_verbatim_up_to_12k_and_extracts_when_oversized(self) -> None:
+        db_path = Path(self.tmp.name) / "script_budget.db"
+        db = self.db_mod.CompanionDB(db_path)
+        proj = db.create_project(self.models_mod.ProjectCreate(name="ScriptBudget", root_path=str(self.root)))
+        sess = db.create_session(self.models_mod.SessionCreate(project_id=proj.id, title="Bridge", api_enabled=False))
+
+        # 1. Passing script under 12k chars (~6,000 chars) even WITH focus -> 0 Flash Lite calls, raw stdout returned
+        models_unused = _ScriptedModels([])
+        gw_unused = _FakeGeminiGateway(SimpleNamespace(models=models_unused))
+        gate_med = db.create_gate(
+            sess.id,
+            "propose_inspection_script",
+            {
+                "path": "inspect_med.py",
+                "content": "print('ATTR_EXACT=42\\n' * 400)\n",
+                "summary": "Check ATTR_EXACT value",
+                "focus": "What is ATTR_EXACT?",
+            },
+            {"summary": "Check ATTR_EXACT value", "delete_on_success": True},
+        )
+        req_unused = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=db, gemini=gw_unused)))
+        with patch.object(self.chat_rt, "_get_effective_scout_settings", return_value={"enabled": True, "summarize_threshold_chars": 4000}):
+            res_med = asyncio.run(
+                self.chat_rt.resolve_tool_gate(
+                    gate_med["id"],
+                    SimpleNamespace(action="write_run_and_delete", reason=None),
+                    req_unused,
+                )
+            )
+        self.assertEqual(len(models_unused.calls), 0, "Passing inspection script <=12k chars must NOT trigger Flash Lite")
+        self.assertIn("ATTR_EXACT=42", res_med["bridge_reply_text"])
+        self.assertNotIn("Scout Summary", res_med["bridge_reply_text"])
+
+        # 2. Oversized script >12k chars -> triggers Flash Lite with concrete extraction prompt + goal + exec_id hint
+        models_big = _ScriptedModels([
+            _make_response(text="- `modal_user_profile.html:44`: `data-mandatory=\"1\"`\n- `user.py:91`: `country_region`")
+        ])
+        gw_big = _FakeGeminiGateway(SimpleNamespace(models=models_big))
+        gate_big = db.create_gate(
+            sess.id,
+            "propose_inspection_script",
+            {
+                "path": "inspect_big.py",
+                "content": "print('LINE_DATA=1234567890\\n' * 800)\n",
+                "summary": "Extract mandatory modal attributes",
+            },
+            {"summary": "Extract mandatory modal attributes", "delete_on_success": True},
+        )
+        req_big = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=db, gemini=gw_big)))
+        with patch.object(self.chat_rt, "_get_effective_scout_settings", return_value={"enabled": True, "summarize_threshold_chars": 4000}):
+            res_big = asyncio.run(
+                self.chat_rt.resolve_tool_gate(
+                    gate_big["id"],
+                    SimpleNamespace(action="write_run_and_delete", reason=None),
+                    req_big,
+                )
+            )
+        self.assertEqual(len(models_big.calls), 1)
+        sent_prompt = models_big.calls[0]["contents"]
+        self.assertIn("Extract mandatory modal attributes", sent_prompt)
+        self.assertIn("Extract CONCRETE data", sent_prompt)
+        self.assertIn("Scout Summary:", res_big["bridge_reply_text"])
+        self.assertIn("read_command_output", res_big["bridge_reply_text"])
+
+    def test_command_output_endpoint_and_deep_scout_defaults(self) -> None:
+        output_buffer.clear_buffer()
+        eid = output_buffer.record_command_output(
+            "python developer/probe.py",
+            "FULL_RAW_LINE_1\nFULL_RAW_LINE_2\n",
+            exit_code=0,
+            duration_ms=88,
+        )
+        found = self.workspace_rt.get_buffered_command_output(exec_id=eid)
+        self.assertTrue(found["found"])
+        self.assertEqual(found["exec_id"], eid)
+        self.assertIn("FULL_RAW_LINE_1", found["output"])
+        self.assertGreaterEqual(found["estimated_tokens"], 1)
+
+        missing = self.workspace_rt.get_buffered_command_output(exec_id="missing99")
+        self.assertFalse(missing["found"])
+        self.assertIn("missing99", missing["error"])
+
+        gemini_client = importlib.import_module("services.gemini_client")
+        project = self._make_project()
+        prev = gemini_client.prepare_tool_gate_preview(
+            project, "scout_workspace", {"goal": "Trace modal wiring"}
+        )
+        self.assertEqual(prev["max_steps"], 10)
+        self.assertIn("verbatim", self.local_scout._SCOUT_SYSTEM_PROMPT.lower())
+        self.assertIn("wiring", self.local_scout._SCOUT_SYSTEM_PROMPT.lower())
 
 
 

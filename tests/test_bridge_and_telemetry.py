@@ -1579,6 +1579,43 @@ class TestRateTelemetryAndAppMode(unittest.TestCase):
             self.assertEqual(p_multi["actions"][0]["args"]["new_text"], "NEW_HEADER = 2")
             self.assertIn("...", p_multi["actions"][1]["args"]["old_text"])
 
+            # 8. Consecutive ```patch blocks across multiple files + tagged write_file in ONE reply
+            multi_block_reply = (
+                "Step 1/3 — Patching (api/routes.py): Wire new flag\n"
+                "```patch\n"
+                "# path: api/routes.py\n"
+                "# summary: Pass new flag\n"
+                "<<<<<<< SEARCH\n"
+                "return run()\n"
+                "=======\n"
+                "return run(strict=True)\n"
+                ">>>>>>> REPLACE\n"
+                "```\n\n"
+                "Step 2/3 — Patching (web/app.js): Update UI label\n"
+                "```patch\n"
+                "# path: web/app.js\n"
+                "# summary: Update label\n"
+                "<<<<<<< SEARCH\n"
+                'btn.textContent = "Run";\n'
+                "=======\n"
+                'btn.textContent = "Run Strict";\n'
+                ">>>>>>> REPLACE\n"
+                "```\n\n"
+                "Step 3/3 — New file (tests/test_flag.py): Add regression test\n"
+                "```python\n"
+                "# tool: write_file\n"
+                "# path: tests/test_flag.py\n"
+                "# summary: Add flag regression test\n"
+                "def test_flag():\n"
+                "    assert True\n"
+                "```\n"
+                "Wait for output.\n"
+            )
+            p_batch = bridge.parse_playground_markdown(multi_block_reply)
+            self.assertEqual([a["tool"] for a in p_batch["actions"]], ["patch_literal", "patch_literal", "write_file"])
+            self.assertEqual([a["args"]["path"] for a in p_batch["actions"]], ["api/routes.py", "web/app.js", "tests/test_flag.py"])
+            self.assertNotIn("Wait for output", p_batch["prose_text"])
+
     def test_every_prompt_guardrail_and_ambiguous_gate_save_vs_inspect(self) -> None:
         import asyncio
         import json as _json

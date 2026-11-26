@@ -179,12 +179,17 @@ export function setCachedGeneratedMd(projectId, relPath, content) {
   }
 }
 
-export function formatBridgeToolResults(toolEvents) {
+export function formatBridgeToolResults(toolEvents, opts = {}) {
   if (!Array.isArray(toolEvents) || toolEvents.length === 0) return "";
+  const fullMap = opts && opts.fullOutputByExecId ? opts.fullOutputByExecId : null;
   const blocks = ["## Local Workspace Tool Results"];
   for (const ev of toolEvents) {
     const name = ev.tool_name || "tool";
     const resp = ev.response || {};
+    const fullRaw =
+      fullMap && resp.exec_id && Object.prototype.hasOwnProperty.call(fullMap, resp.exec_id)
+        ? String(fullMap[resp.exec_id] ?? "")
+        : null;
     if (resp.denied_by_user) {
       blocks.push(`- **${name}**: Denied by user (${resp.reason || "declined"})`);
     } else if (resp.error) {
@@ -241,11 +246,20 @@ export function formatBridgeToolResults(toolEvents) {
         const delNote = resp.deleted ? " and deleted temporary script" : "";
         const eidNote = resp.exec_id ? ` · \`exec_id=${resp.exec_id}\`` : "";
         let line = `- **${name}**: Wrote \`${resp.path}\` and executed${delNote} (exit code \`${resp.exit_code}\`${eidNote}).`;
-        const aiSum = String(resp.ai_summary || "").trim();
-        if (aiSum) line += `\n> **Scout Summary:** ${aiSum}`;
-        const preview = String(resp.output_preview || "").trim();
-        if (preview) {
-          line += `\n\`\`\`text\n${preview}\n\`\`\``;
+        if (fullRaw !== null) {
+          line += `\n\`\`\`text\n${fullRaw.trim() || "(No output)"}\n\`\`\``;
+        } else {
+          const aiSum = String(resp.ai_summary || "").trim();
+          if (aiSum) {
+            const quoted = aiSum.split("\n").join("\n> ");
+            line += `\n> **Scout Summary:** ${quoted}`;
+          }
+          const preview = String(resp.output_preview || "").trim();
+          if (preview) {
+            line += `\n\`\`\`text\n${preview}\n\`\`\``;
+          } else if (aiSum && resp.exec_id) {
+            line += `\n*(Raw output omitted to save tokens — call \`read_command_output\` with \`exec_id=${resp.exec_id}\` if exact lines are needed.)*`;
+          }
         }
         blocks.push(line);
       } else {
@@ -267,16 +281,20 @@ export function formatBridgeToolResults(toolEvents) {
             : "FAILED";
       const eidNote = resp.exec_id ? ` · \`exec_id=${resp.exec_id}\`` : "";
       let line = `- **${name}** (\`${cmd}\`): **${statusLbl}** (exit code \`${code}\`${eidNote}).`;
-      const aiSum = String(resp.ai_summary || "").trim();
-      if (aiSum) {
-        const quoted = aiSum.split("\n").join("\n> ");
-        line += `\n> **Scout Summary:** ${quoted}`;
-      }
-      const preview = String(resp.output_preview || "").trim();
-      if (preview) {
-        line += `\n\`\`\`text\n${preview}\n\`\`\``;
-      } else if (aiSum && resp.exec_id) {
-        line += `\n*(Raw output omitted to save tokens — call \`read_command_output\` with \`exec_id=${resp.exec_id}\` if exact lines are needed.)*`;
+      if (fullRaw !== null) {
+        line += `\n\`\`\`text\n${fullRaw.trim() || "(No output)"}\n\`\`\``;
+      } else {
+        const aiSum = String(resp.ai_summary || "").trim();
+        if (aiSum) {
+          const quoted = aiSum.split("\n").join("\n> ");
+          line += `\n> **Scout Summary:** ${quoted}`;
+        }
+        const preview = String(resp.output_preview || "").trim();
+        if (preview) {
+          line += `\n\`\`\`text\n${preview}\n\`\`\``;
+        } else if (aiSum && resp.exec_id) {
+          line += `\n*(Raw output omitted to save tokens — call \`read_command_output\` with \`exec_id=${resp.exec_id}\` if exact lines are needed.)*`;
+        }
       }
       blocks.push(line);
     } else if (resp.deleted) {
@@ -289,16 +307,20 @@ export function formatBridgeToolResults(toolEvents) {
       const scopeNote = resp.is_full_suite === false ? " (quick/targeted check — savepoint stays active)" : "";
       const eidNote = resp.exec_id ? ` · \`exec_id=${resp.exec_id}\`` : "";
       let line = `- **run_tests** (\`${cmd}\`): **${statusLbl}** (exit code \`${code}\`${eidNote})${scopeNote}.`;
-      const aiSum = String(resp.ai_summary || "").trim();
-      if (aiSum) {
-        const quoted = aiSum.split("\n").join("\n> ");
-        line += `\n> **Scout Summary:** ${quoted}`;
-      }
-      const preview = String(resp.output_preview || "").trim();
-      if (preview) {
-        line += `\n\`\`\`text\n${preview}\n\`\`\``;
-      } else if (aiSum && resp.exec_id) {
-        line += `\n*(Raw output omitted to save tokens — call \`read_command_output\` with \`exec_id=${resp.exec_id}\` if exact lines are needed.)*`;
+      if (fullRaw !== null) {
+        line += `\n\`\`\`text\n${fullRaw.trim() || "(No output)"}\n\`\`\``;
+      } else {
+        const aiSum = String(resp.ai_summary || "").trim();
+        if (aiSum) {
+          const quoted = aiSum.split("\n").join("\n> ");
+          line += `\n> **Scout Summary:** ${quoted}`;
+        }
+        const preview = String(resp.output_preview || "").trim();
+        if (preview) {
+          line += `\n\`\`\`text\n${preview}\n\`\`\``;
+        } else if (aiSum && resp.exec_id) {
+          line += `\n*(Raw output omitted to save tokens — call \`read_command_output\` with \`exec_id=${resp.exec_id}\` if exact lines are needed.)*`;
+        }
       }
       blocks.push(line);
     } else {

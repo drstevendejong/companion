@@ -496,12 +496,13 @@ def _generate_with_model_hop(
     raise RuntimeError(f"All lightweight Scout models failed or hit rate limits: {last_exc}")
 
 
-_SCOUT_SYSTEM_PROMPT = """You are Local Scout, a fast read-only codebase investigator.
-You operate inside a fresh stateless session with a strict step and token budget.
+_SCOUT_SYSTEM_PROMPT = """You are Local Scout, a thorough read-only codebase investigator running on cheap tokens so the primary coding AI does NOT have to burn turns inspecting files.
+You operate inside a fresh stateless session with a step and token budget.
 RULES:
 1. Only cite file paths, line numbers, and symbol names you actually observed in tool outputs during THIS run. Never invent or guess file contents.
 2. Start broad if unsure (`extract_headers`, `list_tree`, or `search_code`), then read exact ranges with `read_lines`. Batch related tool calls together!
-3. Keep your final answer concise, structured, and factual with exact `path:line` citations and brief relevant snippets so the primary coding AI can act immediately."""
+3. Trace the full wiring end-to-end (callers, callees, routes/controllers, UI/templates, models, and relevant tests) within your step budget—do not stop at the first surface match.
+4. Include BOTH exact `path:start-end` citations AND verbatim relevant code blocks/signatures/boundary lines (not just vague prose) whenever the main AI needs to understand wiring or write a surgical patch immediately without extra `read_lines` round-trips."""
 
 
 def run_scout_workspace(
@@ -524,7 +525,7 @@ def run_scout_workspace(
     and supports cooperative Pause/Resume/Stop via `ScoutRunController`.
     """
     rid = run_id or uuid.uuid4().hex[:10]
-    step_cap = max(1, min(12, int(max_steps or SCOUT_DEFAULT_MAX_STEPS)))
+    step_cap = max(1, min(16, int(max_steps or SCOUT_DEFAULT_MAX_STEPS)))
     token_cap = max(4_000, min(120_000, int(max_tokens or SCOUT_DEFAULT_MAX_TOKENS)))
     scope = (subpath or ".").strip() or "."
     ctrl = ScoutRunController(rid, session_id, goal, step_cap)
@@ -553,7 +554,8 @@ def run_scout_workspace(
         f"Project: {project.name}\n"
         f"Scope hint: {scope}\n"
         f"Goal: {goal}\n\n"
-        "Inspect the workspace using the read-only tools and return a concise, cited answer."
+        "Trace the full relevant wiring across files using your read-only tools and return exact `path:line` citations "
+        "plus verbatim relevant code blocks/signatures so the main AI can act immediately without extra read turns."
     )
     contents: List[Any] = [_make_text_content("user", user_prompt)]
 
@@ -872,6 +874,8 @@ def summarize_command_output(
     focus: Optional[str] = None,
     exec_id: Optional[str] = None,
     threshold_chars: int = OUTPUT_SUMMARIZE_THRESHOLD_CHARS,
+    command_kind: str = "command",
+    goal: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Uses a fresh single call on the lightest available `-lite` model to summarize long command/test outputs
@@ -886,23 +890,46 @@ def summarize_command_output(
 
     # Cap input sent to the light summarizer to preserve free-tier TPM/context
     excerpt_for_ai = text if len(text) <= 45_000 else (text[:15_000] + "\n\n... [middle omitted] ...\n\n" + text[-28_000:])
-    focus_clause = (
-        f"Answer this specific question from the main AI: {focus.strip()}\n"
-        if has_focus
-        else "Summarize test/script counts, key outcomes, warnings, and actionable findings concisely.\n"
-    )
-    prompt = (
-        f"Command: `{command}` (exit_code={exit_code}, exec_id={exec_id or 'n/a'})\n"
-        f"{focus_clause}"
-        "Only report facts present in the output. Quote exact numbers/symbols/paths. Keep under 6 lines, no advice.\n\n"
-        f"```text\n{excerpt_for_ai}\n```"
-    )
+    effective_goal = (focus or goal or "").strip()
+    if command_kind == "script":
+        goal_clause = (
+            f"Inspection goal / question: {effective_goal}\n"
+            if effective_goal
+            else "Extract the exact diagnostic findings printed by this inspection script.\n"
+        )
+        prompt = (
+            f"Inspection script `{command}` printed a large output ({len(text)} chars, exit_code={exit_code}, exec_id={exec_id or 'n/a'}).\n"
+            f"{goal_clause}"
+            "Extract CONCRETE data from the stdout verbatim so the main coding AI does not need to re-read the raw dump: "
+            "exact values, identifiers/DOM/API field names, file:line locations, counts, and anomalous items.\n"
+            "Do NOT write vague feature descriptions or advice. Keep within <= 12 tight bullet lines.\n\n"
+            f"```text\n{excerpt_for_ai}\n```"
+        )
+        sys_inst = (
+            "Extract exact values, symbols, file:line locations, counts, and concrete findings verbatim from inspection script stdout. "
+            "Never paraphrase into high-level product/feature descriptions."
+        )
+    else:
+        focus_clause = (
+            f"Answer this specific question from the main AI: {focus.strip()}\n"
+            if has_focus
+            else (
+                f"Check goal: {effective_goal}\n" if effective_goal else ""
+            ) + "Summarize test/command counts, key outcomes, warnings, and actionable findings concisely.\n"
+        )
+        prompt = (
+            f"Command: `{command}` (exit_code={exit_code}, exec_id={exec_id or 'n/a'})\n"
+            f"{focus_clause}"
+            "Only report facts present in the output. Quote exact numbers/symbols/paths. Keep under 6 lines, no advice.\n\n"
+            f"```text\n{excerpt_for_ai}\n```"
+        )
+        sys_inst = "Extract facts from local CLI/test output in <= 6 short lines. No tutorials or suggestions."
     try:
         resp, model_used, _ = _generate_with_model_hop(
             gemini,
             db,
             contents=prompt,
-            system_instruction="Extract facts from local CLI/test output in <= 6 short lines. No tutorials or suggestions.",
+            system_instruction=sys_inst,
             thinking_level="MINIMAL",
         )
         summary_text, _, _ = _extract_response_parts(resp)

@@ -849,6 +849,13 @@ function showTerminalResult(res, opts = {}) {
   const statusTag = res.cancelled ? "stopped" : `exit ${res.exit_code}`;
   state.lastTerminalLabel = `${res.command} (${statusTag})`;
   state.lastTerminalOutput = res.output || "";
+  if (res && res.exec_id && typeof res.output === "string") {
+    state.execRawOutputCache[res.exec_id] = res.output;
+    const cacheKeys = Object.keys(state.execRawOutputCache);
+    if (cacheKeys.length > 25) {
+      delete state.execRawOutputCache[cacheKeys[0]];
+    }
+  }
   terminalMeta.textContent = `${res.cancelled ? "Stopped by user · Exit -1" : `Exit ${res.exit_code}`} · ${res.duration_ms}ms · ~${(res.estimated_tokens || 0).toLocaleString()} tok`;
   terminalOutput.textContent = res.output || "(No output)";
   terminalOutput.scrollTop = terminalOutput.scrollHeight;

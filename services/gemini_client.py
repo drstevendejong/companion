@@ -336,13 +336,13 @@ def build_tool_declarations(scout_enabled: bool = False) -> types.Tool:
             [
                 types.FunctionDeclaration(
                     name="scout_workspace",
-                    description="Delegate an iterative read-only codebase search/trace to the Local AI Scout (ephemeral -lite loop). PREFER FIRST for multi-file bug hunting or unfamiliar call paths so main chat context stays compact.",
+                    description="Delegate a deep read-only codebase trace/audit to Local AI Scout (ephemeral -lite loop). ALWAYS PREFER FIRST when Scout is enabled for bug hunting, wiring/call-chain questions, or unfamiliar components—Scout reads files cheaply and returns verbatim patch-ready snippets + path:line citations so you avoid extra read turns.",
                     parameters=types.Schema(
                         type=types.Type.OBJECT,
                         properties={
-                            "goal": types.Schema(type=types.Type.STRING, description="Clear question or investigation goal for the Scout"),
+                            "goal": types.Schema(type=types.Type.STRING, description="Clear question or investigation goal (ask for verbatim code slices/signatures if you plan to patch)"),
                             "subpath": types.Schema(type=types.Type.STRING, description="Optional relative folder to prioritize (default '.')"),
-                            "max_steps": types.Schema(type=types.Type.INTEGER, description="Optional max read iterations (1-8, default 8)"),
+                            "max_steps": types.Schema(type=types.Type.INTEGER, description="Optional max read iterations (1-16, default 10)"),
                         },
                         required=["goal"],
                     ),
@@ -567,7 +567,7 @@ def prepare_tool_gate_preview(
         if not goal:
             raise ValueError("scout_workspace requires 'goal'.")
         subpath = str(args.get("subpath") or ".").strip() or "."
-        max_steps = max(1, min(8, int(args.get("max_steps") or 8)))
+        max_steps = max(1, min(16, int(args.get("max_steps") or 10)))
         return {
             "category": "scout",
             "title": f"AI Scout: {goal[:72]}",

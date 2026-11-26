@@ -935,6 +935,12 @@ function renderToolBatchCard(
         footer.appendChild(mdBtn);
       }
 
+      const summarizedItems = [...executedScripts, ...testRuns].filter((r) =>
+        Boolean(r && r.ai_summary && String(r.ai_summary).trim())
+      );
+      const summarizedWithExecId = summarizedItems.filter((r) => Boolean(r && r.exec_id));
+      const hasScoutSummary = summarizedItems.length > 0;
+
       if (payloadText) {
         const payloadTok = estimateTokensLocal(payloadText).toLocaleString();
         const copyResBtn = document.createElement("button");
@@ -946,35 +952,122 @@ function renderToolBatchCard(
               ? "btn btn-secondary btn-xs"
               : "btn btn-primary btn-xs";
         if (hasErrors) {
-          copyResBtn.textContent =
-            nonErrorCount > 0
+          copyResBtn.textContent = hasScoutSummary
+            ? `Copy Error & Scout Summary (~${payloadTok} tok)`
+            : nonErrorCount > 0
               ? `Copy Error & Results (~${payloadTok} tok)`
               : `Copy Error (~${payloadTok} tok)`;
         } else {
-          copyResBtn.textContent = `Copy Result (~${payloadTok} tok)`;
+          copyResBtn.textContent = hasScoutSummary
+            ? `Copy Scout Summary (~${payloadTok} tok)`
+            : `Copy Result (~${payloadTok} tok)`;
         }
         copyResBtn.addEventListener("click", async () => {
           try {
             await copyTextToClipboard(payloadText);
-            state.lastClipboardInfo = { key: batchKey, status: "copied" };
+            state.lastClipboardInfo = {
+              key: batchKey,
+              status: "copied",
+              mode: hasScoutSummary ? "summary" : "result",
+            };
             emit("chat:refresh-badges");
           } catch (err) {
             emit("chat:error", err.message);
           }
         });
         footer.appendChild(copyResBtn);
+
+        if (hasScoutSummary && summarizedWithExecId.length > 0) {
+          const cachedFullMap = {};
+          let allCached = true;
+          let rawBytesSum = 0;
+          for (const item of summarizedWithExecId) {
+            if (Object.prototype.hasOwnProperty.call(state.execRawOutputCache || {}, item.exec_id)) {
+              cachedFullMap[item.exec_id] = state.execRawOutputCache[item.exec_id];
+            } else {
+              allCached = false;
+              rawBytesSum += Number(item.output_bytes || 0);
+            }
+          }
+          let estFullTok = 0;
+          if (allCached) {
+            const fullPreviewText = formatBridgeToolResults(events, {
+              fullOutputByExecId: cachedFullMap,
+            });
+            estFullTok = estimateTokensLocal(fullPreviewText);
+          } else {
+            const summaryChars = summarizedWithExecId.reduce(
+              (acc, r) => acc + String(r.ai_summary || "").length,
+              0
+            );
+            const cachedChars = Object.values(cachedFullMap).reduce(
+              (acc, s) => acc + String(s || "").length,
+              0
+            );
+            const approxChars =
+              Math.max(0, payloadText.length - summaryChars) + rawBytesSum + cachedChars;
+            estFullTok = approxChars > 0 ? Math.max(1, Math.ceil(approxChars / 3.6)) : 0;
+          }
+
+          const copyFullBtn = document.createElement("button");
+          copyFullBtn.type = "button";
+          copyFullBtn.className = "btn btn-secondary btn-xs";
+          copyFullBtn.dataset.copyFullResult = "true";
+          copyFullBtn.textContent =
+            estFullTok > 0
+              ? `Copy Full Result (~${estFullTok.toLocaleString()} tok)`
+              : "Copy Full Result";
+          copyFullBtn.title = "Copy the complete raw command output (without Scout summarization) for Playground";
+          copyFullBtn.addEventListener("click", async () => {
+            copyFullBtn.disabled = true;
+            try {
+              const fullOutputByExecId = {};
+              for (const item of summarizedWithExecId) {
+                const eid = item.exec_id;
+                if (Object.prototype.hasOwnProperty.call(state.execRawOutputCache || {}, eid)) {
+                  fullOutputByExecId[eid] = state.execRawOutputCache[eid];
+                } else {
+                  const res = await api.getCommandOutput(eid);
+                  if (!res || !res.found) {
+                    throw new Error(
+                      (res && res.error) ||
+                        `Raw output for exec_id=${eid} is no longer in the rolling buffer.`
+                    );
+                  }
+                  const rawOut = String(res.output || "");
+                  state.execRawOutputCache[eid] = rawOut;
+                  fullOutputByExecId[eid] = rawOut;
+                }
+              }
+              const fullPayload = formatBridgeToolResults(events, { fullOutputByExecId });
+              await copyTextToClipboard(fullPayload);
+              state.lastClipboardInfo = { key: batchKey, status: "copied", mode: "full" };
+              emit("chat:refresh-badges");
+            } catch (err) {
+              emit("chat:error", err.message);
+            } finally {
+              copyFullBtn.disabled = false;
+            }
+          });
+          footer.appendChild(copyFullBtn);
+        }
       }
 
       if (isActiveClip) {
         const badge = document.createElement("span");
         if (state.lastClipboardInfo.status === "copied") {
           badge.className = "exec-badge is-ok";
-          badge.textContent = "On Clipboard ✓";
+          badge.textContent =
+            state.lastClipboardInfo.mode === "full"
+              ? "Full Result on Clipboard ✓"
+              : "On Clipboard ✓";
         } else {
           badge.className = "exec-badge is-err";
           badge.textContent = hasErrors
             ? "Click Copy Error for Clipboard"
-            : "Click Copy Result for Clipboard";
+            : hasScoutSummary
+              ? "Click Copy Scout Summary for Clipboard"
+              : "Click Copy Result for Clipboard";
         }
         footer.appendChild(badge);
       }

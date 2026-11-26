@@ -124,6 +124,12 @@ export const api = {
       body: JSON.stringify({ session_id: sessionId, run_id: runId }),
       timeoutMs: 10000,
     }),
+  getCommandOutput: (execId = null) =>
+    requestJson(
+      execId
+        ? `/api/workspace/command-output?exec_id=${encodeURIComponent(execId)}`
+        : "/api/workspace/command-output"
+    ),
   restoreCheckpoint: (checkpointId) =>
     requestJson(`/api/workspace/checkpoints/${checkpointId}/restore`, { method: "POST" }),
   commitCheckpoint: (checkpointId) =>

@@ -283,8 +283,8 @@ async def parse_bridge_response(payload: BridgeParseRequest, request: Request) -
                     session_id=session.id,
                     goal=str(preview.get("goal") or ""),
                     subpath=str(preview.get("subpath") or "."),
-                    max_steps=int(preview.get("max_steps") or 8),
-                    max_tokens=int(scout_cfg.get("max_tokens") or 30_000),
+                    max_steps=int(preview.get("max_steps") or 10),
+                    max_tokens=int(scout_cfg.get("max_tokens") or 40_000),
                     app=app,
                     event_loop=asyncio.get_running_loop(),
                 )

@@ -245,6 +245,17 @@ class TestUiDomContract(unittest.TestCase):
         self.assertIn(".live-pulse-dot", comp_css)
         self.assertIn(".live-status-row", comp_css)
         self.assertIn(".exec-preview.is-empty", comp_css)
+        self.assertIn("Copy Scout Summary", chat_js)
+        self.assertIn("Copy Full Result", chat_js)
+        self.assertIn("Full Result on Clipboard", chat_js)
+        self.assertIn("fullOutputByExecId", bridge_js)
+        self.assertIn("getCommandOutput", api_js)
+        self.assertIn("execRawOutputCache", state_js)
+        self.assertIn("execRawOutputCache", drawer_js)
+        self.assertIn('"max_steps": 10', bridge_contract)
+        self.assertIn("verbatim", sys_prompt.lower())
+        self.assertIn("Batch multi-file", bridge_contract)
+        self.assertIn("Batch multi-file edits into ONE reply", sys_prompt)
 
     def test_theme_selector_and_css_tokens(self) -> None:
         html = (COMPANION_ROOT / "static" / "index.html").read_text(encoding="utf-8")
